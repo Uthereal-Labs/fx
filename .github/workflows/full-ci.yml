@@ -62,6 +62,9 @@ jobs:
       - name: Run unit tests
         run: zig build test -Doptimize=${{ matrix.optimize }}
 
+      - name: Verify private ACP observations with local providers
+        run: python3 scripts/test-acp-observations.py
+
       - name: Smoke test fresh binary
         shell: bash
         run: |

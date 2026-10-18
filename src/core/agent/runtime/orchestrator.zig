@@ -7531,6 +7531,8 @@ fn processQueuedPromptLoop(
                 .pending_status = &pending_auto_retry_status,
             };
             var model_request = agent_stream_provider.ModelRequest{
+                .observation_sink = deps.observation_sink,
+                .observation_attempt = @intCast(semantic_attempt),
                 .credential = if (job.credential_source == .host_managed)
                     .host_managed
                 else
@@ -11730,6 +11732,7 @@ fn processQueuedPromptLoop(
                     &prepared.memory,
                     execution.tool_result_memory,
                 );
+                deps.observation_sink.tool(arena, .{ .trace = step_ctx }, tool_call.id, tool_call.name, execution.model_output, prepared.model_output, prepared.memory.truncated, prepared.memory.output_handle);
                 try runtime_tool_batch.processCommittedFileResult(
                     deps,
                     call_allocator,
@@ -11817,6 +11820,7 @@ fn processQueuedPromptLoop(
                 else => return err,
             };
             const safe_tool_output = prepared.model_output;
+            deps.observation_sink.tool(arena, .{ .trace = step_ctx }, tool_call.id, tool_call.name, execution.model_output, safe_tool_output, prepared.memory.truncated, prepared.memory.output_handle);
             try shell_execution_failure_retry.observe(
                 arena,
                 tool_call,

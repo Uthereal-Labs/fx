@@ -412,6 +412,11 @@ Ultra eligibility.
   restored on `session/load` and `session/resume`. Set `_meta.fx.terminal` to
   `false` on `initialize` when fx is not presented in a terminal; fx then drops
   its terminal identity and rendering guidance.
+* **Host observations:** `initialize` accepts `_meta.fx.observations` to enable
+  private `fx/observation` notifications for model attempts and prepared tool
+  results. These notifications are separate from session updates and persisted
+  conversation events. See [ACP observations](docs/acp-observations.md) for the
+  content limits, request digests, and provider-free binary test.
 * **Tool call metadata:** each `tool_call` update carries
   `_meta.fx.toolCall.internal`, which is true for fx's own discovery and
   bookkeeping steps such as `capability_search`, `mcp_select_tool`, and
