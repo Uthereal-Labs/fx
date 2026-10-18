@@ -39,7 +39,7 @@ pub fn build(b: *std.Build) void {
         "Build a Node-API addon surface (core)",
     ) orelse .none;
 
-    const git_commit = readGitCommit(b);
+    const git_commit = b.option([]const u8, "source-revision", "Immutable revision for builds from a verified source archive") orelse readGitCommit(b);
     const app_version = readAppVersion(b);
     const update_channel = b.option(UpdateChannel, "update-channel", "Build update channel (stable or dev)") orelse .stable;
 
