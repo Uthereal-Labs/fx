@@ -719,8 +719,10 @@ pub const Reducer = struct {
         defer parsed.deinit();
         const root = try object(parsed.value);
         if (non_null(root, "error") != null) return error.ProviderError;
-        try self.accept_identity(&self.generation_id, non_null(root, "id"), self.limits.identity_bytes);
-        try self.accept_identity(&self.response_model, non_null(root, "model"), configured_provider.max_model_bytes);
+        const annotation_only = try accept_azure_annotations(root);
+        try self.accept_identity(&self.generation_id, non_null(root, "id"), self.limits.identity_bytes, annotation_only);
+        try self.accept_identity(&self.response_model, non_null(root, "model"), configured_provider.max_model_bytes, annotation_only);
+        if (annotation_only) return .{};
         const choices_value = root.get("choices") orelse return error.InvalidChunk;
         if (choices_value != .array) return error.InvalidChunk;
         const choices = choices_value.array.items;
@@ -848,9 +850,70 @@ pub const Reducer = struct {
         return try out.toOwnedSlice();
     }
 
-    fn accept_identity(self: *Reducer, destination: *?[]u8, value: ?std.json.Value, max_bytes: usize) Error!void {
+    /// Azure emits prompt and completion filter metadata outside semantic deltas.
+    /// Inspect filters on every frame; only annotation-only frames may omit identity.
+    fn accept_azure_annotations(root: std.json.ObjectMap) Error!bool {
+        const choices_value = root.get("choices") orelse return false;
+        if (choices_value != .array) return error.InvalidChunk;
+        const choices = choices_value.array.items;
+        var prompt_annotation = false;
+        for ([_][]const u8{ "prompt_filter_results", "prompt_annotations" }) |name| {
+            if (non_null(root, name)) |annotations| {
+                if (annotations != .array or annotations.array.items.len == 0) return error.InvalidChunk;
+                for (annotations.array.items) |annotation| {
+                    const fields = try object(annotation);
+                    if (non_null(fields, "error") != null) return error.ProviderError;
+                    _ = try index_value(fields.get("prompt_index") orelse return error.InvalidChunk);
+                    const filters = fields.get("content_filter_results") orelse return error.InvalidChunk;
+                    _ = try object(filters);
+                    try validate_azure_filters(filters);
+                }
+                prompt_annotation = true;
+            }
+        }
+        var choice_annotation = false;
+        for (choices) |value| {
+            const choice = try object(value);
+            if (choice.get("content_filter_results")) |filters| {
+                _ = try object(filters);
+                try validate_azure_filters(filters);
+                choice_annotation = true;
+            }
+        }
+        if (non_null(root, "usage") != null) return false;
+        if (choices.len == 0) return prompt_annotation;
+        if (choices.len != 1 or !choice_annotation) return false;
+        const choice = try object(choices[0]);
+        if (try index_value(choice.get("index") orelse return error.InvalidChunk) != 0) return error.InvalidChunk;
+        if (non_null(choice, "finish_reason") != null) return false;
+        if (non_null(choice, "delta")) |delta| if ((try object(delta)).count() != 0) return false;
+        var fields = choice.iterator();
+        while (fields.next()) |field| {
+            if (!contains_name(&.{ "index", "finish_reason", "delta", "content_filter_results", "content_filter_offsets" }, field.key_ptr.*)) return false;
+        }
+        return true;
+    }
+
+    fn validate_azure_filters(value: std.json.Value) Error!void {
+        switch (value) {
+            .object => |fields| {
+                if (non_null(fields, "error") != null) return error.ProviderError;
+                var iterator = fields.iterator();
+                while (iterator.next()) |field| {
+                    if (std.mem.eql(u8, field.key_ptr.*, "filtered")) {
+                        if (field.value_ptr.* != .bool) return error.InvalidChunk;
+                        if (field.value_ptr.bool) return error.ContentFiltered;
+                    } else try validate_azure_filters(field.value_ptr.*);
+                }
+            },
+            .array => |items| for (items.items) |item| try validate_azure_filters(item),
+            else => {},
+        }
+    }
+
+    fn accept_identity(self: *Reducer, destination: *?[]u8, value: ?std.json.Value, max_bytes: usize, annotation_only: bool) Error!void {
         const text = try string(value orelse return);
-        if (text.len == 0) return error.InvalidChunk;
+        if (text.len == 0) return if (annotation_only) {} else error.InvalidChunk;
         if (text.len > max_bytes) return error.IdentityTooLarge;
         if (destination.*) |prior| {
             if (!std.mem.eql(u8, prior, text)) return error.ConflictingIdentity;
@@ -871,7 +934,7 @@ pub const Reducer = struct {
             while (self.tools.items.len <= index) try self.tools.append(self.alloc, .{});
             const tool = &self.tools.items[index];
             if (non_null(delta, "type")) |kind| if (!std.mem.eql(u8, try string(kind), "function")) return error.InvalidChunk;
-            try self.accept_identity(&tool.id, non_null(delta, "id"), self.limits.identity_bytes);
+            try self.accept_identity(&tool.id, non_null(delta, "id"), self.limits.identity_bytes, false);
             if (tool.id) |id| for (self.tools.items, 0..) |other, other_index| {
                 if (other_index != index and other.id != null and std.mem.eql(u8, id, other.id.?)) return error.ConflictingIdentity;
             };
