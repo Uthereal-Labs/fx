@@ -2019,7 +2019,7 @@ fn planToolCallFrame(
         // contract as the live path; only arguments are masked for display
         // (redactToolArgumentsJson).
         .content_text = if (result) |r| if (r.output.len > 0)
-            tool_call_presentation.toolUpdateContentText(r.status == .failure, r.output)
+            tool_call_presentation.toolUpdateContentTextForMcp(mcp_identity, r.status == .failure, r.output)
         else
             null else null,
     };
@@ -3465,4 +3465,21 @@ test "ACP same-session restore retires the replaced MCP runtime after active use
     if (restore.err) |err| return err;
     try std.testing.expect(retired_before_destroy);
     try std.testing.expect(!completed_while_leased);
+}
+
+test "ACP MCP replay retains full output using its recorded protocol identity" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var identities: tool_call_identities.Record = .{};
+    defer identities.deinit(alloc);
+    try identities.remember(alloc, .none, "mcp_fixture_echo", .{ .server = @constCast("fixture"), .tool = @constCast("echo") });
+    const payload = "{\"server\":\"fixture\",\"tool\":\"mcp_fixture_echo\",\"result\":{\"structuredContent\":{\"content\":\"" ++ "x" ** 500 ++ "\"}}}";
+    const call: types.ToolCall = .{ .id = "call_1", .name = "mcp_fixture_echo", .arguments_json = "{}" };
+    const result: types.PersistedToolResult = .{ .tool_call_id = @constCast("call_1"), .tool_name = @constCast("mcp_fixture_echo"), .status = .success, .output = @constCast(payload), .output_bytes = payload.len, .stored_output_bytes = payload.len };
+    const frame = try planToolCallFrame(arena_state.allocator(), @import("../builtins/tools.zig").registry, null, &identities, call, result);
+    try std.testing.expectEqualStrings("fixture", frame.meta.mcp.?.server);
+    try std.testing.expectEqualStrings(payload, frame.content_text.?);
+    const unrecognized = try planToolCallFrame(arena_state.allocator(), @import("../builtins/tools.zig").registry, null, null, call, result);
+    try std.testing.expectEqual(@as(usize, 200), unrecognized.content_text.?.len);
 }
