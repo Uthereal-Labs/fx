@@ -81,7 +81,9 @@ The driver uses `zig-out/bin/fx`, isolated temporary homes, and loopback fake HT
 and MCP servers. It compares request digests with actual received HTTP bodies,
 checks the managed preview against the model-facing tool message, verifies
 hidden reasoning exclusion, and exercises opt-in and capture limits. It makes
-no external model calls.
+no external model calls. The multi-call case checks separate MCP receipts;
+dynamic MCP tools execute sequentially in this fixture. It does not exercise
+the runtime's parallel builtin-tool branch.
 
 Focused native unit tests can run with:
 

@@ -39,7 +39,7 @@ class ObservationTest(unittest.TestCase):
     binary = Path(__file__).resolve().parents[1] / "zig-out/bin/fx"
     observations_output: Path | None = None
 
-    def exercise(self, *, enabled: bool, limit: int = 262144, tool: bool = True, capture: bool = True, parallel: int = 1) -> tuple[list[dict], list[bytes]]:
+    def exercise(self, *, enabled: bool, limit: int = 262144, tool: bool = True, capture: bool = True, call_count: int = 1) -> tuple[list[dict], list[bytes]]:
         bodies: list[bytes] = []
 
         class Provider(BaseHTTPRequestHandler):
@@ -50,7 +50,7 @@ class ObservationTest(unittest.TestCase):
                 raw = self.rfile.read(int(self.headers["Content-Length"]))
                 bodies.append(raw)
                 first = len(bodies) == 1 and tool
-                delta = {"tool_calls": [{"index": index, "id": f"fixture_call_{index + 1}", "type": "function", "function": {"name": "mcp_koi_test_echo", "arguments": "{}"}} for index in range(parallel)], "reasoning": "PRIVATE_REASONING_FIXTURE"} if first else {"content": "Scoped fixture answer."}
+                delta = {"tool_calls": [{"index": index, "id": f"fixture_call_{index + 1}", "type": "function", "function": {"name": "mcp_koi_test_echo", "arguments": "{}"}} for index in range(call_count)], "reasoning": "PRIVATE_REASONING_FIXTURE"} if first else {"content": "Scoped fixture answer."}
                 events = [
                     {"id": "fixture", "model": "local-model", "choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
                     {"id": "fixture", "model": "local-model", "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls" if first else "stop"}]},
@@ -173,8 +173,8 @@ class ObservationTest(unittest.TestCase):
         self.assertEqual(finished[0]["tool_call_ids"], [prepared["tool_call_id"]])
         self.assertEqual(finished[1]["output_text"], "Scoped fixture answer.")
 
-    def test_parallel_results_each_observe_the_effective_preview(self) -> None:
-        observations, bodies = self.exercise(enabled=True, parallel=2)
+    def test_multiple_mcp_results_each_observe_the_effective_preview(self) -> None:
+        observations, bodies = self.exercise(enabled=True, call_count=2)
         prepared = [value["event"]["data"] for value in observations if value["event"]["kind"] == "tool.prepared"]
         self.assertEqual(len(prepared), 2)
         self.assertEqual({value["tool_call_id"] for value in prepared}, {"fixture_call_1", "fixture_call_2"})
