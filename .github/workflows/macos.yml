@@ -102,6 +102,9 @@ jobs:
       - name: Smoke test fresh binary
         run: scripts/smoke-binary.sh zig-out/bin/fx
 
+      - name: Verify private ACP observations with local fixtures
+        run: python3 scripts/test-acp-observations.py
+
       - name: Share the binary with the E2E shards
         uses: actions/upload-artifact@v4
         with:

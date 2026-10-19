@@ -39,7 +39,7 @@ pub fn build(b: *std.Build) void {
         "Build a Node-API addon surface (core)",
     ) orelse .none;
 
-    const git_commit = readGitCommit(b);
+    const git_commit = b.option([]const u8, "source-revision", "Immutable revision for builds from a verified source archive") orelse readGitCommit(b);
     const app_version = readAppVersion(b);
     const update_channel = b.option(UpdateChannel, "update-channel", "Build update channel (stable or dev)") orelse .stable;
 
@@ -79,8 +79,10 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run fx");
     run_step.dependOn(&run_cmd.step);
 
+    const test_filter = b.option([]const u8, "test-filter", "Run native unit tests matching a name");
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
+        .filters = if (test_filter) |filter| &.{filter} else &.{},
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
     run_exe_tests.step.dependOn(b.getInstallStep());

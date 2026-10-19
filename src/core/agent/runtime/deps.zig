@@ -200,6 +200,7 @@ pub const DiffMarkerStyles = struct {
 };
 
 pub const AgentRuntimeDeps = struct {
+    observation_sink: @import("../observations.zig").Sink = .{},
     ctx: *anyopaque,
     observer: ?*observation.Observer = null,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,

@@ -5725,7 +5725,8 @@ test.skipIf(!tmuxAvailable())(
       const version = (await runFx(["--version"])).stdout.trim();
       await active.sendHexBytes(["07"]);
 
-      const updatedNotice = `✓ fx has been updated to v${version} (notes)`;
+      const hasReleaseNotes = /^\d+\.\d+\.\d+$/.test(version);
+      const updatedNotice = `✓ fx has been updated to v${version}${hasReleaseNotes ? " (notes)" : ""}`;
       await active.waitForText(updatedNotice, TIMEOUT);
       await active.waitForComposer(TIMEOUT);
       const postUpgradeTrace = readFileSync(tracePath, "utf8");
@@ -5736,10 +5737,14 @@ test.skipIf(!tmuxAvailable())(
       expect(resumed).toContain("UPGRADE_CTRL_G_INITIAL_DONE");
       expect(resumed).toContain(updatedNotice);
       const noticeEscapes = await active.capturePaneEscapes();
-      expect(noticeEscapes).toContain(
-        `(\x1b[4m\x1b]8;;https://fx.sh/changelog#v${version}\x1b\\notes\x1b[0m`,
-      );
-      expect(noticeEscapes).toContain("\x1b]8;;\x1b\\)");
+      if (hasReleaseNotes) {
+        expect(noticeEscapes).toContain(
+          `(\x1b[4m\x1b]8;;https://fx.sh/changelog#v${version}\x1b\\notes\x1b[0m`,
+        );
+        expect(noticeEscapes).toContain("\x1b]8;;\x1b\\)");
+      } else {
+        expect(noticeEscapes).not.toContain("https://fx.sh/changelog#v");
+      }
       expect(resumed).not.toContain("* session resumed:");
       expect(resumed).not.toMatch(/[*✓!✗⊘i] session: resumed:/);
 

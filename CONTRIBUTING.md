@@ -69,6 +69,10 @@ bun test cli.test.ts
 
 Zig unit tests sit in `test` blocks inside the source file they cover, and `zig build test` runs all of them. CI checks formatting with `zig fmt --check src/`. The end-to-end tests run the binary at `zig-out/bin/fx`, so build before you run them. Run only the end-to-end files that cover your change, because CI runs the whole suite on every push. The `tui-*` files drive fx inside tmux.
 
+### Private observation checks
+
+After building the native binary, run `python3 scripts/test-acp-observations.py`. The check uses a local mock provider and the binary at `zig-out/bin/fx`; it makes no paid model calls.
+
 ### Add an end-to-end test file
 
 Every root `tests/e2e/*.test.ts` file needs an entry in the first two files below, and in the third only when it branches on the platform. CI fails when a required entry is missing or stale:

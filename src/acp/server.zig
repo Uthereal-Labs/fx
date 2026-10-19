@@ -1,5 +1,6 @@
 const std = @import("std");
 const testing_allocator = @import("../core/shared/testing_allocator.zig");
+const observations = @import("../core/agent/observations.zig");
 const managed_execution = @import("../core/execution/managed_execution.zig");
 const acp_runner = @import("../core/cli/acp_runner.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
@@ -367,6 +368,8 @@ pub const ServerState = struct {
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
     host_tools: host_tool_runtime.Runtime = .{},
+    observation_options: observations.Options = .{},
+    observation_sequence: std.atomic.Value(u64) = .init(0),
     host_instructions: []u8 = &.{},
     outbound_mutex: std.Io.Mutex = .init,
     outbound_cond: std.Io.Condition = .init,
@@ -2432,6 +2435,7 @@ const InitializeRequest = struct {
     /// False when the client presents fx inside an application rather than a
     /// terminal, set through `_meta.fx.terminal`.
     terminal_ui: bool = true,
+    observation_options: observations.Options = .{},
     client_fs_read: bool = false,
     client_fs_write: bool = false,
     client_terminal: bool = false,
@@ -2467,6 +2471,7 @@ fn parseInitializeRequest(
 
     var request = InitializeRequest{
         .terminal_ui = acp_types.fxMetaBool(parsed.value.object, "terminal") orelse true,
+        .observation_options = try observations.Options.parse(acp_types.fxMetaField(parsed.value.object, "observations")),
     };
     const capabilities = parsed.value.object.get("clientCapabilities") orelse
         return request;
@@ -2807,6 +2812,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     }
     if (!try applyUltrafastOverride(state, alloc, msg, state.ultrafast_mode)) return;
 
+    state.observation_options = request.observation_options;
     state.terminal_ui = request.terminal_ui;
     state.client_fs_read = request.client_fs_read;
     state.client_fs_write = request.client_fs_write;
@@ -2837,6 +2843,10 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         .mcp_over_acp = state.cfg.allow_acp_mcp and !host_target.is_wasm and !mcp_host.selected(),
         .mcp_sse = !mcp_host.selected(),
     });
+    if (state.observation_options.enabled) {
+        out.writer.end -= 1;
+        try out.writer.writeAll(",\"_meta\":{\"fx\":{\"observations\":{\"version\":1}}}}");
+    }
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }
 

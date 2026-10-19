@@ -159,3 +159,7 @@ Report vulnerabilities through the [contact page](https://fx.sh/contact) instead
 ## Credits
 
 Interface sounds by [cuelume](https://github.com/Danilaa1/cuelume).
+
+### Uthereal private observations
+
+This fork adds opt-in ACP observations for model requests, outcomes, and tool-result preparation. See [the observation contract](docs/acp-observations.md). Existing `libfx/hook` events remain available.

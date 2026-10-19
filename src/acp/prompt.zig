@@ -1,6 +1,7 @@
 const std = @import("std");
 const observation = @import("../core/agent/runtime/observation.zig");
 const testing_allocator = @import("../core/shared/testing_allocator.zig");
+const observations = @import("../core/agent/observations.zig");
 const skill_contract = @import("../core/skills/skill_contract.zig");
 const std_builtin = @import("builtin");
 const command_admission = @import("../core/permissions/command_admission.zig");
@@ -1903,11 +1904,41 @@ fn localFileTargetPath(alloc: Allocator, uri_text: []const u8) Allocator.Error!?
     };
 }
 
+fn emitObservation(raw: *anyopaque, context: observations.Context, event: observations.Event) void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw));
+    emitObservationJson(ctx, context, event) catch {};
+}
+
+fn emitObservationJson(ctx: *AcpContext, context: observations.Context, event: observations.Event) !void {
+    var out = std.Io.Writer.Allocating.init(ctx.alloc);
+    defer out.deinit();
+    try std.json.Stringify.value(.{ .version = @as(u8, 1), .sequence = ctx.state.observation_sequence.fetchAdd(1, .monotonic) + 1, .session_id = ctx.session_id, .turn_id = context.trace.turn_id, .step_id = context.trace.step_id, .attempt = context.attempt, .timestamp_ms = io_mod.milliTimestamp() }, .{}, &out.writer);
+    // Add a tagged data object without serializing opaque runtime state.
+    out.writer.end -= 1;
+    try out.writer.writeAll(",\"event\":{");
+    switch (event) {
+        inline else => |value, tag| {
+            const kind = switch (tag) {
+                .model_request => "model.request",
+                .model_finished => "model.finished",
+                .tool_prepared => "tool.prepared",
+            };
+            try out.writer.writeAll("\"kind\":");
+            try std.json.Stringify.value(kind, .{}, &out.writer);
+            try out.writer.writeAll(",\"data\":");
+            try std.json.Stringify.value(value, .{}, &out.writer);
+        },
+    }
+    try out.writer.writeAll("}}");
+    try ctx.state.writer.writeNotification(ctx.alloc, "fx/observation", out.writer.buffered());
+}
+
 fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
     const session = if (ctx.state.active_session) |*active| active else unreachable;
     return .{
         .ctx = @ptrCast(ctx),
         .observer = ctx.observer,
+        .observation_sink = .{ .context = @ptrCast(ctx), .emit_fn = emitObservation, .options = ctx.state.observation_options },
         .agent_stream_provider = server.streamProviderFor(ctx.state, ctx.state.active_session.?.provider),
         .confirm_session_writer = confirmSessionWriter,
         .report_usage = reportUsage,
