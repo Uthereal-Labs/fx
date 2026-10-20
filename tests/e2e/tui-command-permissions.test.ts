@@ -3141,6 +3141,43 @@ describe("effect-aware command permissions", () => {
   );
 
   test(
+    "fx ask forwards agent identity to clean, user, and TTY commands",
+    async () => {
+      for (const options of [{ profile: "clean" }, { profile: "user" }, { tty: true }]) {
+        const root = createIsolatedRoot();
+        const tracePath = join(root.root, "trace.log");
+        const gateway = startFakeGateway([
+          toolCall(`printf 'agent=%s' "$AI_AGENT"`, options),
+          finalText("agent environment complete"),
+        ]);
+        const result = await runFx(
+          ["ask", "--yolo", "--quiet", "--json", "Report the agent environment."],
+          {
+            cwd: root.workspace,
+            env: gatewayEnv(root, gateway, {
+              AI_AGENT: "other-agent",
+              FX_TRACE_LOG: tracePath,
+              FX_TRACE_SCOPES: "core",
+            }),
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        expect(result.code).toBe(0);
+        expect(result.stderr.toLowerCase()).not.toContain("error");
+        JSON.parse(result.stdout.trim());
+        const toolResult = JSON.parse(toolResultText(gateway.requests[1].body, "command_1"));
+        expect(toolResult).toMatchObject({ state: "completed", exit_code: 0 });
+        expect(toolResult.output_delta).toContain("agent=fx");
+        if (options.profile === "user") {
+          expect(readFileSync(tracePath, "utf8")).toContain("command runner snapshot generation=");
+        }
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "fx ask yolo executes pwd through the default user profile with process-scoped replay",
     async () => {
       const root = createIsolatedRoot();
@@ -3711,7 +3748,7 @@ describe("effect-aware command permissions", () => {
         finalText("large ACP complete"),
       ]);
       activeClient = AcpClient.create(acpRoot.workspace, gatewayEnv(acpRoot, acpGateway));
-      await startAcpSession(activeClient, "code");
+      await startAcpSession(activeClient, "auto");
       const acpMessages = await runAcpPrompt(activeClient, "Run the large ACP fixture.");
       await activeClient.close();
       activeClient = null;
@@ -4076,7 +4113,7 @@ class AcpClient {
   }
 }
 
-async function startAcpSession(client: AcpClient, modeId: "ask" | "code" = "ask") {
+async function startAcpSession(client: AcpClient, modeId: "ask" | "auto" = "ask") {
   await client.request("initialize", { protocolVersion: 1 }, 1);
   await client.request("session/new", { mcpServers: [] }, 2);
   await client.readLine();

@@ -37,9 +37,8 @@ const display_width = @import("../shared/display_width.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_presentation = @import("../tooling/tool_presentation.zig");
 const session_commands = @import("../session/session_commands.zig");
-const usage_recovery = @import("../session/usage_recovery.zig");
-const usage_dashboard_runtime = @import("usage_dashboard_runtime.zig");
-const usage_report = @import("../session/usage_report.zig");
+const usage = @import("../../usage/usage.zig");
+const usage_host = @import("usage_host.zig");
 const types = @import("../shared/types.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
@@ -254,7 +253,7 @@ fn handleWorkspaceCommand(app: anytype, rest: []const u8) !void {
     const action = maybe_action orelse {
         refreshWorkspaceAvailabilityForList(app) catch |err| {
             const reason = output_contracts.workspaceErrorMessage(err) orelse "workspace refresh failed";
-            const message = try std.fmt.allocPrint(app.alloc, "Workspace refresh rejected: {s}", .{reason});
+            const message = try app.alloc.print("Workspace refresh rejected: {s}", .{reason});
             defer app.alloc.free(message);
             try app.writeDomainNotice(.{
                 .topic = "workspace",
@@ -290,7 +289,7 @@ fn handleWorkspaceCommand(app: anytype, rest: []const u8) !void {
             .commit => "Workspace settings were not changed",
             .reconcile => "Workspace settings are uncertain and could not be reloaded",
         };
-        const message = try std.fmt.allocPrint(app.alloc, "{s}: {s}", .{ prefix, reason });
+        const message = try app.alloc.print("{s}: {s}", .{ prefix, reason });
         defer app.alloc.free(message);
         try app.writeDomainNotice(.{
             .topic = "workspace",
@@ -412,6 +411,39 @@ pub fn Handlers(comptime App: type) type {
             };
         }
 
+        /// What MCP-v2 and `/mcp` have to say, and the reload a `/mcp` change asked for.
+        fn closeOtherMenusForMcp(app: *App) void {
+            closeModelMenuIfPresent(app);
+            closeHelpMenuIfPresent(app);
+            closeInlineCommandMenusIfPresent(app);
+            if (comptime @hasField(App, "skills")) app.skills.closeMenu();
+            if (comptime @hasField(App, "input_runtime")) {
+                if (comptime @hasField(@TypeOf(app.input_runtime), "settings_menu")) {
+                    app.input_runtime.settings_menu.close();
+                }
+            }
+            if (comptime @hasField(App, "session_persistence")) {
+                app.session_persistence.session_picker.active = false;
+            }
+        }
+
+        pub fn collectMcpHostFacts(app: *App) !void {
+            if (comptime !@hasDecl(App, "takeMcpHostNotices")) return;
+            app.applyMcpHostReload() catch |err| {
+                debug_trace.logf("mcp", "MCP-v2 reload failed err={s}", .{@errorName(err)});
+                try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = "The MCP config changed, but fx couldn't load it again. Your current servers are still active." }, true);
+            };
+            const notices = app.takeMcpHostNotices();
+            defer {
+                for (notices) |n| std.heap.c_allocator.free(n.text);
+                std.heap.c_allocator.free(notices);
+            }
+            for (notices) |n| try app.writeDomainNotice(.{ .topic = "mcp", .tone = if (n.warning) .warning else .neutral, .body = n.text }, true);
+            app.refreshMcpCompletion();
+            app.refreshMcpHostMenu();
+            app.refreshMcpHostStatus();
+        }
+
         pub fn collectMcpStartupHealthFacts(app: *App) !void {
             if (comptime !@hasDecl(App, "takeMcpStartupHealthNotice")) return;
             const notice = (try app.takeMcpStartupHealthNotice()) orelse return;
@@ -484,8 +516,7 @@ pub fn Handlers(comptime App: type) type {
                             "profile reload retained current runtime required_server_failure={s}",
                             .{failure},
                         );
-                        break :retained try std.fmt.allocPrint(
-                            app.alloc,
+                        break :retained try app.alloc.print(
                             "MCP configuration could not be reloaded. Your existing MCP servers are still active. {s} Check the configuration or run /mcp list for details.",
                             .{failure},
                         );
@@ -548,14 +579,12 @@ pub fn Handlers(comptime App: type) type {
                         const success = if (std.mem.eql(u8, completion.server_name, "slack") and completion.reconnect_error == null)
                             try app.alloc.dupe(u8, "Slack connected. You can now use Slack.")
                         else if (authenticated.repaired_entries == 0)
-                            try std.fmt.allocPrint(
-                                app.alloc,
+                            try app.alloc.print(
                                 "Authenticated MCP server '{s}'.",
                                 .{completion.server_name},
                             )
                         else
-                            try std.fmt.allocPrint(
-                                app.alloc,
+                            try app.alloc.print(
                                 "Authenticated MCP server '{s}'.\nRemoved {d} unreadable MCP credential {s}.",
                                 .{
                                     completion.server_name,
@@ -565,7 +594,7 @@ pub fn Handlers(comptime App: type) type {
                             );
                         defer app.alloc.free(success);
                         if (completion.reconnect_error) |err| {
-                            const body = try std.fmt.allocPrint(app.alloc, "{s}\nThe server could not reconnect: {s}. Check /mcp list for details.", .{ success, @errorName(err) });
+                            const body = try app.alloc.print("{s}\nThe server could not reconnect: {s}. Check /mcp list for details.", .{ success, @errorName(err) });
                             defer app.alloc.free(body);
                             try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = body }, true);
                         } else {
@@ -584,14 +613,12 @@ pub fn Handlers(comptime App: type) type {
                 }
             } else |err| {
                 const body = if (err == error.Cancelled)
-                    try std.fmt.allocPrint(
-                        app.alloc,
+                    try app.alloc.print(
                         "MCP authentication for '{s}' was cancelled.",
                         .{completion.server_name},
                     )
                 else
-                    try std.fmt.allocPrint(
-                        app.alloc,
+                    try app.alloc.print(
                         "MCP authentication for '{s}' failed: {s}.",
                         .{ completion.server_name, mcp_auth.authentication_error_message(err) },
                     );
@@ -645,7 +672,7 @@ pub fn Handlers(comptime App: type) type {
                 else
                     false;
                 if (copied) break :blk .{ .copied_file = path };
-                if (builtin.os.tag == .macos) break :blk .{ .copy_failed = path };
+                if (builtin.target.os.tag == .macos) break :blk .{ .copy_failed = path };
                 break :blk .{ .saved = path };
             } else blk: {
                 break :blk .unavailable;
@@ -1009,7 +1036,7 @@ pub fn Handlers(comptime App: type) type {
         fn commandShowStats(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             var buf: [256]u8 = undefined;
-            const body = try std.fmt.bufPrint(
+            const body = try std.mem.print(
                 &buf,
                 "ansi_bytes={d}, redraws={d}, debounced_resizes={d}, footer_updates={d}, stream_chunks={d}",
                 .{ app.metrics.ansi_bytes, app.metrics.full_redraws, app.metrics.debounced_resizes, app.metrics.footer_line_updates, app.metrics.stream_chunks },
@@ -1023,13 +1050,11 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandShowUsage(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            if (comptime !runtime_profile.allows(App, .profile_usage)) {
-                var usage = try app.session.usage.reportSnapshot(app.alloc);
-                defer usage.deinit(app.alloc);
+            if (comptime !@hasField(App, "usage_dashboard")) {
                 try app.writeDomainNotice(.{
                     .topic = "usage",
                     .tone = .neutral,
-                    .body = "Durable profile usage is unavailable in this host; active session usage remains in memory.",
+                    .body = "Usage is not available in this host.",
                 }, true);
                 return;
             }
@@ -1038,205 +1063,58 @@ pub fn Handlers(comptime App: type) type {
             closeHelpMenuIfPresent(app);
             app.input_runtime.settings_menu.close();
             closeInlineCommandMenusIfPresent(app);
-            if (comptime @hasField(App, "usage_dashboard")) {
-                try openUsageDashboard(app, .days_30);
-                return;
+            var label_buf: usage_host.LabelBuffer = undefined;
+            if (usage_host.credential(&app.auth, &label_buf)) |credential| {
+                app.usage_dashboard.open(credential);
+            } else {
+                app.usage_dashboard.openUnavailable(usage_host.missingReason(&app.auth));
             }
-            var usage = loadUsageSnapshot(app, .days_30) catch |err| {
-                debug_trace.logf(
-                    "usage",
-                    "usage dashboard open failed scope={s} reason={s}",
-                    .{ @tagName(usage_report.Scope.days_30), @errorName(err) },
-                );
-                try app.input_runtime.usage_menu.openError(
-                    app.alloc,
-                    .days_30,
-                    "Local usage data is unavailable",
-                );
-                app.shell.render_requests.request(.footer);
-                return;
-            };
-            errdefer usage.deinit(app.alloc);
-            app.input_runtime.usage_menu.openOwned(app.alloc, usage);
-            app.shell.render_requests.request(.footer);
+            try installUsageSnapshot(app);
         }
 
-        pub fn refreshUsageMenu(
-            app: *App,
-            scope: usage_report.Scope,
-        ) !void {
-            if (comptime @hasField(App, "usage_dashboard")) {
-                if (scope == .session) {
-                    var usage = loadUsageSnapshot(app, scope) catch |err| {
-                        try recordUsageRefreshFailure(app, scope, err);
-                        return;
-                    };
-                    errdefer usage.deinit(app.alloc);
-                    installUsageSnapshot(app, usage);
-                    return;
-                }
-                if (try app.usage_dashboard.snapshot(app.alloc, scope)) |usage| {
-                    installUsageSnapshot(app, usage);
-                    return;
-                }
-                app.input_runtime.usage_menu.setLoadingScope(app.alloc, scope);
-                try requestUsageDashboardRefresh(app);
-                app.shell.render_requests.request(.footer);
-                return;
-            }
-            var usage = loadUsageSnapshot(app, scope) catch |err| {
-                try recordUsageRefreshFailure(app, scope, err);
-                return;
-            };
-            errdefer usage.deinit(app.alloc);
-            installUsageSnapshot(app, usage);
+        /// Tab and ←→: lists `period` in the model table; never fetches.
+        pub fn refreshUsageMenu(app: *App, period: usage.Period) !void {
+            if (comptime !@hasField(App, "usage_dashboard")) return;
+            if (app.input_runtime.usage_menu.setPeriod(period)) app.shell.render_requests.request(.footer);
         }
 
-        pub fn reloadUsageMenu(
-            app: *App,
-            scope: usage_report.Scope,
-        ) !void {
-            if (comptime !@hasField(App, "usage_dashboard")) {
-                try refreshUsageMenu(app, scope);
-                return;
-            }
-            if (scope == .session) {
-                try refreshUsageMenu(app, scope);
-                return;
-            }
-            app.input_runtime.usage_menu.requested_scope = scope;
-            requestUsageDashboardRefresh(app) catch |err| {
-                try recordUsageRefreshFailure(app, scope, err);
-                return;
-            };
-            app.shell.render_requests.request(.footer);
+        /// `r`: fetches unless a fetch is already running, then redraws.
+        pub fn reloadUsageMenu(app: *App, period: usage.Period) !void {
+            if (comptime !@hasField(App, "usage_dashboard")) return;
+            _ = period;
+            _ = app.usage_dashboard.refresh();
+            try installUsageSnapshot(app);
         }
 
+        /// Runs on every event-loop pass while `/usage` is open: starts the
+        /// periodic refresh when due, and redraws when the dashboard changed
+        /// or the minute turned ("updated 2m ago", and today at midnight).
         pub fn collectUsageDashboardFacts(app: *App) !bool {
             if (comptime !@hasField(App, "usage_dashboard")) return false;
-            const transition = app.usage_dashboard.pollTransition();
-            if (transition == .none) return false;
-            if (!app.input_runtime.usage_menu.active or
-                app.input_runtime.usage_menu.navigationScope() == .session)
-            {
-                return false;
-            }
-            const scope = app.input_runtime.usage_menu.navigationScope();
-            if (transition == .failed) {
-                const err = app.usage_dashboard.lastError() orelse
-                    error.ProfileUsageUnavailable;
-                try recordUsageRefreshFailure(app, scope, err);
-                return true;
-            }
-            if (try app.usage_dashboard.snapshot(app.alloc, scope)) |usage| {
-                installUsageSnapshot(app, usage);
-                return true;
-            }
-            const err = app.usage_dashboard.lastError() orelse
-                error.ProfileUsageUnavailable;
-            try recordUsageRefreshFailure(app, scope, err);
+            const menu = &app.input_runtime.usage_menu;
+            if (!menu.active) return false;
+            app.usage_dashboard.tick();
+            const changed = app.usage_dashboard.generationCount() != menu.generation;
+            const shown_minute = if (menu.snapshot) |*s| @divFloor(s.now_ms, std.time.ms_per_min) else 0;
+            const minute_turned = @divFloor(app.usage_dashboard.nowMs(), std.time.ms_per_min) != shown_minute;
+            if (!changed and !minute_turned) return false;
+            try installUsageSnapshot(app);
             return true;
         }
 
-        fn openUsageDashboard(
-            app: *App,
-            scope: usage_report.Scope,
-        ) !void {
-            const cached = try app.usage_dashboard.snapshot(app.alloc, scope);
-            if (cached) |usage| {
-                app.input_runtime.usage_menu.openOwned(app.alloc, usage);
-            } else {
-                app.input_runtime.usage_menu.openLoading(app.alloc, scope);
-            }
-            requestUsageDashboardRefresh(app) catch |err| {
-                try recordUsageRefreshFailure(app, scope, err);
-                return;
-            };
+        pub fn closeUsageMenu(app: *App) void {
+            app.input_runtime.usage_menu.close();
+            if (comptime @hasField(App, "usage_dashboard")) app.usage_dashboard.close();
+        }
+
+        fn installUsageSnapshot(app: *App) !void {
+            // Read the generation first, so a fetch finishing in between
+            // still triggers a redraw.
+            const generation = app.usage_dashboard.generationCount();
+            const snapshot = try app.usage_dashboard.snapshot(app.alloc);
+            const menu = &app.input_runtime.usage_menu;
+            if (menu.active) menu.replace(snapshot, generation) else menu.open(snapshot, generation);
             app.shell.render_requests.request(.footer);
-        }
-
-        fn requestUsageDashboardRefresh(app: *App) !void {
-            const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
-            const availability = try app.session.ensureProfileUsageReadable(
-                app.alloc,
-                home,
-            );
-            if (availability == .unavailable) {
-                return app.session.profile_usage.lastError() orelse
-                    error.ProfileUsageUnavailable;
-            }
-            _ = try app.usage_dashboard.requestRefresh(
-                usage_dashboard_runtime.profileProvider(
-                    &app.session.profile_usage,
-                ),
-                home,
-                @max(io_mod.milliTimestamp(), 0),
-            );
-        }
-
-        fn installUsageSnapshot(
-            app: *App,
-            usage: usage_report.Snapshot,
-        ) void {
-            if (app.input_runtime.usage_menu.active) {
-                app.input_runtime.usage_menu.replaceOwned(app.alloc, usage);
-            } else {
-                app.input_runtime.usage_menu.openOwned(app.alloc, usage);
-            }
-            app.shell.render_requests.request(.footer);
-        }
-
-        fn recordUsageRefreshFailure(
-            app: *App,
-            scope: usage_report.Scope,
-            err: anyerror,
-        ) !void {
-            debug_trace.logf(
-                "usage",
-                "usage dashboard refresh failed scope={s} reason={s}",
-                .{ @tagName(scope), @errorName(err) },
-            );
-            try app.input_runtime.usage_menu.recordRefreshFailure(
-                app.alloc,
-                scope,
-                "Local usage data is unavailable",
-            );
-            app.shell.render_requests.request(.footer);
-        }
-
-        fn loadUsageSnapshot(
-            app: *App,
-            scope: usage_report.Scope,
-        ) !usage_report.Snapshot {
-            if (scope == .session) {
-                return app.session.usage.reportSnapshot(app.alloc);
-            }
-            const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
-            const availability = try app.session.ensureProfileUsageReadable(
-                app.alloc,
-                home,
-            );
-            if (availability == .unavailable) {
-                return app.session.profile_usage.lastError() orelse
-                    error.ProfileUsageUnavailable;
-            }
-            const snapshot_time_ms = @max(io_mod.milliTimestamp(), 0);
-            var recovery = try usage_recovery.collectFromHomeConservative(
-                app.alloc,
-                home,
-            );
-            defer recovery.deinit(app.alloc);
-            return app.session.profile_usage.snapshot(
-                app.alloc,
-                scope,
-                snapshot_time_ms,
-                .{
-                    .facts = recovery.facts,
-                    .incidents = recovery.incidents,
-                    .pending = recovery.pending,
-                    .unknown_pending = recovery.unknown_pending,
-                },
-            );
         }
 
         fn commandUndoLast(ctx: *anyopaque) !void {
@@ -1250,7 +1128,7 @@ pub fn Handlers(comptime App: type) type {
                         std.Io.Dir.max_path_bytes,
                     );
                     defer display_path.deinit(app.alloc);
-                    break :blk try std.fmt.allocPrint(app.alloc, "Restored {s}", .{display_path.bytes});
+                    break :blk try app.alloc.print("Restored {s}", .{display_path.bytes});
                 },
                 .deleted => |path| blk: {
                     var display_path = try text_utils.encodeTerminalSafe(
@@ -1259,7 +1137,7 @@ pub fn Handlers(comptime App: type) type {
                         std.Io.Dir.max_path_bytes,
                     );
                     defer display_path.deinit(app.alloc);
-                    break :blk try std.fmt.allocPrint(app.alloc, "Deleted {s} (was newly created)", .{display_path.bytes});
+                    break :blk try app.alloc.print("Deleted {s} (was newly created)", .{display_path.bytes});
                 },
                 .unavailable => |path| blk: {
                     var display_path = try text_utils.encodeTerminalSafe(
@@ -1268,8 +1146,7 @@ pub fn Handlers(comptime App: type) type {
                         std.Io.Dir.max_path_bytes,
                     );
                     defer display_path.deinit(app.alloc);
-                    break :blk try std.fmt.allocPrint(
-                        app.alloc,
+                    break :blk try app.alloc.print(
                         "Could not undo {s}",
                         .{display_path.bytes},
                     );
@@ -1312,21 +1189,19 @@ pub fn Handlers(comptime App: type) type {
         fn commandHandleMcp(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             const command = std.mem.trim(u8, rest, " \t");
+            // MCP-v2: `/mcp` alone opens the menu, and `/mcp
+            // VERB` runs the verbs `fx mcp` has.
+            if (comptime @hasDecl(App, "runMcpVerbs")) if (app.mcpHostSelected()) {
+                if (command.len > 0) return app.runMcpVerbs(command);
+                closeOtherMenusForMcp(app);
+                app.openMcpHostMenu();
+                app.shell.render_requests.request(.footer);
+                return;
+            };
             if ((command.len == 0 or std.mem.eql(u8, command, "list")) and
                 comptime @hasDecl(App, "openMcpMenu"))
             {
-                closeModelMenuIfPresent(app);
-                closeHelpMenuIfPresent(app);
-                closeInlineCommandMenusIfPresent(app);
-                if (comptime @hasField(App, "skills")) app.skills.closeMenu();
-                if (comptime @hasField(App, "input_runtime")) {
-                    if (comptime @hasField(@TypeOf(app.input_runtime), "settings_menu")) {
-                        app.input_runtime.settings_menu.close();
-                    }
-                }
-                if (comptime @hasField(App, "session_persistence")) {
-                    app.session_persistence.session_picker.active = false;
-                }
+                closeOtherMenusForMcp(app);
                 try app.openMcpMenu();
                 app.shell.render_requests.request(.footer);
                 return;
@@ -1340,7 +1215,7 @@ pub fn Handlers(comptime App: type) type {
                 }
             }
             const result = try app.mcpCommandProvider().handle(app.alloc, rest, .{
-                .home = io_mod.getenv("HOME"),
+                .home = io_mod.homeDir(),
                 .list_ctx = @ptrCast(app),
                 .summarize_servers = summarizeMcpServers,
                 .list_servers_and_tools = listMcpServersAndTools,
@@ -1382,8 +1257,7 @@ pub fn Handlers(comptime App: type) type {
                             "MCP configuration could not be reloaded. Your existing MCP servers are still active. Check the configuration and run /mcp list for details before trying again.",
                         )
                     else
-                        try std.fmt.allocPrint(
-                            app.alloc,
+                        try app.alloc.print(
                             "{s}\nMCP configuration could not be reloaded. Your existing MCP servers are still active. Check the configuration and run /mcp list for details before trying again.",
                             .{command_body},
                         );
@@ -1396,8 +1270,7 @@ pub fn Handlers(comptime App: type) type {
                 reload_notice = if (result.report_reload)
                     try app.alloc.dupe(u8, started)
                 else
-                    try std.fmt.allocPrint(
-                        app.alloc,
+                    try app.alloc.print(
                         "{s}\n{s}",
                         .{ command_body, started },
                     );
@@ -1453,8 +1326,7 @@ pub fn Handlers(comptime App: type) type {
                                 "Project MCP choices may have been saved, so live MCP authority was retired. Run /mcp reload after checking settings.json.",
                             );
                         } else {
-                            owned_notice = try std.fmt.allocPrint(
-                                app.alloc,
+                            owned_notice = try app.alloc.print(
                                 "Project MCP choices were not applied: {s}.",
                                 .{@errorName(failure.err)},
                             );
@@ -1815,7 +1687,7 @@ pub fn Handlers(comptime App: type) type {
 
             switch (command) {
                 .install => |install| {
-                    const install_notice = try std.fmt.allocPrint(app.alloc, "Installing from {s}...", .{install.source});
+                    const install_notice = try app.alloc.print("Installing from {s}...", .{install.source});
                     defer app.alloc.free(install_notice);
                     try app.writeDomainNotice(.{
                         .topic = "skills",
@@ -1967,7 +1839,7 @@ pub fn Handlers(comptime App: type) type {
             if (comptime !@hasField(App, "input_runtime")) return;
             const InputRuntime = @TypeOf(app.input_runtime);
             if (comptime @hasField(InputRuntime, "statusline_menu")) app.input_runtime.statusline_menu.close();
-            if (comptime @hasField(InputRuntime, "usage_menu")) app.input_runtime.usage_menu.close(app.alloc);
+            if (comptime @hasField(InputRuntime, "usage_menu")) closeUsageMenu(app);
             if (comptime @hasField(InputRuntime, "workspace_menu")) app.input_runtime.workspace_menu.close();
         }
 
@@ -2129,7 +2001,7 @@ pub fn Handlers(comptime App: type) type {
             if (std.mem.trim(u8, rest, " \t").len == 0) {
                 refreshWorkspaceAvailabilityForList(app) catch |err| {
                     const reason = output_contracts.workspaceErrorMessage(err) orelse "workspace refresh failed";
-                    const message = try std.fmt.allocPrint(app.alloc, "Workspace refresh rejected: {s}", .{reason});
+                    const message = try app.alloc.print("Workspace refresh rejected: {s}", .{reason});
                     defer app.alloc.free(message);
                     try app.writeDomainNotice(.{
                         .topic = "workspace",
@@ -2174,7 +2046,7 @@ const trace_transcript_max_line_bytes: usize = 300;
 
 fn traceFilePermissions() std.Io.File.Permissions {
     const builtin = @import("builtin");
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .windows => .default_file,
         else => std.Io.File.Permissions.fromMode(0o600),
     };
@@ -2194,7 +2066,7 @@ fn writeTraceReportFile(alloc: std.mem.Allocator, contents: []const u8) ![]u8 {
         var random_bytes: [6]u8 = undefined;
         io_mod.getIo().random(&random_bytes);
         const random_hex = std.fmt.bytesToHex(random_bytes, .lower);
-        const path = try std.fmt.allocPrint(alloc, "{s}/fx-trace-{d}-{d:0>2}-{d:0>2}-{d:0>2}{d:0>2}{d:0>2}-{s}.md", .{
+        const path = try alloc.print("{s}/fx-trace-{d}-{d:0>2}-{d:0>2}-{d:0>2}{d:0>2}{d:0>2}-{s}.md", .{
             trimmed,
             year_day.year,
             month_day.month.numeric(),
@@ -2254,8 +2126,13 @@ fn buildTraceReport(app: anytype) ![]u8 {
     }
     const build_options = @import("build_options");
     try out.writer.print("version: {s} ({s})\n", .{ App.app_version, build_options.git_commit });
-    try out.writer.print("platform: {s}/{s}\n", .{ @tagName(builtin.os.tag), @tagName(builtin.cpu.arch) });
-    try out.writer.print("build: {s}\n", .{@tagName(builtin.mode)});
+    try out.writer.print("platform: {s}/{s}\n", .{ @tagName(builtin.target.os.tag), @tagName(builtin.target.cpu.arch) });
+    try out.writer.print("build: {s}\n", .{switch (builtin.optimize) {
+        .debug => "Debug",
+        .safe => "ReleaseSafe",
+        .fast => "ReleaseFast",
+        .small => "ReleaseSmall",
+    }});
     try out.writer.print("model: {s}\n", .{provider_runtime.model(app)});
     if (app.fast_mode) try out.writer.writeAll("fast_mode: on\n");
     const perm_label = permissions.permissionModeLabel(app.permission_engine.mode);
@@ -2360,13 +2237,7 @@ fn writeCurrentStateSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem
         try writer.print("tokens_total: {d}->{d}\n", .{ app.total_input_tokens, app.total_output_tokens });
     }
     if (comptime @hasField(App, "total_web_search_requests")) {
-        var usage = try app.session.usage.snapshot(alloc);
-        defer usage.deinit(alloc);
-        try writeSearchUsageSummary(
-            writer,
-            app.total_web_search_requests,
-            usage.billable_web_search_calls,
-        );
+        try writer.print("web_search_requests_total: {d}\n", .{app.total_web_search_requests});
     }
     try writeAuthStateSummary(writer, app);
     try writeProcessSummary(writer, alloc);
@@ -2465,7 +2336,7 @@ fn writeProcessSummary(writer: *std.Io.Writer, alloc: std.mem.Allocator) !void {
 
 fn countOpenFileDescriptors() ?usize {
     const builtin = @import("builtin");
-    const fd_dir = switch (builtin.os.tag) {
+    const fd_dir = switch (builtin.target.os.tag) {
         .linux => "/proc/self/fd",
         .macos => "/dev/fd",
         else => return null,
@@ -2483,7 +2354,7 @@ fn countOpenFileDescriptors() ?usize {
 }
 
 fn processMemorySnapshot(alloc: std.mem.Allocator, pid: std.c.pid_t) ![]u8 {
-    const pid_text = try std.fmt.allocPrint(alloc, "{d}", .{pid});
+    const pid_text = try alloc.print("{d}", .{pid});
     defer alloc.free(pid_text);
     const result = try std.process.run(alloc, io_mod.getIo(), .{
         .argv = &.{ "ps", "-o", "pid,ppid,rss,vsz,etime,stat", "-p", pid_text },
@@ -2661,6 +2532,8 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
         try writer.writeByte('\n');
     }
 
+    count += try writeMcpHostProblems(writer, app, alloc);
+
     var mcp_lease = if (comptime @hasDecl(@TypeOf(app.*), "acquireMcpRuntime"))
         app.acquireMcpRuntime()
     else
@@ -2819,6 +2692,62 @@ fn writeSessionTitleSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem
     try writer.writeByte('\n');
 }
 
+/// MCP-v2's servers, one line each; false when there is no host to ask.
+fn writeMcpHostServers(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !bool {
+    if (comptime !@hasDecl(@TypeOf(app.*), "mcpHostStatuses")) return false;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const statuses = (try app.mcpHostStatuses(arena.allocator())) orelse return false;
+    if (statuses.len == 0) {
+        try writer.writeAll("mcp_servers: none\n");
+        return true;
+    }
+    try writer.print("mcp_servers ({d}):\n", .{statuses.len});
+    for (statuses) |s| {
+        try writer.print("  - {s} state={s} transport={s} tools={d} signed_in={s} needs_login={s}\n", .{
+            s.name,
+            @tagName(s.state),
+            @tagName(s.transport),
+            s.tools,
+            boolLabel(s.signed_in),
+            boolLabel(s.needs_login),
+        });
+        if (s.last_error) |err| {
+            try writer.writeAll("    error: ");
+            try writeMaskedInline(writer, alloc, err);
+            try writer.writeByte('\n');
+        }
+    }
+    return true;
+}
+
+/// MCP-v2's servers that need someone to act: down, retrying, missing a
+/// variable, or waiting for a login.
+fn writeMcpHostProblems(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !usize {
+    if (comptime !@hasDecl(@TypeOf(app.*), "mcpHostStatuses")) return 0;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const statuses = (try app.mcpHostStatuses(arena.allocator())) orelse return 0;
+    var count: usize = 0;
+    for (statuses) |s| {
+        const what = switch (s.state) {
+            .failed => "failed",
+            .retrying => "retrying",
+            .missing_env => "missing a variable",
+            else => if (s.needs_login) "needs login" else continue,
+        };
+        count += 1;
+        try writer.print("- mcp server {s} name={s}", .{ what, s.name });
+        if (s.missing) |variable| try writer.print(" variable={s}", .{variable});
+        if (s.last_error) |err| {
+            try writer.writeAll(" error=");
+            try writeMaskedInline(writer, alloc, err);
+        }
+        try writer.writeByte('\n');
+    }
+    return count;
+}
+
 fn writeRuntimeContextSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !void {
     try writer.writeAll("\n## Runtime Context\n");
     try writer.print("TERM: {s}\n", .{io_mod.getenv("TERM") orelse "(unset)"});
@@ -2828,6 +2757,11 @@ fn writeRuntimeContextSummary(writer: *std.Io.Writer, app: anytype, alloc: std.m
         boolLabel(io_mod.getenv("TMUX") != null),
         boolLabel(io_mod.getenv("CMUX_WORKSPACE_ID") != null),
     });
+
+    if (comptime @hasDecl(@TypeOf(app.*), "mcpHostSelected")) {
+        try writer.print("mcp_engine: {s}\n", .{if (app.mcpHostSelected()) "v2" else "v1"});
+    }
+    if (try writeMcpHostServers(writer, app, alloc)) return;
 
     var mcp_lease = if (comptime @hasDecl(@TypeOf(app.*), "acquireMcpRuntime"))
         app.acquireMcpRuntime()
@@ -3087,7 +3021,7 @@ fn writeModelCatalogSummary(writer: *std.Io.Writer, app: anytype) !void {
         }
         if (snapshot.failure_category) |category| {
             try writer.print(" failure={s} retryable={s}", .{ category, boolLabel(snapshot.failure_retryable) });
-            if (snapshot.failure_http_status) |status| try writer.print(" status={d}", .{@intFromEnum(status)});
+            if (snapshot.failure_http_status) |status| try writer.print(" status={d}", .{@backingInt(status)});
             if (snapshot.anonymous_fallback) try writer.writeAll(" anonymous_fallback=true");
         }
         try writer.writeByte('\n');
@@ -3188,8 +3122,7 @@ fn projectProviderToolCalls(
                     output[count] = summary;
                     count += 1;
                 } else {
-                    std.mem.copyForwards(
-                        ProviderToolCallSummary,
+                    @memmove(
                         output[0 .. output.len - 1],
                         output[1..],
                     );
@@ -3206,11 +3139,6 @@ fn providerToolStatusLabel(status: ?types.PersistedToolStatus) []const u8 {
         .success => "ok",
         .failure => "err",
     } else "pending";
-}
-
-fn writeSearchUsageSummary(writer: *std.Io.Writer, observed: u64, billed: u64) !void {
-    try writer.print("web_search_requests_total: {d} (observed)\n", .{observed});
-    try writer.print("billable_web_search_calls: {d} (billed)\n", .{billed});
 }
 
 noinline fn writeToolCallsSummary(
@@ -3571,7 +3499,7 @@ fn renderThematicRuleTimelineBody(alloc: std.mem.Allocator, text: []const u8) ![
     const stripped = try stripAnsiEscapes(alloc, text);
     defer alloc.free(stripped);
     const trimmed = std.mem.trimEnd(u8, stripped, " \t\r\n");
-    return std.fmt.allocPrint(alloc, "  {s}\n", .{trimmed});
+    return alloc.print("  {s}\n", .{trimmed});
 }
 
 test "workspace slash parser preserves paths with spaces and rejects incomplete actions" {
@@ -3631,7 +3559,7 @@ test "workspace list refresh waits for an idle turn" {
         active: bool = true,
         index_refresh_count: usize = 0,
 
-        fn refreshWorkspaceAccess(self: *@This()) !bool {
+        pub fn refreshWorkspaceAccess(self: *@This()) !bool {
             self.available = false;
             self.active = false;
             self.index_refresh_count += 1;
@@ -3689,11 +3617,11 @@ test "workspace list reports refresh rejection without replacing access" {
             self.transcript.deinit(self.alloc);
         }
 
-        fn refreshWorkspaceAccess(_: *@This()) !bool {
+        pub fn refreshWorkspaceAccess(_: *@This()) !bool {
             return error.TooManyDirectories;
         }
 
-        fn workspaceAccess(self: *@This()) *const Access {
+        pub fn workspaceAccess(self: *@This()) *const Access {
             return &self.access;
         }
 
@@ -3830,8 +3758,7 @@ fn handleRenameCommand(app: anytype, rest: []const u8) !void {
             error.InvalidTitle => "title must be printable text",
             error.NoActiveSession => "no active session to rename",
             else => {
-                const notice = try std.fmt.allocPrint(
-                    app.alloc,
+                const notice = try app.alloc.print(
                     "renamed for this process but not saved ({s})",
                     .{@errorName(err)},
                 );
@@ -3853,7 +3780,7 @@ fn handleRenameCommand(app: anytype, rest: []const u8) !void {
 
     app.shell.render_requests.request(.footer);
     const title = SessionRuntime.cachedSessionTitle(app) orelse "";
-    const msg = try std.fmt.allocPrint(app.alloc, "renamed to \"{s}\"", .{title});
+    const msg = try app.alloc.print("renamed to \"{s}\"", .{title});
     defer app.alloc.free(msg);
     try app.writeDomainNotice(.{ .topic = "session", .tone = .neutral, .body = msg }, true);
 }
@@ -3862,8 +3789,9 @@ const StatuslineFeedback = enum { announce, silent };
 
 fn parseStatuslineItem(raw: []const u8) ?config_runtime.StatuslineItem {
     const trimmed = std.mem.trim(u8, raw, " \t");
-    inline for (std.meta.fields(config_runtime.StatuslineItem)) |field| {
-        if (std.mem.eql(u8, trimmed, field.name)) return @enumFromInt(field.value);
+    const statusline_item_info = @typeInfo(config_runtime.StatuslineItem).@"enum";
+    inline for (statusline_item_info.field_names, statusline_item_info.field_values) |field_name, field_value| {
+        if (std.mem.eql(u8, trimmed, field_name)) return @fromBackingInt(@intCast(field_value));
     }
     return null;
 }
@@ -3915,8 +3843,7 @@ fn applyStatuslineItem(
     switch (feedback) {
         .announce => {
             try persistUserPreferences(app, "statusline", patch, runtime_changed);
-            const message = try std.fmt.allocPrint(
-                app.alloc,
+            const message = try app.alloc.print(
                 "{s}: {s}",
                 .{ @tagName(item), if (enabled) "on" else "off" },
             );
@@ -4169,8 +4096,7 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
                 return error.InvalidSettingsCatalogValue;
             const capabilities = app.resolvedModelCapabilities(provider_runtime.model(app));
             if (!model_capabilities.reasoningEffortSupported(capabilities, effort)) {
-                const message = try std.fmt.allocPrint(
-                    app.alloc,
+                const message = try app.alloc.print(
                     "{s} is not available for {s}",
                     .{ effort.displayLabel(), provider_runtime.model(app) },
                 );
@@ -4302,7 +4228,7 @@ const McpCommandFakeApp = struct {
         self.notice_body.deinit(self.alloc);
     }
 
-    fn openMcpMenu(self: *McpCommandFakeApp) !void {
+    pub fn openMcpMenu(self: *McpCommandFakeApp) !void {
         self.menu_open_count += 1;
     }
 
@@ -4352,7 +4278,7 @@ const McpCommandFakeApp = struct {
         self.reload_pending = true;
     }
 
-    fn takeMcpReloadCompletion(self: *McpCommandFakeApp) !?app_mcp_runtime.ReloadCompletion {
+    pub fn takeMcpReloadCompletion(self: *McpCommandFakeApp) !?app_mcp_runtime.ReloadCompletion {
         if (!self.reload_pending) return null;
         self.reload_pending = false;
         return switch (self.reload_behavior) {
@@ -4391,11 +4317,11 @@ const McpCommandFakeApp = struct {
         };
     }
 
-    fn mcpReloadCompletionOrigin(self: *const McpCommandFakeApp) app_mcp_runtime.PresentationOrigin {
+    pub fn mcpReloadCompletionOrigin(self: *const McpCommandFakeApp) app_mcp_runtime.PresentationOrigin {
         return self.completion_origin;
     }
 
-    fn applyMcpMenuReloadCompletion(
+    pub fn applyMcpMenuReloadCompletion(
         self: *McpCommandFakeApp,
         generation: u64,
         _: *const app_mcp_runtime.ReloadCompletion,
@@ -4404,7 +4330,7 @@ const McpCommandFakeApp = struct {
         self.menu_reload_completions += 1;
     }
 
-    fn takeMcpAuthenticationCompletion(
+    pub fn takeMcpAuthenticationCompletion(
         self: *McpCommandFakeApp,
     ) !?app_mcp_runtime.AuthenticationCompletion {
         if (!self.authentication_pending) return null;
@@ -4416,11 +4342,11 @@ const McpCommandFakeApp = struct {
         };
     }
 
-    fn mcpAuthenticationCompletionOrigin(self: *const McpCommandFakeApp) app_mcp_runtime.PresentationOrigin {
+    pub fn mcpAuthenticationCompletionOrigin(self: *const McpCommandFakeApp) app_mcp_runtime.PresentationOrigin {
         return self.completion_origin;
     }
 
-    fn applyMcpMenuAuthenticationCompletion(
+    pub fn applyMcpMenuAuthenticationCompletion(
         self: *McpCommandFakeApp,
         generation: u64,
         _: *const app_mcp_runtime.AuthenticationCompletion,
@@ -4573,7 +4499,7 @@ const SkillsInstallReplayApp = struct {
         self.shell.deinit(self.alloc);
     }
 
-    fn requestSkillsRefresh(self: *SkillsInstallReplayApp) !u64 {
+    pub fn requestSkillsRefresh(self: *SkillsInstallReplayApp) !u64 {
         self.reload_count += 1;
         self.skills.fresh_through_generation = self.reload_count;
         return self.reload_count;
@@ -4606,7 +4532,7 @@ const ChangeCommandFakeApp = struct {
 };
 
 fn writeTempSkillFile(tmp: *std.testing.TmpDir, sub_path: []const u8, content: []const u8) !void {
-    if (std.fs.path.dirname(sub_path)) |parent| {
+    if (std.Io.Dir.path.dirname(sub_path)) |parent| {
         try tmp.dir.createDirPath(io_mod.getIo(), parent);
     }
     var file = try tmp.dir.createFile(io_mod.getIo(), sub_path, .{ .truncate = true });
@@ -4779,7 +4705,7 @@ test "trace report file uses private randomized markdown path" {
     defer file.close(std.testing.io);
     const stat = try file.stat(std.testing.io);
     try std.testing.expectEqual(@as(u64, 6), stat.size);
-    if (@import("builtin").os.tag != .windows) {
+    if (@import("builtin").target.os.tag != .windows) {
         try std.testing.expectEqual(@as(std.posix.mode_t, 0), stat.permissions.toMode() & 0o077);
     }
 }
@@ -5080,19 +5006,6 @@ test "trace provider tool projection keeps the most recent bounded calls" {
     try std.testing.expectEqualStrings("newest", summaries[count - 1].call_id);
 }
 
-test "trace labels observed and billed search usage independently" {
-    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer out.deinit();
-
-    try writeSearchUsageSummary(&out.writer, 3, 1);
-
-    try std.testing.expectEqualStrings(
-        "web_search_requests_total: 3 (observed)\n" ++
-            "billable_web_search_calls: 1 (billed)\n",
-        out.written(),
-    );
-}
-
 test "trace renders web search request count without content" {
     const alloc = std.testing.allocator;
     diagnostics.resetForTest();
@@ -5178,7 +5091,7 @@ test "trace network section reports session totals and window coverage" {
 
     const total = diagnostics.network_ring_capacity + 2;
     var expect_buf: [160]u8 = undefined;
-    const session_line = try std.fmt.bufPrint(&expect_buf, "session: calls={d} ok={d} errors=1", .{ total, total - 1 });
+    const session_line = try std.mem.print(&expect_buf, "session: calls={d} ok={d} errors=1", .{ total, total - 1 });
     try std.testing.expect(std.mem.find(u8, text, session_line) != null);
     try std.testing.expect(std.mem.find(u8, text, "coverage: window holds only the last") != null);
     try std.testing.expect(std.mem.find(u8, text, "turns:\n") != null);
@@ -5227,7 +5140,7 @@ test "trace tool section reports session totals and window coverage" {
 
     const total = diagnostics.tool_call_ring_capacity + 2;
     var expect_buf: [200]u8 = undefined;
-    const session_line = try std.fmt.bufPrint(
+    const session_line = try std.mem.print(
         &expect_buf,
         "session: calls={d} succeeded={d} rejected=1 command_failed=0 tool_failed=0 runtime_failed=0",
         .{ total, total - 1 },
@@ -5250,13 +5163,13 @@ test "app_commands exposes active handler API surface" {
     const HandlerSurface = Handlers(SurfaceOnlyApp);
 
     const route_info = @typeInfo(@TypeOf(HandlerSurface.route)).@"fn";
-    try std.testing.expectEqual(@as(usize, 2), route_info.params.len);
-    try std.testing.expect(route_info.params[0].type.? == *SurfaceOnlyApp);
-    try std.testing.expect(route_info.params[1].type.? == []const u8);
+    try std.testing.expectEqual(@as(usize, 2), route_info.param_types.len);
+    try std.testing.expect(route_info.param_types[0].? == *SurfaceOnlyApp);
+    try std.testing.expect(route_info.param_types[1].? == []const u8);
 
     const handlers_info = @typeInfo(@TypeOf(HandlerSurface.commandHandlers)).@"fn";
-    try std.testing.expectEqual(@as(usize, 1), handlers_info.params.len);
-    try std.testing.expect(handlers_info.params[0].type.? == *SurfaceOnlyApp);
+    try std.testing.expectEqual(@as(usize, 1), handlers_info.param_types.len);
+    try std.testing.expect(handlers_info.param_types[0].? == *SurfaceOnlyApp);
     try std.testing.expect(handlers_info.return_type.? == command_router.CommandHandlers);
 }
 
@@ -5451,7 +5364,7 @@ test "skills install groups command notice fragments for entry replay" {
     var app = SkillsInstallReplayApp{ .alloc = alloc, .skills = .{ .dir = dest_dir } };
     defer app.deinit();
 
-    const args = try std.fmt.allocPrint(alloc, "install {s}", .{pack_dir});
+    const args = try alloc.print("install {s}", .{pack_dir});
     defer alloc.free(args);
     try Handlers(SkillsInstallReplayApp).commandHandleSkills(@ptrCast(&app), args);
 
@@ -5462,7 +5375,7 @@ test "skills install groups command notice fragments for entry replay" {
     try std.testing.expect(app.shell.entries.items[0] == .semantic_notice);
     try std.testing.expect(app.shell.entries.items[1] == .semantic_notice);
     try std.testing.expectEqualStrings("skills", app.shell.entries.items[0].semantic_notice.topic);
-    const installing_body = try std.fmt.allocPrint(alloc, "Installing from {s}...", .{pack_dir});
+    const installing_body = try alloc.print("Installing from {s}...", .{pack_dir});
     defer alloc.free(installing_body);
     try std.testing.expectEqualStrings(installing_body, app.shell.entries.items[0].semantic_notice.body);
     try std.testing.expectEqualStrings(

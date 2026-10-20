@@ -55,9 +55,10 @@ pub const Runtime = struct {
     model_picker_draft: ?composer_stash.State = null,
 
     pub fn initInto(self: *Runtime) void {
-        inline for (std.meta.fields(Runtime)) |field| {
-            if (comptime std.mem.eql(u8, field.name, "picker")) continue;
-            @field(self.*, field.name) = field.defaultValue().?;
+        const runtime_info = @typeInfo(Runtime).@"struct";
+        inline for (runtime_info.field_names, runtime_info.field_types, runtime_info.field_attrs) |field_name, field_type, field_attrs| {
+            if (comptime std.mem.eql(u8, field_name, "picker")) continue;
+            @field(self.*, field_name) = field_attrs.defaultValue(field_type).?;
         }
         self.picker.initInto();
     }
@@ -65,7 +66,7 @@ pub const Runtime = struct {
     pub fn deinit(self: *Runtime, alloc: Allocator) void {
         input_reset.resetPendingTextScalarWithTrace(&self.text_scalar, "shutdown");
         self.paste.deinit(alloc);
-        self.usage_menu.close(alloc);
+        self.usage_menu.close();
         self.edit_state.deinit(alloc);
         self.picker.deinit(alloc);
         self.composer_history.deinit(alloc);

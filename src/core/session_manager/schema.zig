@@ -106,8 +106,9 @@ pub const Outcome = enum { ok, failed, cancelled, interrupted, lost };
 /// side folder: its value names the blob that maps old handles to blobs,
 /// and its line lists every moved blob (D47). `compaction_records` names
 /// the blob that maps fx's compactor record names to blobs, and its line
-/// lists the map and the records it adds (D50).
-pub const SetKey = enum { prefs, title, permissions, usage, workspace, language, client_prompt, tool_identities, moved_files, compaction_records };
+/// lists the map and the records it adds (D50). `v1_source` is fx's record
+/// of the v1 session a converted one was copied from (D60).
+pub const SetKey = enum { prefs, title, permissions, usage, workspace, language, client_prompt, tool_identities, moved_files, compaction_records, v1_source };
 
 pub const ForkOrigin = struct { id: []const u8, seq: u64 };
 
@@ -483,7 +484,7 @@ fn fastValue(comptime T: type, value: []const u8) ?T {
         .bool => return if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else null,
         .@"enum" => return std.meta.stringToEnum(T, plainString(value) orelse return null),
         .pointer => |ptr| {
-            if (ptr.size != .slice or ptr.child != u8 or !ptr.is_const) return null;
+            if (ptr.size != .slice or ptr.child != u8 or !ptr.attrs.@"const") return null;
             return plainString(value);
         },
         else => return null,
@@ -847,10 +848,10 @@ test "Fields fast paths decode exactly what the full parse decodes" {
 }
 
 test "validItemType: short lowercase names only" {
-    for ([_][]const u8{ "user", "assistant", "tool_call", "tool_result", "steering", "a", "v2", "x" ** 32 }) |name| {
+    for ([_][]const u8{ "user", "assistant", "tool_call", "tool_result", "steering", "a", "v2", &@as([32]u8, @splat('x')) }) |name| {
         try testing.expect(validItemType(name));
     }
-    for ([_][]const u8{ "", "x" ** 33, "Steering", "tool-call", "tool call", "caf\u{e9}", "a/b", "\"q\"" }) |name| {
+    for ([_][]const u8{ "", &@as([33]u8, @splat('x')), "Steering", "tool-call", "tool call", "caf\u{e9}", "a/b", "\"q\"" }) |name| {
         try testing.expect(!validItemType(name));
     }
 }

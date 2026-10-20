@@ -1,8 +1,115 @@
 # fx
 
-## 0.0.13
+## 0.0.14
 
 <!-- release:start -->
+
+**libfx is now durable out of the box. Same API on local, Vercel and DIY. Use your ChatGPT or Grok subscription, or a custom provider, to power cloud agents with libfx. fx moves to Zig 0.17.**
+
+### New Features
+
+- Durable libfx sessions can continue after crashes, [redeploys](https://fx.sh/docs/lib/durability#what-a-session-stores), and function timeouts. Interrupted tools run again only when marked `idempotent: true`.
+- You can run multiple named libfx agents in one app, each with its own model, instructions, and tools. Sessions stay with the agent that created them.
+- [`wakeHandler()`](https://fx.sh/docs/lib/durability#several-agents) provides an HTTP handler for queued prompts and recovery, so one Vercel route serves all your libfx agents.
+- Each libfx session can override its agent's model, reasoning effort, and instructions.
+- libfx now supports ChatGPT and Grok subscriptions for server-side agents, with sign-in helpers included.
+- libfx agents can connect to custom OpenAI-compatible endpoints, including [local model servers](https://fx.sh/docs/lib/providers#custom-providers).
+- Clients can reconnect to a libfx reply stream from the last event they received, even through a different server.
+- Another server process can steer or cancel a running libfx session, or resume an interrupted turn.
+- Prompts sent to a busy libfx session queue behind its running turn and start when it finishes.
+- Reusing a libfx `messageId` follows the original turn instead of starting it again.
+- libfx now includes TypeScript types for its public APIs.
+- Pass `hooks` to `createFxAgent()` or `createFxEngine()` to observe model calls, tools, approvals, subagents, and saved-session activity on native and WebAssembly backends. Content capture is opt-in, and callback failures do not interrupt or retry agent work.
+- With `--sessions-v2`, opening a session saved in the previous format converts it together with its subagent sessions. The previous-format files are removed only after the converted sessions are saved.
+- Use `fx --sessions-v2 sessions convert` to convert all sessions saved in the previous format at once.
+- On Vercel, libfx can use deployment OIDC credentials instead of an API key.
+- `createFxEngine()` adds queued follow-ups with `followUp()` and lets you withdraw pending steering with `turn.withdraw()`.
+- `/usage` and `fx usage` now show your provider's usage reports instead of locally recorded usage.
+- AI Gateway usage shows your spending and budget, or the selected API key's spending, with per-model totals.
+- `/usage` now shows ChatGPT plan limits and activity, plus Grok allowances, credits, and pay-as-you-go spending.
+- In `@` file suggestions, Enter mentions the selected folder; Tab opens it.
+- ACP clients can toggle Fast mode on supported models and keep the setting when resuming.
+- `fx models --json` now lists Gateway model names, reasoning levels, and Fast and Ultrafast support.
+- `fx status --json` now reports the starting permission mode, available modes, and reasoning effort.
+- Compatible terminals can show when fx is working, finished, or waiting for your input.
+- Commands launched by fx receive `AI_AGENT=fx`, so development tools can detect the agent environment.
+
+### Improvements
+
+- Prompts now appear immediately after Enter, even in long conversations.
+- On Vercel, libfx starts idle sessions in the request that submits the prompt instead of waiting for a queue delivery.
+- libfx waits to read a reply stream until its events or result are requested.
+- Native libfx reuses HTTP connections between turns without delaying streamed output.
+- libfx shares token refreshes across sessions and supports `refreshLock` for multi-server apps.
+- `@` suggestions reuse a saved workspace index, and file-content searches run in parallel.
+- `@` suggestions rank exact file names, name prefixes, and whole-word matches above scattered letters. Searches can span a file's containing folder and its name, and highlighted letters show the match used to rank it.
+- Short `@` searches and searches with many exact matches return faster. The file picker shows up to 10 rows when the terminal has room.
+- Repeated file searches use less memory during long turns.
+- `grep_files` now searches files larger than 200 KiB and reports when results are incomplete.
+- `ctrl+o` now wraps long commands and tool details instead of cutting them off.
+- `/usage` opens with cached numbers and refreshes in the background. Press `r` to refresh manually.
+- Shell tracing now includes startup-step timings for diagnosing slow launches.
+- Embedded browser terminals can load your workspace's `AGENTS.md` through the host adapter.
+- ACP sessions start in your saved permission mode and remember changes for future CLI and ACP sessions.
+- Image-heavy requests keep the newest images and omit older ones when needed, without changing saved history.
+- Request-size errors trigger a retry with fewer images before compaction.
+
+### Bug Fixes
+
+- Long submitted prompts and steering messages no longer overwrite earlier scrollback.
+- `ctrl+o` keeps your reading position when running commands change the transcript above it.
+- File searches pick up newly created files and respect parent and global ignore rules.
+- `grep_files` no longer hangs when it encounters a named pipe.
+- An empty or relative `HOME` no longer crashes fx or puts profile files in the current folder.
+- Shell commands no longer fail when a child process exits in gVisor sandboxes, including Modal.
+- Switching models or providers in ACP turns off Fast or Ultrafast when the new model does not support it.
+- Embedded terminals apply Fast and Ultrafast to their first request without opening the model picker.
+- libfx tool failures include an error message even when the tool throws an empty error.
+- libfx saves each tool result as it finishes, so recovery can reuse completed work.
+- Interrupted libfx tools no longer appear to run forever after recovery. Their events report that the call may have partly run.
+- libfx rejects checkpoints created by a newer version instead of attempting to restore them.
+- A steer that starts a durable libfx turn is no longer applied twice or dropped when it contains images.
+- Cancelling a durable libfx session no longer stops a queued prompt that starts after the cancellation. Steering already assigned to another queued prompt no longer reaches the running turn.
+- Usage totals stay visible when a refresh fails or the local cache becomes unreadable.
+- Gateway requests no longer fail intermittently at startup.
+- libfx rejects invalid host HTTP statuses instead of crashing the process.
+- Markdown rendering no longer crashes on incomplete UTF-8.
+
+### Security
+
+- Workspace indexing and fx's built-in read-only Git checks no longer run repository-configured programs.
+- Auto mode no longer reruns a refused built-in Git check without its protections.
+- Local usage data is saved with owner-only permissions.
+- Vercel and local libfx storage reject writes from a worker that has lost ownership of the session.
+- libfx keeps credentials out of saved conversations and adds them only to the selected service's HTTP calls.
+- libfx masks keys and tokens echoed in failed provider responses.
+- Grok token refresh rejects credentials belonging to a different account.
+- libfx sign-in helpers reject pasted callbacks from a different sign-in.
+- Custom libfx endpoints require HTTPS outside localhost.
+- libfx routes queued work to the named agent on the intended store, rather than another store with the same agent name. Use a separate `world()` store for each customer whose sessions must stay separate.
+- libfx ignores queue deliveries that do not refer to an input already saved by the app. A delivery cannot replace that input or its caller context and session settings; apps must still authorize session access and authenticate their queue routes.
+
+### Breaking Changes
+
+- macOS release binaries now require macOS 15 or later.
+- Building fx from source now requires Zig 0.17.
+- `createFxAgent()` now manages durable sessions. Use `createFxEngine()` for the previous single-conversation API.
+- Tools passed to `createFxAgent()` must set `idempotent: true` or `false` to say whether a call can run again after a crash.
+- Native libfx runs idempotent tools in parallel unless marked `writes: true`. Other tools run alone by default.
+- Images sent to durable libfx sessions must be Base64-encoded. `createFxEngine()` still accepts image files and raw bytes directly.
+- Disconnecting from a durable libfx turn no longer stops it. Use `session.cancel()` or an abort signal.
+- In one process, libfx agents with the same name on the same store must use the same configuration. Creating a conflicting agent throws `FX_AGENT_NAME_IN_USE`; give different configurations separate names or stores.
+- Durable libfx prompts and steers, including their context and session settings, must fit within 8 MiB of JSON. Larger inputs throw `FX_INPUT_TOO_LARGE` before anything is saved.
+- ACP's `code` mode has been replaced by `auto`. Clients should use `auto`, `ask`, or `full-access`.
+- `/cost` has been removed. Use `/usage`.
+- `fx usage --period` now accepts `today`, `7d`, and `month`. The `24h` and `30d` periods have been removed.
+
+- `fx usage --json` now returns provider reports instead of the previous local usage totals.
+- ACP usage updates report context use and no longer include costs.
+
+<!-- release:end -->
+
+## 0.0.13
 
 **fx now supports Ultrafast on supported OpenAI models and launches up to 23× faster. Shell calls are up to 8.6× faster, and exits are up to 44× faster in matched benchmarks.**
 
@@ -44,8 +151,6 @@
 
 - Reloading shell configuration clears remembered command approvals. Auto mode reviews routine commands that use captured aliases or functions.
 - ACP sessions use profile MCP servers only when the client explicitly opts in.
-
-<!-- release:end -->
 
 ## 0.0.12
 

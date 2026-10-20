@@ -11,7 +11,6 @@ const builtin_gateway = @import("../../../../builtins/gateway.zig");
 const builtin_tools = @import("../../../../builtins/tools.zig");
 const session_runtime = @import("../../../session/session.zig");
 const session_codec = @import("../../../session/session_codec.zig");
-const session_usage = @import("../../../session/session_usage.zig");
 const model_provider = @import("../../../config/model_provider.zig");
 const command_replay_store = @import("../../../session/command_replay_store.zig");
 const session_child_store = @import("../../../session/session_child_store.zig");
@@ -179,7 +178,7 @@ fn testExecutionAuthority(call: ToolCall) command_admission.ToolExecutionAuthori
         .fingerprint = .{
             .command = call.arguments_json,
             .resolved_cwd = "",
-            .target_os = builtin.os.tag,
+            .target_os = builtin.target.os.tag,
         },
         .source = .interactive_once,
     } } };
@@ -209,8 +208,6 @@ pub const FakeCompletion = struct {
     omit_finish: bool = false,
     usage: types.Usage = .{},
     generation_id: ?[]const u8 = null,
-    billing: ?types.ProviderBilling = null,
-    exact_usage_provider: ?model_provider.ProviderId = null,
     delivery_ambiguous: bool = false,
     pause_before_output: bool = false,
     cancel_before_output: bool = false,
@@ -376,12 +373,7 @@ pub const FakeGateway = struct {
                     completion.finish_reason orelse if (completion.tool_calls.len > 0) .tool_calls else .stop,
                 .usage = completion.usage,
                 .generation_id = completion.generation_id,
-                .billing = completion.billing,
             },
-            .usage = if (completion.exact_usage_provider) |provider_id|
-                .{ .exact = provider_id }
-            else
-                .{ .unavailable = .possibly_billed },
         } };
     }
 
@@ -647,7 +639,6 @@ pub const FakeAgentRuntimeDeps = struct {
     cancel_on_execute_delay_ms: u64 = 0,
     ordinary_cancel_on_execute_name: ?[]const u8 = null,
     session_context: ?*session_runtime.SessionRuntime = null,
-    usage: ?*session_usage.Usage = null,
     validation_not_registered_names: []const []const u8 = &.{},
     validation_failure_names: []const []const u8 = &.{},
     validation_results: []const ?[]const u8 = &.{},
@@ -689,6 +680,9 @@ pub const FakeAgentRuntimeDeps = struct {
     last_credential_refresh_expected_account: ?[]u8 = null,
     enable_interactive_notices: bool = false,
     enable_recovery_checkpoint: bool = false,
+    /// Returned by every session writer check; null confirms the writer.
+    session_writer_error: ?anyerror = null,
+    session_writer_checks: usize = 0,
     recovery_checkpoints: std.ArrayList(session_codec.RecoveryCheckpoint) = .empty,
     recovery_checkpoint_error: ?anyerror = null,
     recovery_checkpoint_error_at: ?usize = null,
@@ -813,6 +807,7 @@ pub const FakeAgentRuntimeDeps = struct {
                 .set = setRecoveryCheckpoint,
                 .clear = clearRecoveryCheckpoint,
             } else null,
+            .confirm_session_writer = confirmSessionWriter,
             .propagate_grant = @This().propagateGrant,
             .push_event = pushEvent,
             .push_text = pushText,
@@ -838,9 +833,13 @@ pub const FakeAgentRuntimeDeps = struct {
             .record_tool_call_rejected = recordRejected,
             .record_tool_call_failed = recordFailed,
             .report_inner_tool_usage = reportCapturedInnerToolUsage,
-            .usage = self.usage,
-            .usage_allocator = self.alloc,
         };
+    }
+
+    fn confirmSessionWriter(raw: *anyopaque) anyerror!void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.session_writer_checks += 1;
+        if (self.session_writer_error) |err| return err;
     }
 
     fn clearRecoveryCheckpoint(raw: *anyopaque) !void {
@@ -997,7 +996,7 @@ pub const FakeAgentRuntimeDeps = struct {
     }
 
     fn record(self: *FakeAgentRuntimeDeps, comptime fmt: []const u8, args: anytype) !void {
-        try self.log.append(self.alloc, try std.fmt.allocPrint(self.alloc, fmt, args));
+        try self.log.append(self.alloc, try self.alloc.print(fmt, args));
     }
 
     fn prepareParentTurnContext(raw: *anyopaque, arena: Allocator) !?runtime_deps.PreparedParentTurnContext {
@@ -1077,7 +1076,7 @@ pub const FakeAgentRuntimeDeps = struct {
         }
         for (self.validation_failure_names) |name| {
             if (std.mem.eql(u8, name, call.name)) {
-                return .{ .failure = try std.fmt.allocPrint(arena, "{s} arguments failed registered-tool validation", .{call.name}) };
+                return .{ .failure = try arena.print("{s} arguments failed registered-tool validation", .{call.name}) };
             }
         }
         const mcp_runtime_generation = if (self.validation_mcp_tool_name) |name|
@@ -1398,20 +1397,20 @@ pub const FakeAgentRuntimeDeps = struct {
 
     fn describeAction(_: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, _: []const []const u8) ![]const u8 {
         return if (display_target) |target|
-            std.fmt.allocPrint(arena, "start {s} {s}", .{ call.name, target })
+            arena.print("start {s} {s}", .{ call.name, target })
         else
-            std.fmt.allocPrint(arena, "start {s}", .{call.name});
+            arena.print("start {s}", .{call.name});
     }
 
     fn describeCompleted(_: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, _: []const []const u8) ![]const u8 {
         return if (display_target) |target|
-            std.fmt.allocPrint(arena, "done {s} {s}", .{ call.name, target })
+            arena.print("done {s} {s}", .{ call.name, target })
         else
-            std.fmt.allocPrint(arena, "done {s}", .{call.name});
+            arena.print("done {s}", .{call.name});
     }
 
     fn describeDenied(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
-        return std.fmt.allocPrint(arena, "{s} {s}", .{ label, call.name });
+        return arena.print("{s} {s}", .{ label, call.name });
     }
 
     fn permissionTarget(raw: *anyopaque, arena: Allocator, call: ToolCall, _: []const []const u8) ![]const u8 {
@@ -1856,7 +1855,7 @@ pub const FakeAgentRuntimeDeps = struct {
     }
 
     fn formatError(_: *anyopaque, arena: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {
-        return std.fmt.allocPrint(arena, "Tool {s} failed: {s}", .{ tool_name, @errorName(err) });
+        return arena.print("Tool {s} failed: {s}", .{ tool_name, @errorName(err) });
     }
 };
 
@@ -2143,7 +2142,7 @@ pub fn expectBodyContainsInOrder(gateway: *const FakeGateway, index: usize, need
     const body = gateway.request_bodies.items[index];
     var cursor: usize = 0;
     for (needles) |needle| {
-        const found = std.mem.indexOfPos(u8, body, cursor, needle) orelse return error.TestExpectedBodyNeedleMissing;
+        const found = std.mem.findPos(u8, body, cursor, needle) orelse return error.TestExpectedBodyNeedleMissing;
         cursor = found + needle.len;
     }
 }
@@ -2210,7 +2209,7 @@ pub fn countText(hooks: *const FakeAgentRuntimeDeps, needle: []const u8) usize {
 pub fn countNeedle(haystack: []const u8, needle: []const u8) usize {
     var count: usize = 0;
     var pos: usize = 0;
-    while (std.mem.indexOfPos(u8, haystack, pos, needle)) |found| {
+    while (std.mem.findPos(u8, haystack, pos, needle)) |found| {
         count += 1;
         pos = found + needle.len;
     }

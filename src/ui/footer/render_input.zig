@@ -7,11 +7,12 @@ const model_cache_runtime = @import("../../core/app/model_cache_runtime.zig");
 const app_mcp_runtime = @import("../../core/app/app_mcp_runtime.zig");
 const mcp_health = @import("../../core/mcp/health.zig");
 const mcp_menu_state = @import("../../core/mcp/menu_state.zig");
+const mcp_host_menu_presentation = @import("mcp_host_menu_presentation.zig");
 const mcp_runtime = @import("../../core/mcp/mcp_runtime.zig");
 const picker_state = @import("../../core/input/picker_state.zig");
 const session_catalog = @import("../../core/session/session_catalog.zig");
 const session_store = @import("../../core/session/session_store.zig");
-const usage_report = @import("../../core/session/usage_report.zig");
+const usage_presentation = @import("usage_presentation.zig");
 const command_specs = @import("../../core/slash_commands/command_specs.zig");
 const settings_catalog = @import("../../core/config/settings_catalog.zig");
 const skill_runtime = @import("../../core/skills/skill_runtime.zig");
@@ -87,7 +88,7 @@ pub const ModelMenuProjection = struct {
     query: []const u8 = "",
 
     pub fn providerFilter(self: ModelMenuProjection) model_cache_runtime.ModelProviderFilter {
-        return @enumFromInt(@min(self.provider_index, model_cache_runtime.model_provider_filter_count - 1));
+        return @fromBackingInt(@intCast(@min(self.provider_index, model_cache_runtime.model_provider_filter_count - 1)));
     }
 
     pub fn filteredItemCount(self: ModelMenuProjection) usize {
@@ -295,27 +296,21 @@ pub fn statuslineMenuProjection(
     };
 }
 
-pub const UsageMenuProjection = struct {
-    active: bool = false,
-    scope: usage_report.Scope = .days_30,
-    selected_model: usize = 0,
-    expanded_model: ?usize = null,
-    model_window_start: usize = 0,
-    snapshot: ?*const usage_report.Snapshot = null,
-    refresh_error: ?[]const u8 = null,
-};
+pub const UsageMenuProjection = usage_presentation.Projection;
+pub const usageShowsTables = usage_presentation.showsTables;
+pub const usageIsPlan = usage_presentation.isPlan;
+pub const usageCodexHasPeriods = usage_presentation.codexHasPeriods;
 
 pub fn usageMenuProjection(
     menu: *const usage_menu.State,
 ) UsageMenuProjection {
     return .{
         .active = menu.active,
-        .scope = menu.scope(),
+        .period = menu.period,
         .selected_model = menu.selected_model,
-        .expanded_model = menu.expanded_model,
         .model_window_start = menu.model_window_start,
+        .detail = menu.detail,
         .snapshot = if (menu.snapshot) |*snapshot| snapshot else null,
-        .refresh_error = menu.refresh_error,
     };
 }
 
@@ -461,6 +456,7 @@ pub const RenderContext = struct {
     },
     skills_menu: SkillsMenuProjection = .{},
     mcp_menu: McpMenuProjection = .{},
+    mcp_host_menu: mcp_host_menu_presentation.Projection = .{},
     help_menu: HelpMenuProjection = .{},
     settings_menu: SettingsMenuProjection = .{},
     model_menu: ModelMenuProjection = .{},
@@ -469,6 +465,8 @@ pub const RenderContext = struct {
     usage_menu: UsageMenuProjection = .{},
     workspace_menu: WorkspaceMenuProjection = .{},
     upgrade_status: []const u8 = "",
+    /// What MCP has to say, after everything else on the right.
+    mcp_status: []const u8 = "",
     danger_status: []const u8 = "",
     danger_status_compact: []const u8 = "",
     esc_clear_armed: bool = false,

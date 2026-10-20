@@ -3993,6 +3993,59 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
+  test("saved ask separates provider messages and replays each with its phase", async () => {
+    const root = createFixtureRoot("message-phases");
+    const commentary = "Hi! What would you like help with?";
+    const answer = "Hi! What can I help you with?";
+    const message = (id: string, phase: string, text: string) => [
+      { type: "text-start", id, providerMetadata: { openai: { itemId: id, phase } } },
+      { type: "text-delta", id, delta: text.slice(0, 8) },
+      { type: "text-delta", id, delta: text.slice(8) },
+      { type: "text-end", id },
+    ];
+    const replies = [
+      fakeGatewaySse([
+        ...message("msg_commentary", "commentary", commentary),
+        ...message("msg_answer", "final_answer", answer),
+        { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
+      ]),
+      fakeGatewayFinalText("Resumed reply."),
+    ];
+    const gateway = startGateway(() => replies.shift() ?? new Response("unexpected request", { status: 500 }));
+    try {
+      const first = await runFx(["ask", "--json", "--auto", "Say hello."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, join(root.root, "first.log")),
+        timeoutMs: 15_000,
+      });
+      expect(first.code).toBe(0);
+      expect(first.stderr).toBe("");
+      const result = parseAskJson(first.stdout);
+      expect(result.output).toBe(`${commentary}\n\n${answer}`);
+      expect(result.final_output).toBe(`${commentary}\n\n${answer}`);
+
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", result.session_id, "Say it again."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, join(root.root, "resume.log")),
+        timeoutMs: 15_000,
+      });
+      expect(resumed.code).toBe(0);
+      expect(resumed.stderr).toBe("");
+      expect(parseAskJson(resumed.stdout).final_output).toBe("Resumed reply.");
+      expect(gateway.requests).toHaveLength(2);
+      const prompt = JSON.parse(gateway.requests[1].body).prompt as PromptMessage[];
+      const assistants = prompt.filter((entry) => entry.role === "assistant");
+      expect(assistants).toHaveLength(1);
+      expect(assistants[0].content).toEqual([
+        { type: "text", text: commentary, providerOptions: { openai: { itemId: "msg_commentary", phase: "commentary" } } },
+        { type: "text", text: answer, providerOptions: { openai: { itemId: "msg_answer", phase: "final_answer" } } },
+      ]);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("saved ask retries a clear response language mismatch without persisting it", async () => {
     const root = createFixtureRoot("response-language-retry");
     const firstTracePath = join(root.root, "first-trace.log");

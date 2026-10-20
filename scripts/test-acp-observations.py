@@ -39,7 +39,7 @@ class ObservationTest(unittest.TestCase):
     binary = Path(__file__).resolve().parents[1] / "zig-out/bin/fx"
     observations_output: Path | None = None
 
-    def exercise(self, *, enabled: bool, limit: int = 262144, tool: bool = True, capture: bool = True, call_count: int = 1) -> tuple[list[dict], list[bytes]]:
+    def exercise(self, *, enabled: bool, limit: int = 262144, tool: bool = True, capture: bool = True, call_count: int = 1, hooks: bool = False) -> tuple[list[dict], list[bytes]]:
         bodies: list[bytes] = []
 
         class Provider(BaseHTTPRequestHandler):
@@ -78,7 +78,7 @@ class ObservationTest(unittest.TestCase):
                 "models": {"local": "local-model"},
             }
             (home / ".fx/settings.json").write_text(json.dumps(settings))
-            environment = {"HOME": str(home), "PATH": os.defpath, "NO_COLOR": "1", "FX_AUTO_UPGRADE": "0", "FX_SOUND": "0", "FX_SESSIONS_V2": "1"}
+            environment = {"HOME": str(home), "PATH": os.defpath, "NO_COLOR": "1", "FX_AUTO_UPGRADE": "0", "FX_SOUND": "0", "FX_SESSIONS_V2": "1", "FX_DISABLE_KEYCHAIN": "1"}
             process = subprocess.Popen([str(self.binary.resolve()), "acp"], cwd=workspace, env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             lines: queue.Queue[str] = queue.Queue()
             output: list[dict] = []
@@ -112,9 +112,20 @@ class ObservationTest(unittest.TestCase):
                     self.assertEqual(initialized["_meta"]["fx"]["observations"]["version"], 1)
                 else:
                     self.assertNotIn("_meta", initialized)
-                session = request(2, "session/new", {"cwd": str(workspace), "mcpServers": [{"name": "koi_test", "command": sys.executable, "args": [str(Path(__file__).resolve()), "--mcp-fixture"], "env": []}] if tool else [], "systemPrompt": [{"type": "text", "text": "VISIBLE_CLIENT_INSTRUCTIONS"}]})
+                session_params = {"cwd": str(workspace), "mcpServers": [{"name": "koi_test", "command": sys.executable, "args": [str(Path(__file__).resolve()), "--mcp-fixture"], "env": []}] if tool else [], "systemPrompt": [{"type": "text", "text": "VISIBLE_CLIENT_INSTRUCTIONS"}]}
+                if hooks:
+                    session_params["_meta"] = {"fx": {"hooks": {"captureContent": False}}}
+                session = request(2, "session/new", session_params)
+                if hooks:
+                    self.assertEqual(session["_meta"]["fx"]["hooksVersion"], 1)
                 result = request(3, "session/prompt", {"sessionId": session["sessionId"], "prompt": [{"type": "text", "text": "Use the fixture source."}]})
                 self.assertEqual(result["stopReason"], "end_turn")
+                hook_events = [message["params"] for message in output if message.get("method") == "libfx/hook"]
+                if hooks:
+                    self.assertTrue({"turn.start", "turn.end", "model.start", "model.end"} <= {value["type"] for value in hook_events})
+                    self.assertTrue(all(value["sessionId"] == session["sessionId"] for value in hook_events))
+                else:
+                    self.assertEqual(hook_events, [])
                 assert process.stdin is not None
                 process.stdin.close()
                 self.assertEqual(process.wait(timeout=10), 0)
@@ -180,6 +191,17 @@ class ObservationTest(unittest.TestCase):
         self.assertEqual({value["tool_call_id"] for value in prepared}, {"fixture_call_1", "fixture_call_2"})
         visible = [message["content"] for message in json.loads(bodies[1])["messages"] if message["role"] == "tool"]
         self.assertEqual([value["model_visible"]["content_text"] for value in prepared], visible)
+
+    def test_private_observations_coexist_with_native_session_hooks(self) -> None:
+        observations, bodies = self.exercise(enabled=True, hooks=True)
+        requests = [value["event"]["data"]["request"] for value in observations if value["event"]["kind"] == "model.request"]
+        self.assertEqual([value["sha256"] for value in requests], [hashlib.sha256(body).hexdigest() for body in bodies])
+        self.assertEqual(len(requests), 2)
+
+    def test_native_session_hooks_do_not_enable_private_observations(self) -> None:
+        observations, bodies = self.exercise(enabled=False, hooks=True, tool=False)
+        self.assertEqual(observations, [])
+        self.assertEqual(len(bodies), 1)
 
     def test_metadata_only_has_hashes_and_tool_names_without_content(self) -> None:
         observations, _ = self.exercise(enabled=True, capture=False)

@@ -17,6 +17,8 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const doctor_runtime = @import("doctor_runtime.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
+const model_catalog_metadata = @import("../gateway/model_catalog_metadata.zig");
+const model_capabilities = @import("../config/model_capabilities.zig");
 const provider_set = @import("../gateway/provider_set.zig");
 const execution_process_provider = @import("../execution/process_provider.zig");
 const github_publish = @import("../github/github_publish.zig");
@@ -32,7 +34,6 @@ const session_codec = @import("../session/session_codec.zig");
 const session_store = @import("../session/session_store.zig");
 const session_adapter = @import("../session/session_adapter.zig");
 const subagent_resume_admission = @import("../subagent/resume_admission.zig");
-const usage_report = @import("../session/usage_report.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const types = @import("../shared/types.zig");
 const update_target = @import("../upgrade/update_target.zig");
@@ -47,13 +48,16 @@ const mcp_command_provider = @import("../mcp/command_provider.zig");
 const mcp_health = @import("../mcp/health.zig");
 const project_config = @import("../mcp/project_config.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
+const mcp_host = @import("../mcp_host/host.zig");
+const mcp_verbs = @import("../mcp_host/verbs.zig");
 const mcp_auth = @import("../mcp/mcp_auth.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
-const usage_cli_runtime = @import("usage_cli_runtime.zig");
+const usage = @import("../../usage/usage.zig");
+const usage_host = @import("../app/usage_host.zig");
 
 const slack_install = @import("../slack/install.zig");
 const Allocator = std.mem.Allocator;
@@ -187,8 +191,12 @@ pub const InteractiveLaunch = struct {
     requested_resume: ?ResumeTarget = null,
     upgrade_relaunch: ?UpgradeRelaunch = null,
     modifiers: LaunchModifiers = .{},
+    /// Why the session the launch resumes could not be converted from v1
+    /// (D61), for the message the launch exits with. Owned.
+    resume_refusal: ?[]u8 = null,
 
     pub fn deinit(self: *InteractiveLaunch, alloc: Allocator) void {
+        if (self.resume_refusal) |reason| alloc.free(reason);
         if (self.requested_resume) |*target| target.deinit(alloc);
         if (self.upgrade_relaunch) |*relaunch| relaunch.deinit(alloc);
         self.modifiers.deinit(alloc);
@@ -238,6 +246,7 @@ pub const Config = struct {
     inspect_mcp_local_config: mcp_health.InspectLocalConfigFn =
         mcp_health.inspectLocalConfigUnavailable,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
+    load_mcp_host: ?mcp_host.LoadFn = null,
     add_mcp_profile_server: mcp_command_provider.AddProfileServerFn =
         mcp_command_provider.addProfileServerUnavailable,
     remove_mcp_profile_server: mcp_command_provider.RemoveProfileServerFn =
@@ -281,7 +290,7 @@ const SessionListOptions = struct {
 
 const UsageOptions = struct {
     format: output_contracts.OutputFormat = .text,
-    scope: usage_report.Scope = .days_30,
+    period: usage.Period = .month,
 };
 
 const WorkspaceOptions = struct {
@@ -395,6 +404,9 @@ const GlobalLaunchArgs = struct {
     }
 };
 
+/// Parses the launch flags `fx` and `fx ask` share. How `--model`, `--fast`,
+/// `--ultrafast`, and `--effort` reach the first turn is modeled in
+/// `tests/tla/cli/LaunchSelection.tla`.
 fn parseGlobalLaunchArgs(
     alloc: Allocator,
     args: []const [:0]const u8,
@@ -790,8 +802,7 @@ fn writeProviderActivationError(
     caller: ProviderActivationCaller,
     detail: []const u8,
 ) !void {
-    const message = try std.fmt.allocPrint(
-        alloc,
+    const message = try alloc.print(
         "{s}: {s}\n",
         .{ if (caller == .provider_login) "fx login" else "fx provider", detail },
     );
@@ -886,7 +897,7 @@ fn activateProviderSelectionFallible(
             },
             .outcome => {},
         }
-        const message = try std.fmt.allocPrint(alloc, "Provider set to {s}.\n", .{bound.label()});
+        const message = try alloc.print("Provider set to {s}.\n", .{bound.label()});
         defer alloc.free(message);
         if (caller == .provider_command) try writeStdout(deps, message);
         return true;
@@ -993,8 +1004,7 @@ fn activateProviderSelectionFallible(
         },
         .failed => |failure| {
             debug_trace.logf("catalog", "provider selection catalog failed provider={s} category={s}", .{ @tagName(target), @tagName(failure.failure.category) });
-            const detail = try std.fmt.allocPrint(
-                alloc,
+            const detail = try alloc.print(
                 "could not load the target model catalog ({s})",
                 .{@tagName(failure.failure.category)},
             );
@@ -1106,12 +1116,13 @@ fn runNonInteractiveWithDeps(
         return .handled_success;
     }
 
-    if (topLevelHelpRequest(cfg.command_catalog, effective_args)) |kind| {
+    // MCP-v2's verbs print their own help, and pass `-h` after `--` to the server.
+    if (topLevelHelpRequest(cfg.command_catalog, effective_args)) |kind| if (kind != .mcp or !mcp_host.selected()) {
         const text = try command_specs.renderTopLevelCommandHelp(alloc, cfg.command_catalog, kind);
         defer alloc.free(text);
         try writeStdout(deps, text);
         return .handled_success;
-    }
+    };
 
     switch (parsed_command) {
         .interactive, .resume_session => unreachable,
@@ -1386,6 +1397,7 @@ fn runNonInteractiveWithDeps(
             }, mcp_inspection.profile_diagnostic);
             snapshot.mcp = localMcpView(&mcp_inspection);
             snapshot.provider_endpoint = startup.provider_endpoint;
+            snapshot.modes = statusModes(cfg.mode_registry, snapshot.permission_mode);
             if (opts.format == .json) {
                 try writeStatusJsonLine(alloc, deps, snapshot);
                 return .handled_success;
@@ -1489,8 +1501,7 @@ fn runNonInteractiveWithDeps(
                 .loaded => |loaded| loaded,
                 .failure => |failure| {
                     const error_name = @errorName(failure.failure.asError());
-                    const message = try std.fmt.allocPrint(
-                        alloc,
+                    const message = try alloc.print(
                         "could not list models: {s}",
                         .{catalogFailureDetail(failure.failure)},
                     );
@@ -1513,9 +1524,20 @@ fn runNonInteractiveWithDeps(
             };
             var ids = loaded.ids;
             defer collections.freeStringList(alloc, &ids);
+            var entries = loaded.entries;
+            defer model_catalog.freeModelCatalog(alloc, &entries);
+            const details = try modelDetails(
+                alloc,
+                ids.items,
+                entries.items,
+                available_providers.select(startup.provider),
+                startup.provider,
+            );
+            defer alloc.free(details);
 
             const text = try (output_contracts.ModelListSnapshot{
                 .ids = ids.items,
+                .details = details,
                 .provider = startup.provider,
                 .private_models_hidden = loaded.provenance.access.private_models_may_be_hidden,
                 .public_only_reason = loaded.provenance.access.public_only_reason,
@@ -1705,6 +1727,19 @@ fn runNonInteractiveWithDeps(
             }
         },
         .sessions => |rest| {
+            if (rest.len > 0 and std.mem.eql(u8, rest[0], "convert")) {
+                const format = parseSessionConvertArgs(rest[1..]) catch |err| {
+                    try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .sessions, "sessions", err, rest);
+                    return .handled_failure;
+                };
+                // It moves v1 sessions into the experimental store, where
+                // plain fx would no longer find them.
+                if (!sessions_v2) {
+                    try writeLookupFailure(alloc, deps, "sessions", error.SessionsV2Required, format);
+                    return .handled_failure;
+                }
+                return runSessionConvert(alloc, deps, format);
+            }
             const opts = parseSessionListArgs(rest) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .sessions, "sessions", err, rest);
                 return .handled_failure;
@@ -1841,31 +1876,53 @@ fn runNonInteractiveWithDeps(
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .usage, "usage", err, rest);
                 return .handled_failure;
             };
-            const home = deps.getenv(deps.env_ctx, "HOME") orelse {
-                try writeUsageCommandFailure(
-                    alloc,
-                    deps,
-                    error.HomeNotSet,
-                    opts.format,
-                );
+            // A relative $HOME counts as unset, as everywhere else in fx.
+            const home = deps.getenv(deps.env_ctx, "HOME") orelse "";
+            if (!std.Io.Dir.path.isAbsolute(home)) {
+                try writeUsageCommandFailure(alloc, deps, error.HomeNotSet, opts.format);
                 return .handled_failure;
-            };
-            var report = usage_cli_runtime.collect(
-                alloc,
-                home,
-                opts.scope,
-                @max(io_mod.milliTimestamp(), 0),
-            ) catch |err| {
+            }
+            var startup = (if (cfg.auth_mode == .host_managed)
+                deps.load_startup_state_with_auth_mode(
+                    alloc,
+                    cfg.gateway_provider.oauth_transport,
+                    cfg.secret_store,
+                    cfg.default_model,
+                    cfg.default_agent_step_limit,
+                    cfg.auth_mode,
+                )
+            else
+                deps.load_startup_state(
+                    alloc,
+                    cfg.gateway_provider.oauth_transport,
+                    cfg.secret_store,
+                    cfg.default_model,
+                    cfg.default_agent_step_limit,
+                )) catch |err| {
                 try writeUsageCommandFailure(alloc, deps, err, opts.format);
                 return .handled_failure;
             };
-            defer report.deinit(alloc);
-            const text = try (output_contracts.UsageSnapshot{
-                .report = &report,
-            }).render(alloc, opts.format);
+            defer startup.deinit(alloc);
+
+            var dashboard = usage.Dashboard.init(alloc, usage_host.host(home));
+            defer dashboard.deinit();
+            var label_buf: usage_host.LabelBuffer = undefined;
+            if (startup.credential) |c| {
+                if (usage_host.fromCredential(c, &label_buf)) |credential| {
+                    dashboard.open(credential);
+                } else {
+                    dashboard.openUnavailable(.unsupported_provider);
+                }
+            } else {
+                dashboard.openUnavailable(.no_gateway_sign_in);
+            }
+            dashboard.waitForFetch();
+            var snapshot = try dashboard.snapshot(alloc);
+            defer snapshot.deinit();
+            const text = try (output_contracts.UsageSnapshot{ .snapshot = &snapshot, .period = opts.period }).render(alloc, opts.format);
             defer alloc.free(text);
             try writeFormattedOutput(deps, text, opts.format);
-            return .handled_success;
+            return if (snapshot.status == .ready) .handled_success else .handled_failure;
         },
         .upgrade => |rest| {
             const upgrade_runtime = @import("../upgrade/upgrade_runtime.zig");
@@ -2071,8 +2128,7 @@ fn runPasteSetup(
         };
     }
 
-    const message = try std.fmt.allocPrint(
-        alloc,
+    const message = try alloc.print(
         "Saved API key to {s}.\n",
         .{secret_store.backend_label},
     );
@@ -2141,7 +2197,7 @@ const MaskedKeyRawMode = struct {
         }
 
         var self: MaskedKeyRawMode = .{};
-        self.original = try std.posix.tcgetattr(std.posix.STDIN_FILENO);
+        self.original = try io_mod.tcgetattr(std.posix.STDIN_FILENO);
         var raw = self.original;
         raw.iflag.BRKINT = false;
         raw.iflag.ICRNL = false;
@@ -2154,11 +2210,11 @@ const MaskedKeyRawMode = struct {
         raw.lflag.ICANON = false;
         raw.lflag.IEXTEN = false;
         raw.lflag.ISIG = false;
-        const vmin_idx = switch (builtin.os.tag) {
+        const vmin_idx = switch (builtin.target.os.tag) {
             .linux => 6,
             else => 16,
         };
-        const vtime_idx = switch (builtin.os.tag) {
+        const vtime_idx = switch (builtin.target.os.tag) {
             .linux => 5,
             else => 17,
         };
@@ -2166,14 +2222,14 @@ const MaskedKeyRawMode = struct {
             raw.cc[vmin_idx] = 1;
             raw.cc[vtime_idx] = 0;
         }
-        try std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
+        try io_mod.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
         self.active = true;
         return self;
     }
 
     fn disable(self: *MaskedKeyRawMode) void {
         if (!self.active) return;
-        std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
+        io_mod.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
         self.active = false;
     }
 };
@@ -2265,6 +2321,7 @@ fn statusSnapshotFromStartupWithBuild(
     return .{
         .model = startup.selected_model,
         .model_origin = startup.model_origin.label(),
+        .effort = startup.effort,
         .provider = startup.provider,
         .auth = startup.auth,
         .auth_help = startup.auth.missingHelp(.cli),
@@ -2306,14 +2363,14 @@ fn doctorSnapshotFromRuntime(snapshot: doctor_runtime.Snapshot) output_contracts
 }
 
 fn writeRealStdout(_: ?*anyopaque, text: []const u8) !void {
-    if (comptime builtin.os.tag != .windows) {
+    if (comptime builtin.target.os.tag != .windows) {
         return writeFdAll(std.posix.STDOUT_FILENO, text);
     }
     try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
 }
 
 fn writeRealStderr(_: ?*anyopaque, text: []const u8) !void {
-    if (comptime builtin.os.tag != .windows) {
+    if (comptime builtin.target.os.tag != .windows) {
         return writeFdAll(std.posix.STDERR_FILENO, text);
     }
     try std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), text);
@@ -2392,6 +2449,7 @@ fn runTopLevelMcp(
     cfg: Config,
     deps: RunDeps,
 ) !RunResult {
+    if (mcp_host.selected()) return runMcpVerbs(alloc, rest, cfg, deps);
     if (rest.len == 0) {
         const help = try command_specs.renderTopLevelCommandHelp(alloc, cfg.command_catalog, .mcp);
         defer alloc.free(help);
@@ -2592,6 +2650,93 @@ fn runTopLevelMcp(
     try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
     return .handled_failure;
 }
+
+/// `fx mcp` on MCP-v2: the verbs `/mcp` shares.
+fn runMcpVerbs(alloc: Allocator, rest: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunResult {
+    const home = deps.getenv(deps.env_ctx, "HOME") orelse {
+        try writeStderr(deps, "fx mcp: HOME isn't set\n");
+        return .handled_failure;
+    };
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    defer alloc.free(workspace_root);
+    const args = try alloc.alloc([]const u8, rest.len);
+    defer alloc.free(args);
+    for (rest, args) |r, *a| a.* = r;
+    var out_buffer: [1024]u8 = undefined;
+    var err_buffer: [512]u8 = undefined;
+    var out: DepsWriter = .init(deps, .stdout, &out_buffer);
+    var err: DepsWriter = .init(deps, .stderr, &err_buffer);
+    var hosts: CliMcpHosts = .{ .alloc = alloc, .cfg = cfg, .workspace_root = workspace_root };
+    const code = mcp_verbs.run(.{
+        .gpa = alloc,
+        .out = &out.interface,
+        .err = &err.interface,
+        .surface = .cli,
+        .home = home,
+        .workspace_root = workspace_root,
+        .hosts = .{ .context = &hosts, .get = CliMcpHosts.get, .release = CliMcpHosts.release, .changed = CliMcpHosts.changed },
+    }, args);
+    return switch (code) {
+        0 => .handled_success,
+        1 => .handled_failure,
+        else => .{ .handled_exit = code },
+    };
+}
+
+/// A host made for one `fx mcp` command.
+const CliMcpHosts = struct {
+    alloc: Allocator,
+    cfg: Config,
+    workspace_root: []const u8,
+
+    fn get(context: *anyopaque, notify: ?mcp_verbs.Notify) anyerror!?*mcp_host.Host {
+        const self: *CliMcpHosts = @ptrCast(@alignCast(context));
+        const load = self.cfg.load_mcp_host orelse return null;
+        return load(self.alloc, self.workspace_root, self.cfg.tool_set.registry, .{ .notify = notify });
+    }
+
+    /// `fx mcp` exits after its one command, so nothing waits for the
+    /// servers; a logout already waited for its revocation.
+    fn release(_: *anyopaque, _: *mcp_host.Host) void {
+        mcp_host.signalServersForExit();
+    }
+
+    fn changed(_: *anyopaque) void {}
+};
+
+/// Streams through `deps`, so `login` shows its address while it waits.
+const DepsWriter = struct {
+    deps: RunDeps,
+    stream: enum { stdout, stderr },
+    interface: std.Io.Writer,
+
+    fn init(deps: RunDeps, stream: @FieldType(DepsWriter, "stream"), buffer: []u8) DepsWriter {
+        return .{ .deps = deps, .stream = stream, .interface = .{ .vtable = &.{ .drain = drain }, .buffer = buffer } };
+    }
+
+    fn emit(self: *DepsWriter, bytes: []const u8) std.Io.Writer.Error!void {
+        if (bytes.len == 0) return;
+        const written = switch (self.stream) {
+            .stdout => writeStdout(self.deps, bytes),
+            .stderr => writeStderr(self.deps, bytes),
+        };
+        written catch return error.WriteFailed;
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *DepsWriter = @alignCast(@fieldParentPtr("interface", w));
+        try self.emit(w.buffered());
+        w.end = 0;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            try self.emit(d);
+            n += d.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| try self.emit(last);
+        return n + last.len * splat;
+    }
+};
 
 fn authenticateMcpCommand(
     alloc: Allocator,
@@ -2865,8 +3010,8 @@ fn usageFailureMessage(err: anyerror) []const u8 {
         error.HomeNotSet => "HOME is not set",
         error.DurablePathUnsafe,
         error.PrivateStatePermissionsUnsupported,
-        => "local usage storage is unsafe",
-        else => "local usage data is unavailable",
+        => "the ~/.fx folder is unsafe",
+        else => "couldn't load the fx profile",
     };
 }
 
@@ -2936,6 +3081,28 @@ fn workflowLanguagePlaceholder() types.ConversationLanguage {
     return types.ConversationLanguage.default();
 }
 
+/// The session modes `fx status` reports, so a client can show the mode
+/// choice before an ACP session exists. Null for a registry without modes.
+fn statusModes(registry: mode_registry.Registry, permission_mode: types.PermissionMode) ?output_contracts.StatusSnapshot.SessionModes {
+    if (registry.modes.len == 0) return null;
+    return .{ .current = registry.startingModeId(permission_mode), .all = registry.modes };
+}
+
+test "status reports the mode a new session starts in" {
+    const modes = [_]mode_registry.ModeSpec{
+        .{ .id = "auto", .name = "Auto", .permission_mode = .auto },
+        .{ .id = "ask", .name = "Ask", .permission_mode = .ask },
+        .{ .id = "full-access", .name = "Full access", .permission_mode = .yolo },
+    };
+    const registry = mode_registry.Registry{ .default_mode_id = "auto", .modes = modes[0..] };
+
+    const full = statusModes(registry, .yolo) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("full-access", full.current);
+    try std.testing.expectEqual(@as(usize, 3), full.all.len);
+    try std.testing.expectEqualStrings("ask", statusModes(registry, .ask).?.current);
+    try std.testing.expect(statusModes(.{ .default_mode_id = "surface" }, .auto) == null);
+}
+
 fn permissionModeForSnapshot(mode: anytype) types.PermissionMode {
     return switch (mode) {
         .ask => .ask,
@@ -2967,6 +3134,36 @@ fn permissionRulesForSnapshot(alloc: Allocator, active_rules: anytype) !types.Pe
         };
     }
     return .{ .rules = rules };
+}
+
+/// One detail per id when the provider described its models, by the same capability merge a
+/// session uses for its effort and speed options; Ultrafast is a Gateway-only lane. Empty when
+/// there are no entries. Names borrow from `entries`. Caller frees the returned slice.
+fn modelDetails(
+    alloc: Allocator,
+    ids: []const []const u8,
+    entries: []const model_catalog.ModelCatalogEntry,
+    bundle: provider_set.Bundle,
+    provider: model_provider.ProviderId,
+) ![]const output_contracts.ModelDetail {
+    if (entries.len == 0) return &.{};
+    const details = try alloc.alloc(output_contracts.ModelDetail, ids.len);
+    for (ids, details) |id, *detail| {
+        const entry = for (entries) |candidate| {
+            if (std.mem.eql(u8, candidate.id, id)) break candidate;
+        } else null;
+        const capabilities = model_capabilities.mergeCapabilities(
+            bundle.fallbackModelCapabilities(id),
+            if (entry) |found| model_catalog_metadata.fromCatalogEntry(found) else null,
+        );
+        detail.* = .{
+            .name = if (entry) |found| found.name else null,
+            .efforts = capabilities.reasoning_efforts,
+            .fast = capabilities.supports_fast_mode,
+            .ultrafast = provider == .gateway and capabilities.supports_ultrafast_mode,
+        };
+    }
+    return details;
 }
 
 fn catalogFailureDetail(failure: model_catalog.Failure) []const u8 {
@@ -3107,6 +3304,51 @@ fn runSessionListV2(alloc: Allocator, deps: RunDeps, opts: SessionListOptions) !
     return writeSessionList(alloc, deps, page, opts);
 }
 
+fn parseSessionConvertArgs(args: []const [:0]const u8) !output_contracts.OutputFormat {
+    if (args.len == 0) return .text;
+    if (args.len == 1 and std.mem.eql(u8, args[0], "--json")) return .json;
+    return error.InvalidLocalSurfaceArgs;
+}
+
+/// Why `fx sessions convert` refuses without the v2 store switched on.
+const sessions_v2_required_message = "sessions convert moves v1 sessions into the experimental v2 store and needs --sessions-v2 or FX_SESSIONS_V2=1";
+
+/// `fx sessions convert`: converts every v1 session v2 does not hold yet,
+/// and fails when it skipped any (D61).
+fn runSessionConvert(alloc: Allocator, deps: RunDeps, format: output_contracts.OutputFormat) !RunResult {
+    // Each conversion is traced (`[convert]`), as an open's is.
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    defer alloc.free(workspace_root);
+    debug_trace.configureFromEnv(alloc, workspace_root);
+    var store = session_adapter.Store.openFromEnv(alloc) catch |err| {
+        try writeLookupFailure(alloc, deps, "sessions", session_adapter.commandError(err), format);
+        return .handled_failure;
+    };
+    defer store.deinit(alloc);
+    var report = session_adapter.convertAll(&store, alloc) catch |err| {
+        try writeLookupFailure(alloc, deps, "sessions", session_adapter.commandError(err), format);
+        return .handled_failure;
+    };
+    defer report.deinit(alloc);
+    const skipped = try alloc.alloc(output_contracts.SessionConvertSnapshot.Skipped, report.skipped.items.len);
+    defer alloc.free(skipped);
+    for (report.skipped.items, skipped) |from, *to| to.* = .{ .id = from.id, .code = from.code, .reason = from.reason };
+    const left_out = try alloc.alloc(output_contracts.SessionConvertSnapshot.LeftOut, report.left_out.items.len);
+    defer alloc.free(left_out);
+    for (report.left_out.items, left_out) |from, *to| to.* = .{
+        .id = from.id,
+        .member = from.file.member,
+        .file = from.file.file,
+        .bytes = from.file.bytes,
+        .limit = session_adapter.ConvertReport.file_limit_bytes,
+    };
+    const snapshot: output_contracts.SessionConvertSnapshot = .{ .converted = report.converted, .busy = report.busy, .unreadable = report.unreadable, .skipped = skipped, .left_out = left_out };
+    const text = try snapshot.render(alloc, format);
+    defer alloc.free(text);
+    try writeFormattedOutput(deps, text, format);
+    return if (skipped.len == 0) .handled_success else .handled_failure;
+}
+
 /// `fx session last|{id}` on v2, read without the session's lock (D37).
 fn runSessionDetailV2(
     alloc: Allocator,
@@ -3195,6 +3437,9 @@ fn writeLookupFailure(
         },
         error.SessionMigrationUnavailable => {
             try writeStderr(deps, "fx session: session migrate converts v1 sessions and is not available with sessions v2 yet\n");
+        },
+        error.SessionsV2Required => {
+            try writeStderr(deps, "fx sessions: " ++ sessions_v2_required_message ++ "\n");
         },
         error.InvalidSessionFormat,
         error.InvalidPermissionState,
@@ -3325,13 +3570,11 @@ fn writeSessionDetailFailure(
     format: output_contracts.OutputFormat,
 ) !void {
     const message = switch (err) {
-        error.InvalidSessionFormat => try std.fmt.allocPrint(
-            alloc,
+        error.InvalidSessionFormat => try alloc.print(
             "session {s} is corrupt; run `fx session recover {s}`",
             .{ session_id, session_id },
         ),
-        error.UnsupportedSessionSchema => try std.fmt.allocPrint(
-            alloc,
+        error.UnsupportedSessionSchema => try alloc.print(
             "session {s} uses an unsupported session version",
             .{session_id},
         ),
@@ -3378,6 +3621,7 @@ fn lookupFailureMessage(err: anyerror) ?[]const u8 {
         error.NoReadableSessions => "saved sessions are unreadable; run `fx doctor` for recovery guidance",
         error.SessionNotFound => "record not found",
         error.SessionMigrationUnavailable => "session migrate converts v1 sessions and is not available with sessions v2 yet",
+        error.SessionsV2Required => sessions_v2_required_message,
         error.InvalidSessionFormat,
         error.InvalidPermissionState,
         error.PermissionStateTooLarge,
@@ -3494,6 +3738,21 @@ test "session lookup failures preserve supporting-state errors in the requested 
     }
 }
 
+test "sessions convert without the v2 store names the switch it needs, in text and json" {
+    for ([_]output_contracts.OutputFormat{ .text, .json }) |format| {
+        var output = CaptureOutput.init(std.testing.allocator);
+        defer output.deinit();
+        try writeLookupFailure(std.testing.allocator, output.deps(), "sessions", error.SessionsV2Required, format);
+        const body = if (format == .json) output.stdout.written() else output.stderr.written();
+        try std.testing.expect(std.mem.find(u8, body, "--sessions-v2 or FX_SESSIONS_V2=1") != null);
+        if (format == .json) {
+            var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings("SessionsV2Required", parsed.value.object.get("code").?.string);
+        }
+    }
+}
+
 test "session recovery boundary failures keep stable text and json guidance" {
     var text_output = CaptureOutput.init(std.testing.allocator);
     defer text_output.deinit();
@@ -3561,6 +3820,7 @@ fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
         .max_history_turns = cfg.max_history_turns,
         .mode_registry = cfg.mode_registry,
         .load_mcp_runtime = cfg.load_mcp_runtime,
+        .load_mcp_host = cfg.load_mcp_host,
     };
 }
 
@@ -3763,12 +4023,12 @@ fn parseUsageArgs(args: []const [:0]const u8) !UsageOptions {
             if (period_seen or index + 1 >= args.len) return error.InvalidUsageArgs;
             period_seen = true;
             index += 1;
-            options.scope = if (std.mem.eql(u8, args[index], "24h"))
-                .hours_24
+            options.period = if (std.mem.eql(u8, args[index], "today"))
+                .today
             else if (std.mem.eql(u8, args[index], "7d"))
                 .days_7
-            else if (std.mem.eql(u8, args[index], "30d"))
-                .days_30
+            else if (std.mem.eql(u8, args[index], "month"))
+                .month
             else
                 return error.InvalidUsageArgs;
             continue;
@@ -3791,7 +4051,7 @@ fn parseSessionListCursor(raw: []const u8) !session_store.ResumableSessionContin
     const updated_at_ms = std.fmt.parseInt(i64, updated_text, 10) catch
         return error.InvalidLocalSurfaceArgs;
     var canonical: [320]u8 = undefined;
-    const encoded = std.fmt.bufPrint(
+    const encoded = std.mem.print(
         &canonical,
         "v1:{d}:{s}",
         .{ updated_at_ms, id },
@@ -3804,8 +4064,7 @@ fn formatSessionListCursor(
     alloc: Allocator,
     summary: session_store.SessionSummary,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "v1:{d}:{s}",
         .{ summary.updated_at_ms, summary.id },
     );
@@ -4133,9 +4392,9 @@ test "help aliases route to help" {
     try std.testing.expectEqual(Command.help, parse(command_catalog, &.{@constCast("-h")}));
 }
 
-test "usage arguments accept only rolling periods and one JSON flag" {
+test "usage arguments accept today, 7d or 30d and one JSON flag" {
     const defaults = try parseUsageArgs(&.{});
-    try std.testing.expectEqual(usage_report.Scope.days_30, defaults.scope);
+    try std.testing.expectEqual(usage.Period.month, defaults.period);
     try std.testing.expectEqual(output_contracts.OutputFormat.text, defaults.format);
 
     const selected = try parseUsageArgs(&.{
@@ -4143,13 +4402,15 @@ test "usage arguments accept only rolling periods and one JSON flag" {
         @constCast("--period"),
         @constCast("7d"),
     });
-    try std.testing.expectEqual(usage_report.Scope.days_7, selected.scope);
+    try std.testing.expectEqual(usage.Period.days_7, selected.period);
+    try std.testing.expectEqual(usage.Period.today, (try parseUsageArgs(&.{ @constCast("--period"), @constCast("today") })).period);
     try std.testing.expectEqual(output_contracts.OutputFormat.json, selected.format);
 
     for ([_][]const [:0]const u8{
         &.{@constCast("--period")},
         &.{ @constCast("--period"), @constCast("session") },
-        &.{ @constCast("--period"), @constCast("24h"), @constCast("--period"), @constCast("7d") },
+        &.{ @constCast("--period"), @constCast("24h") },
+        &.{ @constCast("--period"), @constCast("today"), @constCast("--period"), @constCast("7d") },
         &.{ @constCast("--json"), @constCast("--json") },
         &.{@constCast("30d")},
     }) |invalid| {
@@ -5032,8 +5293,7 @@ test "top-level MCP trust persists project approval without interactive startup"
         deps,
     );
     try std.testing.expectEqual(RunResult.handled_success, result);
-    const expected = try std.fmt.allocPrint(
-        alloc,
+    const expected = try alloc.print(
         "Approved project MCP server 'fixture' for {s}.\n",
         .{workspace_root},
     );
@@ -5710,6 +5970,63 @@ test "runIfRequested models passes startup team to fetch seam" {
     );
 }
 
+test "runIfRequested models json describes each model from its catalog entry" {
+    var capture = CaptureOutput.init(std.testing.allocator);
+    defer capture.deinit();
+    var probe = ModelFetchProbe{ .outcome = .described };
+    var cfg = testConfig();
+    cfg.provider_set.gateway.cli_model_catalog = probe.provider();
+
+    var deps = capture.deps();
+    deps.load_startup_state = stubLoadStartupState;
+
+    const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("models"), @constCast("--json") }, cfg, deps);
+    try std.testing.expectEqual(RunResult.handled_success, result);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"models\",\"count\":1,\"shown_count\":1,\"more_count\":0,\"private_models_hidden\":false," ++
+            "\"ids\":[\"private/blue-hornbill\"],\"models\":[{\"id\":\"private/blue-hornbill\",\"name\":\"Blue Hornbill\"," ++
+            "\"efforts\":[\"low\",\"high\"],\"fast\":true,\"ultrafast\":true}]}\n",
+        capture.stdout.written(),
+    );
+}
+
+test "modelDetails lets the catalog entry decide and keeps Ultrafast to the Gateway" {
+    const Fallback = struct {
+        fn capabilities(_: []const u8) model_capabilities.Capabilities {
+            return .{
+                .supports_fast_mode = true,
+                .reasoning_efforts = .fromSlice(&.{types.ReasoningEffort.literal("medium")}),
+            };
+        }
+    };
+    var bundle = testConfig().provider_set.gateway;
+    bundle.fallback_model_capabilities_fn = Fallback.capabilities;
+    const entries = [_]model_catalog.ModelCatalogEntry{.{
+        .id = @constCast("openai/gpt-6-astra"),
+        .name = @constCast("GPT-6 Astra"),
+        .model_type = @constCast("language"),
+        .supports_ultrafast_mode = true,
+    }};
+    const ids = [_][]const u8{ "openai/gpt-6-astra", "provider/unlisted" };
+
+    const gateway = try modelDetails(std.testing.allocator, &ids, &entries, bundle, .gateway);
+    defer std.testing.allocator.free(gateway);
+    try std.testing.expectEqualStrings("GPT-6 Astra", gateway[0].name.?);
+    try std.testing.expect(gateway[0].ultrafast);
+    try std.testing.expect(!gateway[0].fast);
+    try std.testing.expectEqual(@as(usize, 0), gateway[0].efforts.len);
+    try std.testing.expectEqual(@as(?[]const u8, null), gateway[1].name);
+    try std.testing.expect(gateway[1].fast);
+    try std.testing.expectEqualStrings("medium", gateway[1].efforts.slice()[0].label());
+
+    const codex = try modelDetails(std.testing.allocator, &ids, &entries, bundle, .codex);
+    defer std.testing.allocator.free(codex);
+    try std.testing.expect(!codex[0].ultrafast);
+
+    const undescribed = try modelDetails(std.testing.allocator, &ids, &.{}, bundle, .gateway);
+    try std.testing.expectEqual(@as(usize, 0), undescribed.len);
+}
+
 test "runIfRequested credits renders through the configured provider" {
     var capture = CaptureOutput.init(std.testing.allocator);
     defer capture.deinit();
@@ -5784,7 +6101,7 @@ test "runIfRequested local json success appends exactly one newline" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("status"), @constCast("--json") }, testConfig(), deps);
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"model_origin\":\"default\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"ultrafast_requested\":false,\"mcp\":{\"connection_check\":\"not_checked\",\"servers\":[],\"configuration_issues\":[],\"inspection_error\":null}}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"model_origin\":\"default\",\"effort\":\"auto\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"ultrafast_requested\":false,\"mcp\":{\"connection_check\":\"not_checked\",\"servers\":[],\"configuration_issues\":[],\"inspection_error\":null}}\n",
         capture.stdout.written(),
     );
     try std.testing.expect(!std.mem.endsWith(u8, capture.stdout.written(), "\n\n"));
@@ -5874,7 +6191,7 @@ test "writeRenderedJsonLine falls back to heap and appends exactly one newline" 
     );
 
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"model_origin\":\"default\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"ultrafast_requested\":true}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"model_origin\":\"default\",\"effort\":\"auto\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"ultrafast_requested\":true}\n",
         capture.stdout.written(),
     );
 }
@@ -6227,12 +6544,34 @@ fn failingStartupState(
 const ModelFetchProbe = struct {
     const Outcome = enum {
         success,
+        /// Succeeds with the catalog entry behind the id, as the Gateway does.
+        described,
         failure,
         cancelled,
     };
 
     called: bool = false,
     outcome: Outcome = .success,
+
+    fn describedEntry(alloc: Allocator) !model_catalog.ModelCatalogEntry {
+        const id = try alloc.dupe(u8, "private/blue-hornbill");
+        errdefer alloc.free(id);
+        const name = try alloc.dupe(u8, "Blue Hornbill");
+        errdefer alloc.free(name);
+        const model_type = try alloc.dupe(u8, "language");
+        errdefer alloc.free(model_type);
+        var efforts: std.ArrayList(types.ReasoningEffort) = .empty;
+        errdefer efforts.deinit(alloc);
+        try efforts.appendSlice(alloc, &.{ types.ReasoningEffort.literal("low"), types.ReasoningEffort.literal("high") });
+        return .{
+            .id = id,
+            .name = name,
+            .model_type = model_type,
+            .reasoning_efforts = efforts,
+            .supports_fast_mode = true,
+            .supports_ultrafast_mode = true,
+        };
+    }
 
     fn provider(self: *ModelFetchProbe) gateway_provider.CliModelCatalogProvider {
         return .{
@@ -6271,7 +6610,7 @@ const ModelFetchProbe = struct {
         switch (self.outcome) {
             .failure => return failure(input, .runtime),
             .cancelled => return failure(input, .cancellation),
-            .success => {},
+            .success, .described => {},
         }
 
         var ids: std.ArrayList([]u8) = .empty;
@@ -6282,8 +6621,21 @@ const ModelFetchProbe = struct {
             alloc.free(id);
             return failure(input, .resource_exhausted);
         };
+        var entries: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+        if (self.outcome == .described) {
+            const entry = describedEntry(alloc) catch {
+                collections.freeStringList(alloc, &ids);
+                return failure(input, .resource_exhausted);
+            };
+            entries.append(alloc, entry) catch {
+                model_catalog.freeModelCatalogEntry(alloc, entry);
+                collections.freeStringList(alloc, &ids);
+                return failure(input, .resource_exhausted);
+            };
+        }
         return .{ .loaded = .{
             .ids = ids,
+            .entries = entries,
             .provenance = .{ .access = .init(input.access) },
         } };
     }

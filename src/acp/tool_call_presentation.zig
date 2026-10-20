@@ -48,9 +48,9 @@ pub fn describeToolTitle(registry: tool_dispatch.Registry, arena: Allocator, cal
         });
     }
     if (tool_dispatch.toolCallPresentation(arena, registry, call)) |presentation| {
-        return std.fmt.allocPrint(arena, "{s}", .{presentation.action_label});
+        return arena.print("{s}", .{presentation.action_label});
     }
-    return std.fmt.allocPrint(arena, "{s}", .{call.name});
+    return arena.print("{s}", .{call.name});
 }
 
 pub const ToolCallPresentation = struct {
@@ -141,7 +141,7 @@ pub fn toolUpdateContentTextForMcp(identity: ?mcp_runtime.McpRuntime.ToolIdentit
 }
 
 test "ACP MCP results preserve complete query JSON regardless of server or tool name" {
-    const payload = "{\"server\":\"fixture\",\"tool\":\"mcp_fixture_echo\",\"result\":{\"structuredContent\":{\"content\":\"" ++ "x" ** 500 ++ "\"}}}";
+    const payload = "{\"server\":\"fixture\",\"tool\":\"mcp_fixture_echo\",\"result\":{\"structuredContent\":{\"content\":\"" ++ text_utils.repeat("x", 500) ++ "\"}}}";
     for ([_]mcp_runtime.McpRuntime.ToolIdentity{
         .{ .server = @constCast("koi_sensor"), .tool = @constCast("lookup_evidence") },
         .{ .server = @constCast("koi"), .tool = @constCast("get_evidence") },
@@ -153,9 +153,9 @@ test "ACP MCP results preserve complete query JSON regardless of server or tool 
 
 test "ACP MCP output limit retains complete boundary and omits oversized JSON" {
     const identity: mcp_runtime.McpRuntime.ToolIdentity = .{ .server = @constCast("fixture"), .tool = @constCast("echo") };
-    const boundary = "x" ** (64 * 1024);
+    const boundary = text_utils.repeat("x", 64 * 1024);
     try std.testing.expectEqualStrings(boundary, toolUpdateContentTextForMcp(identity, false, boundary));
-    const oversized = "x" ** (64 * 1024 + 1);
+    const oversized = text_utils.repeat("x", 64 * 1024 + 1);
     try std.testing.expectEqualStrings("MCP tool result truncated: exceeded 64 KiB; complete JSON was omitted.", toolUpdateContentTextForMcp(identity, false, oversized));
 }
 
@@ -167,7 +167,7 @@ test "ACP MCP output rejects unsafe bytes without exposing partial results" {
 }
 
 test "ACP MCP output leaves native tool previews unchanged" {
-    const payload = "x" ** 500;
+    const payload = text_utils.repeat("x", 500);
     try std.testing.expectEqualStrings(toolUpdateContentText(false, payload), toolUpdateContentTextForMcp(null, false, payload));
     try std.testing.expectEqual(@as(usize, 200), toolUpdateContentTextForMcp(null, false, payload).len);
     const denied = "{\"error\":{\"type\":\"tool_permission_denied\",\"tool_name\":\"run_command\",\"message\":\"Permission denied by user\",\"reason\":\"user_denied\"}}";
@@ -207,7 +207,7 @@ test "describeToolCall flags internal discovery and names MCP identity" {
 }
 
 test "toolUpdateContentText clips long output and guards unsafe bytes" {
-    const long = "x" ** 500;
+    const long = text_utils.repeat("x", 500);
     const clipped = toolUpdateContentText(false, long);
     try std.testing.expectEqual(@as(usize, 200), clipped.len);
 

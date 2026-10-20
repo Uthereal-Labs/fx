@@ -80,7 +80,9 @@ python3 scripts/test-acp-observations.py
 The driver uses `zig-out/bin/fx`, isolated temporary homes, and loopback fake HTTP
 and MCP servers. It compares request digests with actual received HTTP bodies,
 checks the managed preview against the model-facing tool message, verifies
-hidden reasoning exclusion, and exercises opt-in and capture limits. It makes
+hidden reasoning exclusion, and exercises opt-in and capture limits. It also
+checks that private observations and session-scoped `libfx/hook` events can be
+enabled independently or used together. It makes
 no external model calls. The multi-call case checks separate MCP receipts;
 dynamic MCP tools execute sequentially in this fixture. It does not exercise
 the runtime's parallel builtin-tool branch.
