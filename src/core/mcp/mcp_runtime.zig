@@ -5467,7 +5467,7 @@ test "modern request builders share required request metadata" {
     defer alloc.free(expected_list);
     try std.testing.expectEqualStrings(expected_list, list);
 
-    const call = try buildToolCallRequestForProtocol(alloc, 2, "echo", "{\"text\":\"hi\"}", .modern, null, null, .{});
+    const call = try buildToolCallRequestForProtocol(alloc, 2, "echo", "{\"text\":\"hi\"}", .modern, null, null, .{}, null);
     defer alloc.free(call);
     const expected_call = try alloc.print(
         "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{{s},\"name\":\"echo\",\"arguments\":{{\"text\":\"hi\"}}}}}}",
@@ -5485,6 +5485,7 @@ test "modern request builders share required request metadata" {
         3,
         null,
         .{},
+        null,
     );
     defer alloc.free(modern_progress);
     try std.testing.expect(
@@ -5500,6 +5501,7 @@ test "modern request builders share required request metadata" {
         null,
         null,
         .{},
+        null,
     );
     defer alloc.free(legacy_call);
     try std.testing.expect(

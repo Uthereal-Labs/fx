@@ -15,6 +15,8 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+ROOT_TRACEPARENT = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+
 PAYLOAD = "visible voucher classification " + "x" * 18000 + ' actor_scope=unknown jurisdiction=unknown'
 
 
@@ -29,7 +31,11 @@ def mcp_fixture() -> None:
         elif method == "tools/list":
             result = {"tools": [{"name": "echo", "description": "Return the local fixture source.", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}, "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}}]}
         elif method == "tools/call":
-            result = {"content": [{"type": "text", "text": PAYLOAD}], "isError": False}
+            if "--trace-output" in sys.argv:
+                path = Path(sys.argv[sys.argv.index("--trace-output") + 1])
+                with path.open("a") as destination:
+                    destination.write(json.dumps(request) + "\n")
+            result = {"content": [{"type": "text", "text": PAYLOAD}], "isError": "--fail-tool" in sys.argv}
         else:
             result = {}
         print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
@@ -38,9 +44,11 @@ def mcp_fixture() -> None:
 class ObservationTest(unittest.TestCase):
     binary = Path(__file__).resolve().parents[1] / "zig-out/bin/fx"
     observations_output: Path | None = None
+    observations_v2_output: Path | None = None
 
-    def exercise(self, *, enabled: bool, limit: int = 262144, tool: bool = True, capture: bool = True, call_count: int = 1, hooks: bool = False) -> tuple[list[dict], list[bytes]]:
+    def exercise(self, *, enabled: bool, limit: int = 262144, tool: bool = True, capture: bool = True, call_count: int = 1, hooks: bool = False, version: int = 1, engine: str = "v1", parent: str = ROOT_TRACEPARENT, tool_failure: bool = False) -> tuple[list[dict], list[bytes]]:
         bodies: list[bytes] = []
+        provider_headers: list[dict[str, str]] = []
 
         class Provider(BaseHTTPRequestHandler):
             def log_message(self, *_: object) -> None:
@@ -49,6 +57,7 @@ class ObservationTest(unittest.TestCase):
             def do_POST(self) -> None:
                 raw = self.rfile.read(int(self.headers["Content-Length"]))
                 bodies.append(raw)
+                provider_headers.append(dict(self.headers.items()))
                 first = len(bodies) == 1 and tool
                 delta = {"tool_calls": [{"index": index, "id": f"fixture_call_{index + 1}", "type": "function", "function": {"name": "mcp_koi_test_echo", "arguments": "{}"}} for index in range(call_count)], "reasoning": "PRIVATE_REASONING_FIXTURE"} if first else {"content": "Scoped fixture answer."}
                 events = [
@@ -68,6 +77,7 @@ class ObservationTest(unittest.TestCase):
             home, workspace = root / "home", root / "workspace"
             (home / ".fx").mkdir(parents=True)
             workspace.mkdir()
+            trace_output = root / "mcp-requests.jsonl"
             server = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
             worker = threading.Thread(target=server.serve_forever, daemon=True)
             worker.start()
@@ -79,6 +89,7 @@ class ObservationTest(unittest.TestCase):
             }
             (home / ".fx/settings.json").write_text(json.dumps(settings))
             environment = {"HOME": str(home), "PATH": os.defpath, "NO_COLOR": "1", "FX_AUTO_UPGRADE": "0", "FX_SOUND": "0", "FX_SESSIONS_V2": "1", "FX_DISABLE_KEYCHAIN": "1"}
+            environment["FX_MCP_ENGINE"] = engine
             process = subprocess.Popen([str(self.binary.resolve()), "acp"], cwd=workspace, env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             lines: queue.Queue[str] = queue.Queue()
             output: list[dict] = []
@@ -106,13 +117,13 @@ class ObservationTest(unittest.TestCase):
             try:
                 initialize = {"protocolVersion": 1, "clientCapabilities": {}, "_meta": {"fx": {"terminal": False}}}
                 if enabled:
-                    initialize["_meta"]["fx"]["observations"] = {"version": 1, "capture_content": capture, "max_content_bytes": limit}
+                    initialize["_meta"]["fx"]["observations"] = {"version": version, "capture_content": capture, "max_content_bytes": limit, **({"traceparent": parent, "tracestate": "vendor=value"} if version == 2 else {})}
                 initialized = request(1, "initialize", initialize)
-                if enabled:
-                    self.assertEqual(initialized["_meta"]["fx"]["observations"]["version"], 1)
+                if enabled and version in (1, 2) and parent == ROOT_TRACEPARENT:
+                    self.assertEqual(initialized["_meta"]["fx"]["observations"]["version"], version)
                 else:
                     self.assertNotIn("_meta", initialized)
-                session_params = {"cwd": str(workspace), "mcpServers": [{"name": "koi_test", "command": sys.executable, "args": [str(Path(__file__).resolve()), "--mcp-fixture"], "env": []}] if tool else [], "systemPrompt": [{"type": "text", "text": "VISIBLE_CLIENT_INSTRUCTIONS"}]}
+                session_params = {"cwd": str(workspace), "mcpServers": [{"name": "koi_test", "command": sys.executable, "args": [str(Path(__file__).resolve()), "--mcp-fixture", "--trace-output", str(trace_output), *(["--fail-tool"] if tool_failure else [])], "env": []}] if tool else [], "systemPrompt": [{"type": "text", "text": "VISIBLE_CLIENT_INSTRUCTIONS"}]}
                 if hooks:
                     session_params["_meta"] = {"fx": {"hooks": {"captureContent": False}}}
                 session = request(2, "session/new", session_params)
@@ -143,6 +154,8 @@ class ObservationTest(unittest.TestCase):
                 for stream in (process.stdout, process.stderr):
                     if stream is not None:
                         stream.close()
+            self.provider_headers = [{key.lower(): value for key, value in headers.items()} for headers in provider_headers]
+            self.mcp_requests = [json.loads(line) for line in trace_output.read_text().splitlines()] if trace_output.exists() else []
             return [message["params"] for message in output if message.get("method") == "fx/observation"], bodies
 
     def test_effective_model_input_matches_local_provider_and_excludes_reasoning(self) -> None:
@@ -192,6 +205,83 @@ class ObservationTest(unittest.TestCase):
         visible = [message["content"] for message in json.loads(bodies[1])["messages"] if message["role"] == "tool"]
         self.assertEqual([value["model_visible"]["content_text"] for value in prepared], visible)
 
+    def test_v2_exact_native_tool_and_model_parents_reach_both_mcp_engines(self) -> None:
+        for engine in ("v1", "v2"):
+            with self.subTest(engine=engine):
+                observations, bodies = self.exercise(enabled=True, version=2, engine=engine, call_count=2, hooks=True)
+                models = [value for value in observations if value["event"]["kind"] == "model.request"]
+                model_ends = [value for value in observations if value["event"]["kind"] == "model.finished"]
+                tools = [value for value in observations if value["event"]["kind"] == "tool.started"]
+                tool_ends = [value for value in observations if value["event"]["kind"] == "tool.finished"]
+                projections = [value for value in observations if value["event"]["kind"] == "tool.prepared"]
+                self.assertEqual((len(models), len(model_ends), len(tools), len(tool_ends), len(projections)), (2, 2, 2, 2, 2))
+                self.assertEqual(len(self.mcp_requests), 2)
+                self.assertEqual(len({value["trace"]["span_id"] for value in models + tools}), 4)
+                self.assertEqual([value["sequence"] for value in observations], list(range(1, len(observations) + 1)))
+                for value in models + tools:
+                    self.assertEqual(value["version"], 2)
+                    self.assertEqual(value["trace"]["trace_id"], ROOT_TRACEPARENT[3:35])
+                    self.assertEqual(value["trace"]["parent_span_id"], ROOT_TRACEPARENT[36:52])
+                for start, end, headers, body in zip(models, model_ends, self.provider_headers, bodies, strict=True):
+                    self.assertEqual(start["trace"], end["trace"])
+                    self.assertEqual(headers["traceparent"], f"00-{start['trace']['trace_id']}-{start['trace']['span_id']}-01")
+                    self.assertEqual(headers["tracestate"], "vendor=value")
+                    self.assertEqual(start["event"]["data"]["request"]["sha256"], hashlib.sha256(body).hexdigest())
+                for start, end, projection, remote in zip(tools, tool_ends, projections, self.mcp_requests, strict=True):
+                    self.assertEqual(start["trace"], end["trace"])
+                    self.assertEqual(start["trace"], projection["trace"])
+                    self.assertLess(start["sequence"], projection["sequence"])
+                    self.assertLess(projection["sequence"], end["sequence"])
+                    self.assertEqual(start["event"]["data"]["tool_call_id"], end["event"]["data"]["tool_call_id"])
+                    self.assertEqual(remote["params"]["_meta"]["traceparent"], f"00-{start['trace']['trace_id']}-{start['trace']['span_id']}-01")
+                    self.assertEqual(remote["params"]["_meta"]["tracestate"], "vendor=value")
+                self.assertNotIn("PRIVATE_REASONING_FIXTURE", json.dumps(observations))
+                if engine == "v1" and self.observations_v2_output is not None:
+                    self.observations_v2_output.write_text(json.dumps(observations))
+
+    def test_v2_failed_tool_finishes_after_projection_and_preserves_its_result(self) -> None:
+        observations, _ = self.exercise(enabled=True, version=2, tool_failure=True)
+        start = next(value for value in observations if value["event"]["kind"] == "tool.started")
+        end = next(value for value in observations if value["event"]["kind"] == "tool.finished")
+        prepared = next(value for value in observations if value["event"]["kind"] == "tool.prepared")
+        self.assertEqual(start["trace"], end["trace"])
+        self.assertEqual(end["event"]["data"]["outcome"], "failed")
+        self.assertIn("visible voucher classification", end["event"]["data"]["output_text"])
+        self.assertLess(prepared["sequence"], end["sequence"])
+
+    def test_v2_tool_content_limit_omits_complete_fields_with_digests(self) -> None:
+        observations, _ = self.exercise(enabled=True, version=2, limit=1)
+        start = next(value["event"]["data"] for value in observations if value["event"]["kind"] == "tool.started")
+        end = next(value["event"]["data"] for value in observations if value["event"]["kind"] == "tool.finished")
+        self.assertIsNone(start["arguments_json"])
+        self.assertTrue(start["arguments_omitted"])
+        self.assertEqual(start["arguments_sha256"], hashlib.sha256(b"{}").hexdigest())
+        self.assertEqual(start["arguments_byte_count"], 2)
+        self.assertIsNone(end["output_text"])
+        self.assertTrue(end["output_omitted"])
+        self.assertGreater(end["output_byte_count"], 1)
+        self.assertEqual(len(end["output_sha256"]), 64)
+
+    def test_v2_metadata_only_keeps_native_tool_identities_without_content(self) -> None:
+        observations, _ = self.exercise(enabled=True, version=2, capture=False)
+        self.assertTrue(any(value["event"]["kind"] == "tool.finished" for value in observations))
+        for value in observations:
+            data = value["event"]["data"]
+            if value["event"]["kind"] == "tool.started":
+                self.assertIsNone(data["arguments_json"])
+                self.assertTrue(data["arguments_omitted"])
+            elif value["event"]["kind"] == "tool.finished":
+                self.assertIsNone(data["output_text"])
+                self.assertTrue(data["output_omitted"])
+        self.assertNotIn("visible voucher classification", json.dumps(observations))
+
+    def test_unsupported_or_invalid_trace_negotiation_does_not_change_execution(self) -> None:
+        for version, parent in ((99, ROOT_TRACEPARENT), (2, "malformed")):
+            observations, bodies = self.exercise(enabled=True, version=version, parent=parent, tool=False)
+            self.assertEqual(observations, [])
+            self.assertEqual(len(bodies), 1)
+            self.assertNotIn("traceparent", self.provider_headers[0])
+
     def test_private_observations_coexist_with_native_session_hooks(self) -> None:
         observations, bodies = self.exercise(enabled=True, hooks=True)
         requests = [value["event"]["data"]["request"] for value in observations if value["event"]["kind"] == "model.request"]
@@ -233,5 +323,9 @@ if __name__ == "__main__":
         if "--observations-output" in sys.argv:
             index = sys.argv.index("--observations-output")
             ObservationTest.observations_output = Path(sys.argv[index + 1]).resolve()
+            del sys.argv[index:index + 2]
+        if "--observations-v2-output" in sys.argv:
+            index = sys.argv.index("--observations-v2-output")
+            ObservationTest.observations_v2_output = Path(sys.argv[index + 1]).resolve()
             del sys.argv[index:index + 2]
         unittest.main()

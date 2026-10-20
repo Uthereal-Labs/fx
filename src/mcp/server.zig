@@ -144,6 +144,7 @@ pub const Error = http.Error || process.Error || std.mem.Allocator.Error || wire
 const What = union(enum) { discover: u8, initialize, list, call, listen };
 
 const Logical = struct {
+    trace_context: ?wire.TraceContext = null,
     used: bool = false,
     handle: Handle = 0,
     what: What = .list,
@@ -441,8 +442,13 @@ pub const Server = struct {
     /// Calls a tool from the current list. `arguments` is a JSON object, or
     /// null for none. Both are copied.
     pub fn call(r: *Server, name: []const u8, arguments: ?[]const u8) Error!Handle {
+        return r.callWithTrace(name, arguments, null);
+    }
+
+    pub fn callWithTrace(r: *Server, name: []const u8, arguments: ?[]const u8, trace_context: ?wire.TraceContext) Error!Handle {
         if (!r.detector.ready()) return error.NotReady;
         const l = try r.newLogical(.call, .call);
+        l.trace_context = trace_context;
         const a = l.arena.allocator();
         l.name = try a.dupe(u8, name);
         l.arguments = if (arguments) |args| try a.dupe(u8, args) else null;
@@ -922,9 +928,11 @@ pub const Server = struct {
     /// The body of a tools/list or tools/call.
     fn writeOperation(r: *Server, out: *std.Io.Writer, l: *const Logical, meta: wire.Meta) Error!void {
         const id = l.id.?;
+        var call_meta = meta;
+        call_meta.trace_context = l.trace_context;
         switch (l.what) {
             .list => try tools.writeList(out, id, meta, if (r.catalog.pending == .next) r.store.nextCursor() else null),
-            .call => try tools.writeCall(out, id, meta, l.name, l.arguments, if (!r.legacyEra()) retryOf(l) else .{}),
+            .call => try tools.writeCall(out, id, call_meta, l.name, l.arguments, if (!r.legacyEra()) retryOf(l) else .{}),
             else => unreachable,
         }
     }

@@ -144,7 +144,7 @@ pub const Catalog = struct {
         var asking: Asking = .{ .responder = options.input_responder orelse undefined, .tool = name, .cancel = options.cancel_flag, .io = c.io };
         const observed = if (options.observer) |observer| observer.beginMcp(.{ .call_id = options.call_id, .server = server, .tool = tool, .transport = transport }) else null;
         const asker: ?runtime_mod.Asker = if (options.input_responder != null) .{ .context = &asking, .ask = Asking.ask } else null;
-        const answer = c.runtime.callObserved(arena, server, tool, arguments_json, options.cancel_flag, asker, observed) catch |err| {
+        const answer = c.runtime.callObserved(arena, server, tool, arguments_json, options.cancel_flag, asker, observed, options.trace_context) catch |err| {
             if (observed) |call| call.end(if (err == error.Cancelled) .cancelled else .failure, @errorName(err));
             asking.finish(arena, .abandoned);
             return err;

@@ -147,11 +147,24 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
     defer client.deinit();
     var uri = try std.Uri.parse(url);
     uri.scheme = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) "https" else if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) "http" else return error.UnsupportedUriScheme;
+    var request_headers: [3]std.http.Header = undefined;
+    request_headers[0] = .{ .name = "accept", .value = "text/event-stream" };
+    var header_count: usize = 1;
+    var traceparent: [55]u8 = undefined;
+    if (request.trace_context) |*context| {
+        traceparent = context.traceparent();
+        request_headers[header_count] = .{ .name = "traceparent", .value = &traceparent };
+        header_count += 1;
+        if (context.tracestate()) |state| {
+            request_headers[header_count] = .{ .name = "tracestate", .value = state };
+            header_count += 1;
+        }
+    }
     var operation = client_mod.PostOperation{
         .client = &client,
         .uri = uri,
         .authorization = authorization,
-        .extra_headers = &.{.{ .name = "accept", .value = "text/event-stream" }},
+        .extra_headers = request_headers[0..header_count],
     };
     try request.admission.admit();
     var opened = try client_mod.openBoundedPost(alloc, request.cancel_flag, phase_deadline(30_000, request.deadline), &operation);

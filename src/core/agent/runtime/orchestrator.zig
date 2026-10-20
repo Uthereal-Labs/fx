@@ -10396,6 +10396,7 @@ fn processQueuedPromptLoop(
                         step_batch.pending_user_suffix.items,
                     );
                     var parallel_exec_ctx = runtime_parallel_execution.ParallelHookExecContext{
+                        .observation_context = .{ .trace = step_ctx },
                         .skill_locations = if (skills.catalog) |catalog| &catalog.locations else null,
                         .hooks = deps,
                         .turn_id = turn_id,
@@ -11732,6 +11733,7 @@ fn processQueuedPromptLoop(
             const execution_is_command = runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, tool_call) == .command;
             var execution_error: ?anyerror = null;
             var execution = deps.executeToolCall(.{
+                .observation_context = .{ .trace = step_ctx },
                 .skill_locations = if (skills.catalog) |catalog| &catalog.locations else null,
                 .call_allocator = call_allocator,
                 .result_allocator = arena,
@@ -11772,6 +11774,7 @@ fn processQueuedPromptLoop(
                 execution_error = err;
                 break :blk ToolExecutionResult{ .status = .failure, .model_output = try deps.format_tool_execution_error(deps.ctx, arena, tool_call.name, err) };
             };
+            defer execution.finishObservation(deps.observation_sink, execution_call);
             var result_commit_pending = execution.result_commit != null;
             defer if (result_commit_pending) {
                 execution.result_commit.?.cancel();
@@ -11898,7 +11901,7 @@ fn processQueuedPromptLoop(
                     &prepared.memory,
                     execution.tool_result_memory,
                 );
-                deps.observation_sink.tool(arena, .{ .trace = step_ctx }, tool_call.id, tool_call.name, execution.model_output, prepared.model_output, prepared.memory.truncated, prepared.memory.output_handle);
+                deps.observation_sink.tool(arena, .{ .trace = step_ctx, .span = execution.observation_context.span }, tool_call.id, tool_call.name, execution.model_output, prepared.model_output, prepared.memory.truncated, prepared.memory.output_handle);
                 try runtime_tool_batch.processCommittedFileResult(
                     deps,
                     call_allocator,
@@ -11986,7 +11989,7 @@ fn processQueuedPromptLoop(
                 else => return err,
             };
             const safe_tool_output = prepared.model_output;
-            deps.observation_sink.tool(arena, .{ .trace = step_ctx }, tool_call.id, tool_call.name, execution.model_output, safe_tool_output, prepared.memory.truncated, prepared.memory.output_handle);
+            deps.observation_sink.tool(arena, .{ .trace = step_ctx, .span = execution.observation_context.span }, tool_call.id, tool_call.name, execution.model_output, safe_tool_output, prepared.memory.truncated, prepared.memory.output_handle);
             try shell_execution_failure_retry.observe(
                 arena,
                 tool_call,

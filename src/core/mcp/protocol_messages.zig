@@ -1,3 +1,4 @@
+const TraceContext = @import("../shared/trace_context.zig").TraceContext;
 const std = @import("std");
 const build_options = @import("build_options");
 const mcp_json = @import("mcp_json.zig");
@@ -39,7 +40,7 @@ pub fn buildToolsListRequest(
 }
 
 pub fn writeModernRequestMetadata(writer: *std.Io.Writer) !void {
-    return writeModernRequestMetadataWithProgress(writer, null, .{});
+    return writeModernRequestMetadataWithProgress(writer, null, .{}, null);
 }
 
 pub fn buildToolCallRequest(alloc: Allocator, request_id: u64, original_name: []const u8, arguments_json: []const u8) ![]u8 {
@@ -52,6 +53,7 @@ pub fn buildToolCallRequest(alloc: Allocator, request_id: u64, original_name: []
         null,
         null,
         .{},
+        null,
     );
 }
 
@@ -64,6 +66,7 @@ pub fn buildToolCallRequestForProtocol(
     progress_token: ?u64,
     continuation: ?tool_mcp_runtime.Continuation,
     capabilities: elicitation.Capabilities,
+    trace_context: ?TraceContext,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -73,10 +76,16 @@ pub fn buildToolCallRequestForProtocol(
     try out.writer.writeAll(",\"method\":\"tools/call\",\"params\":{");
     if (protocol == .modern) {
         try out.writer.writeAll("\"_meta\":");
-        try writeModernRequestMetadataWithProgress(&out.writer, progress_token, capabilities);
+        try writeModernRequestMetadataWithProgress(&out.writer, progress_token, capabilities, trace_context);
         try out.writer.writeAll(",");
-    } else if (progress_token) |token| {
-        try out.writer.print("\"_meta\":{{\"progressToken\":{d}}},", .{token});
+    } else if (progress_token != null or trace_context != null) {
+        try out.writer.writeAll("\"_meta\":{");
+        if (progress_token) |token| try out.writer.print("\"progressToken\":{d}", .{token});
+        if (trace_context) |context| {
+            if (progress_token != null) try out.writer.writeByte(',');
+            try writeTraceMetadata(&out.writer, context);
+        }
+        try out.writer.writeAll("},");
     }
     try out.writer.writeAll("\"name\":");
     try std.json.Stringify.value(original_name, .{}, &out.writer);
@@ -101,6 +110,7 @@ pub fn writeModernRequestMetadataWithProgress(
     writer: *std.Io.Writer,
     progress_token: ?u64,
     capabilities: elicitation.Capabilities,
+    trace_context: ?TraceContext,
 ) !void {
     try writer.writeAll("{\"io.modelcontextprotocol/protocolVersion\":\"");
     try writer.writeAll(modern_protocol_version);
@@ -124,19 +134,33 @@ pub fn writeModernRequestMetadataWithProgress(
     if (progress_token) |token| {
         try writer.print(",\"progressToken\":{d}", .{token});
     }
+    if (trace_context) |context| {
+        try writer.writeByte(',');
+        try writeTraceMetadata(writer, context);
+    }
     try writer.writeByte('}');
 }
 
+fn writeTraceMetadata(writer: *std.Io.Writer, context: TraceContext) !void {
+    const parent = context.traceparent();
+    try writer.writeAll("\"traceparent\":");
+    try std.json.Stringify.value(parent[0..], .{}, writer);
+    if (context.tracestate()) |state| {
+        try writer.writeAll(",\"tracestate\":");
+        try std.json.Stringify.value(state, .{}, writer);
+    }
+}
+
 pub fn writeModernRequestMetadataForm(writer: *std.Io.Writer) !void {
-    return writeModernRequestMetadataWithProgress(writer, null, .{ .form = true });
+    return writeModernRequestMetadataWithProgress(writer, null, .{ .form = true }, null);
 }
 
 pub fn writeModernRequestMetadataUrl(writer: *std.Io.Writer) !void {
-    return writeModernRequestMetadataWithProgress(writer, null, .{ .url = true });
+    return writeModernRequestMetadataWithProgress(writer, null, .{ .url = true }, null);
 }
 
 pub fn writeModernRequestMetadataFormAndUrl(writer: *std.Io.Writer) !void {
-    return writeModernRequestMetadataWithProgress(writer, null, .{ .form = true, .url = true });
+    return writeModernRequestMetadataWithProgress(writer, null, .{ .form = true, .url = true }, null);
 }
 
 pub fn buildLegacyInitializeRequest(
@@ -285,4 +309,22 @@ pub fn metadataWriterForCapabilities(
     if (capabilities.form) return writeModernRequestMetadataForm;
     if (capabilities.url) return writeModernRequestMetadataUrl;
     return writeModernRequestMetadata;
+}
+
+test "MCP trace metadata preserves protocol progress and tool arguments" {
+    const alloc = std.testing.allocator;
+    const context = try TraceContext.parse("00-0123456789abcdef0123456789abcdef-0123456789abcdef-01", "vendor=value");
+    for ([_]StdioProtocol{ .legacy, .modern }) |protocol| {
+        const body = try buildToolCallRequestForProtocol(alloc, 9, "echo", "{\"value\":1}", protocol, 9, null, .{}, context);
+        defer alloc.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer parsed.deinit();
+        const params = parsed.value.object.get("params").?.object;
+        const meta = params.get("_meta").?.object;
+        try std.testing.expectEqualStrings("00-0123456789abcdef0123456789abcdef-0123456789abcdef-01", meta.get("traceparent").?.string);
+        try std.testing.expectEqualStrings("vendor=value", meta.get("tracestate").?.string);
+        try std.testing.expectEqual(@as(i64, 9), meta.get("progressToken").?.integer);
+        try std.testing.expectEqual(@as(i64, 1), params.get("arguments").?.object.get("value").?.integer);
+        try std.testing.expectEqual(protocol == .modern, meta.contains("io.modelcontextprotocol/protocolVersion"));
+    }
 }

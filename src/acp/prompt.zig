@@ -1910,15 +1910,26 @@ fn emitObservation(raw: *anyopaque, context: observations.Context, event: observ
 }
 
 fn emitObservationJson(ctx: *AcpContext, context: observations.Context, event: observations.Event) !void {
+    // Parallel tools allocate sequence numbers and write their frames under one lock.
+    ctx.state.observation_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.state.observation_mutex.unlock(io_mod.getIo());
+    if (ctx.state.observation_options.version == 2 and context.span == null) return;
     var out = std.Io.Writer.Allocating.init(ctx.alloc);
     defer out.deinit();
-    try std.json.Stringify.value(.{ .version = @as(u8, 1), .sequence = ctx.state.observation_sequence.fetchAdd(1, .monotonic) + 1, .session_id = ctx.session_id, .turn_id = context.trace.turn_id, .step_id = context.trace.step_id, .attempt = context.attempt, .timestamp_ms = io_mod.milliTimestamp() }, .{}, &out.writer);
+    try std.json.Stringify.value(.{ .version = ctx.state.observation_options.version, .sequence = ctx.state.observation_sequence.fetchAdd(1, .monotonic) + 1, .session_id = ctx.session_id, .turn_id = context.trace.turn_id, .step_id = context.trace.step_id, .attempt = context.attempt, .timestamp_ms = io_mod.milliTimestamp() }, .{}, &out.writer);
     // Add a tagged data object without serializing opaque runtime state.
     out.writer.end -= 1;
+    if (ctx.state.observation_options.version == 2) {
+        const span = context.span orelse return;
+        try out.writer.writeAll(",\"trace\":");
+        try std.json.Stringify.value(span.wire(), .{}, &out.writer);
+    }
     try out.writer.writeAll(",\"event\":{");
     switch (event) {
         inline else => |value, tag| {
             const kind = switch (tag) {
+                .tool_started => "tool.started",
+                .tool_finished => "tool.finished",
                 .model_request => "model.request",
                 .model_finished => "model.finished",
                 .tool_prepared => "tool.prepared",
@@ -2577,6 +2588,7 @@ fn executeToolCall(
     ctx.sendToolCallProgressText(acp_id, null) catch {};
 
     var tool_ctx = ctx.toolContext();
+    tool_ctx.trace_context = request.observation_context.span;
     var elicitation_responder = AcpElicitationResponderContext{
         .acp = ctx,
         .tool_call_id = acp_id,

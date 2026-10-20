@@ -87,6 +87,7 @@ pub const SnapshotToolFn = *const fn (*anyopaque, Allocator, []const u8, Binding
 pub const Binding = types.McpToolBinding;
 
 pub const CallOptions = struct {
+    trace_context: ?@import("../shared/trace_context.zig").TraceContext = null,
     observer: ?*observation.Observer = null,
     call_id: ?[]const u8 = null,
     mcp_observation: ?*observation.McpCall = null,
