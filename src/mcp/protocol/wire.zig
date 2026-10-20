@@ -344,7 +344,14 @@ pub const Implementation = struct {
 };
 
 /// Per-request `_meta`.
+pub const TraceContext = struct {
+    traceparent: [55]u8,
+    tracestate: [512]u8 = @splat(0),
+    tracestate_len: u16 = 0,
+};
+
 pub const Meta = struct {
+    trace_context: ?TraceContext = null,
     /// 2026-07-28 fields, required together on every request. Null on 2025 requests.
     modern: ?Modern = null,
     /// Opts the request into progress notifications. The client uses the request id.
@@ -444,9 +451,18 @@ pub const Writer = struct {
         try w.json.write(method);
         try w.json.objectField("params");
         try w.json.beginObject();
-        if (meta.modern == null and meta.progress_token == null) return;
+        if (meta.modern == null and meta.progress_token == null and meta.trace_context == null) return;
         try w.json.objectField("_meta");
         try w.json.beginObject();
+        if (meta.trace_context) |context| {
+            if (context.tracestate_len > context.tracestate.len) return error.InvalidRawJson;
+            try w.json.objectField("traceparent");
+            try w.json.write(context.traceparent[0..]);
+            if (context.tracestate_len > 0) {
+                try w.json.objectField("tracestate");
+                try w.json.write(context.tracestate[0..context.tracestate_len]);
+            }
+        }
         if (meta.progress_token) |token| {
             try w.json.objectField("progressToken");
             try w.int(@intCast(token));

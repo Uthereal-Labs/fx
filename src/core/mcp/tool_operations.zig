@@ -590,6 +590,7 @@ pub const Operations = struct {
                 null,
             options.continuation,
             responderCapabilities(options.input_responder),
+            options.trace_context,
         );
         defer alloc.free(request_body);
         if (options.mcp_observation) |call| call.request(request_id);
@@ -861,6 +862,7 @@ pub const Operations = struct {
             if (options.progress != null) request_id else null,
             options.continuation,
             responderCapabilities(options.input_responder),
+            options.trace_context,
         );
         defer alloc.free(request_body);
 
@@ -958,6 +960,7 @@ pub const Operations = struct {
             if (options.progress != null) request_id else null,
             options.continuation,
             .{},
+            options.trace_context,
         );
         defer alloc.free(request_body);
 
@@ -1165,6 +1168,7 @@ pub const Operations = struct {
             null,
             options.continuation,
             .{},
+            options.trace_context,
         );
         defer alloc.free(request_body);
         const raw_frame_cap = mcpResponseFrameCap(max_tool_result_bytes);

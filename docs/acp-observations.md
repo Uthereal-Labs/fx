@@ -1,6 +1,6 @@
 # ACP observations
 
-An embedding host can observe model attempts and tool-result preparation through
+An embedding host can observe model attempts, tool execution, and tool-result preparation through
 `fx/observation` notifications. fx sends these notifications only after an
 explicit opt-in on `initialize`:
 
@@ -68,6 +68,55 @@ session updates and public conversation journals. Export failures do not change
 model invocation or tool execution. Hosts should close incomplete generation
 observations when the connection ends without a matching `model.finished`.
 
+## Exact native parents with version 2
+
+Request version 2 and pass the host-owned run context to connect native tools,
+model attempts, and downstream operations to one trace:
+
+```json
+{
+  "version": 2,
+  "capture_content": true,
+  "max_content_bytes": 524288,
+  "traceparent": "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+  "tracestate": "vendor=value"
+}
+```
+
+Place this object at `initialize._meta.fx.observations`. The response acknowledges
+version 2. Unsupported observation versions and invalid trace contexts disable
+observations without changing the ACP operation. Version 1 retains its existing
+notification shape. Neither version stores trace state in session history.
+
+Every version 2 envelope adds `trace` with `trace_id`, `span_id`, and
+`parent_span_id`, represented as lowercase hexadecimal strings. fx generates a
+new nonzero 64-bit span ID for each native tool execution and model attempt.
+Start and finish events share that ID. The host exports each span using its
+native ID and validates that it belongs to the supplied run trace. Repeated tool
+call IDs do not reuse span IDs.
+
+| Additional event | Data |
+| --- | --- |
+| `tool.started` | `tool_call_id`, `tool_name`, bounded `arguments_json`, `arguments_sha256`, `arguments_byte_count`, and `arguments_omitted`. |
+| `tool.finished` | `tool_call_id`, `tool_name`, `outcome`, bounded `output_text`, `output_sha256`, `output_byte_count`, `output_omitted`, and `error_type`. |
+
+Tool outcomes are `completed`, `failed`, or `cancelled`. A returned native result
+finishes after managed output preparation; thrown failures finish immediately.
+The `tool.prepared` envelope identifies its owning tool span. Original tool
+output and the model-visible projection remain distinct fields and events.
+Hosts close incomplete spans if native execution ends before a finish event.
+
+Both MCP engines copy the tool context into each `tools/call` request's `_meta`
+as `traceparent` and optional `tracestate`. Existing protocol and progress
+metadata remain intact through retries and input-response continuations. A host
+can pass static run headers for connection setup and discovery separately.
+
+The configured Chat Completions transport sends the model attempt's context in
+HTTP `traceparent` and optional `tracestate` headers. An authenticated local model
+adapter can extract that parent before creating its transport span. These headers
+are separate from the model body, so they do not alter request-body digests.
+The tracing contract carries no exporter credentials.
+
 ## Verify the built binary
 
 Build from the repository root, then run the provider-free driver:
@@ -83,7 +132,10 @@ checks the managed preview against the model-facing tool message, verifies
 hidden reasoning exclusion, and exercises opt-in and capture limits. It also
 checks that private observations and session-scoped `libfx/hook` events can be
 enabled independently or used together. It makes
-no external model calls. The multi-call case checks separate MCP receipts;
+no external model calls. Version 2 checks exact native parents in both MCP
+engines, model HTTP headers, content opt-out, and invalid-context fallback. Write
+an actual version 2 capture with `--observations-v2-output /tmp/fx-observations.v2.json`.
+The multi-call case checks separate MCP receipts;
 dynamic MCP tools execute sequentially in this fixture. It does not exercise
 the runtime's parallel builtin-tool branch.
 

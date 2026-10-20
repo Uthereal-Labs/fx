@@ -309,8 +309,10 @@ pub const AgentRuntimeDeps = struct {
     pub fn executeToolCall(self: *const AgentRuntimeDeps, request: ToolExecutionRequest) !ToolExecutionResult {
         if (self.observer) |observer| observer.emit(.{ .tool_start = .{ .call = request.call } });
         var observed_request = request;
+        observed_request.observation_context = self.observation_sink.beginTool(request.observation_context, request.call);
         observed_request.observer = self.observer orelse request.observer;
-        const result = self.execute_tool_call(self.ctx, observed_request) catch |err| {
+        var result = self.execute_tool_call(self.ctx, observed_request) catch |err| {
+            self.observation_sink.finishTool(observed_request.observation_context, request.call, null, true, err == error.Cancelled, @errorName(err));
             if (self.observer) |observer| observer.emit(.{ .tool_end = .{
                 .call = request.call,
                 .status = if (err == error.Cancelled) "cancelled" else "failure",
@@ -324,6 +326,7 @@ pub const AgentRuntimeDeps = struct {
             .status = if (result.cancelled) "cancelled" else @tagName(result.status),
             .usage = result.inner_usage,
         } });
+        result.observation_context = observed_request.observation_context;
         return result;
     }
 };

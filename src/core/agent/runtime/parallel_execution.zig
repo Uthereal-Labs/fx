@@ -114,6 +114,7 @@ pub const ParallelRunResult = struct {
 };
 
 pub const ParallelHookExecContext = struct {
+    observation_context: @import("../observations.zig").Context = .{ .trace = .{} },
     skill_locations: ?*const skill_contract.Locations = null,
     hooks: *const AgentRuntimeDeps,
     turn_id: u64,
@@ -356,6 +357,7 @@ fn cancelRequested(cancel_flag: ?*std.atomic.Value(bool)) bool {
 pub fn parallelHookExecute(ctx: *anyopaque, alloc: Allocator, call: ToolCall, index: usize) !ToolExecutionResult {
     const exec_ctx: *ParallelHookExecContext = @ptrCast(@alignCast(ctx));
     return exec_ctx.hooks.executeToolCall(.{
+        .observation_context = exec_ctx.observation_context,
         .skill_locations = exec_ctx.skill_locations,
         .call_allocator = alloc,
         .result_allocator = alloc,
@@ -398,10 +400,13 @@ fn duplicateParallelToolResult(alloc: Allocator, call: ToolCall, execution: Tool
             .execution = .{
                 .status = .failure,
                 .model_output = try alloc.dupe(u8, "Parallel tool returned an unsupported side-effect payload."),
+                .observation_context = execution.observation_context,
             },
         };
     }
     var duplicated_execution: ToolExecutionResult = .{
+        .observation_context = execution.observation_context,
+        .cancelled = execution.cancelled,
         .model_content_kind = execution.model_content_kind,
         .status = execution.status,
         .model_output = try alloc.dupe(u8, execution.model_output),
@@ -1047,4 +1052,22 @@ test "parallel result duplication cleans up every allocation failure" {
         checkParallelResultDuplicationAllocationFailures,
         .{},
     );
+}
+
+test "parallel native observations retain their exact owner through result transfer" {
+    const alloc = std.testing.allocator;
+    const parent = try @import("../../shared/trace_context.zig").TraceContext.parse("00-0123456789abcdef0123456789abcdef-0123456789abcdef-01", null);
+    const owner = parent.child();
+    const call: ToolCall = .{ .id = "call_1", .name = "read_file", .arguments_json = "{}" };
+    const original: ToolExecutionResult = .{
+        .model_output = "cancelled",
+        .status = .failure,
+        .cancelled = true,
+        .observation_context = .{ .trace = .{ .turn_id = 3, .step_id = 7 }, .span = owner },
+    };
+    const duplicated = try duplicateParallelToolResult(alloc, call, original);
+    defer freeParallelToolAttempt(alloc, .{ .completed = duplicated });
+    try std.testing.expectEqualStrings(&owner.span_id, &duplicated.execution.observation_context.span.?.span_id);
+    try std.testing.expectEqual(@as(u64, 7), duplicated.execution.observation_context.trace.step_id);
+    try std.testing.expect(duplicated.execution.cancelled);
 }

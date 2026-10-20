@@ -160,6 +160,7 @@ pub const Error = Allocator.Error || error{
 
 const Request = struct {
     observation: ?observation.McpCall = null,
+    trace_context: ?@import("../shared/trace_context.zig").TraceContext = null,
     kind: Kind,
     /// Results are allocated with it; the caller doesn't use it while waiting.
     alloc: Allocator,
@@ -411,11 +412,11 @@ pub const Runtime = struct {
         cancel: ?*const std.atomic.Value(bool),
         asker: ?Asker,
     ) Error!CallResult {
-        return r.callObserved(alloc, server, tool, arguments, cancel, asker, null);
+        return r.callObserved(alloc, server, tool, arguments, cancel, asker, null, null);
     }
 
-    pub fn callObserved(r: *Runtime, alloc: Allocator, server: []const u8, tool: []const u8, arguments: ?[]const u8, cancel: ?*const std.atomic.Value(bool), asker: ?Asker, observed: ?observation.McpCall) Error!CallResult {
-        var req: Request = .{ .kind = .{ .call = .{ .server = server, .tool = tool, .arguments = arguments } }, .alloc = alloc, .asker = asker, .observation = observed };
+    pub fn callObserved(r: *Runtime, alloc: Allocator, server: []const u8, tool: []const u8, arguments: ?[]const u8, cancel: ?*const std.atomic.Value(bool), asker: ?Asker, observed: ?observation.McpCall, trace_context: ?@import("../shared/trace_context.zig").TraceContext) Error!CallResult {
+        var req: Request = .{ .kind = .{ .call = .{ .server = server, .tool = tool, .arguments = arguments } }, .alloc = alloc, .asker = asker, .observation = observed, .trace_context = trace_context };
         try r.submit(&req, cancel);
         return switch (req.result) {
             .call => |c| c,
@@ -586,7 +587,8 @@ pub const Runtime = struct {
                 if (r.resolved.servers[i].held != null) return r.finish(req, .{ .failed = error.Held });
                 // Room first: a call the engine took must have its waiter.
                 try r.calls.ensureUnusedCapacity(r.gpa, 1);
-                const handle_ = try r.engine.call(r.resolved.servers[i].name, c.tool, c.arguments);
+                const carrier: ?mcp.wire.TraceContext = if (req.trace_context) |context| .{ .traceparent = context.traceparent(), .tracestate = context.state, .tracestate_len = context.state_len } else null;
+                const handle_ = try r.engine.callWithTrace(r.resolved.servers[i].name, c.tool, c.arguments, carrier);
                 if (req.observation) |call_| call_.engineRequest(handle_);
                 r.calls.putAssumeCapacity(handle_, req);
             },

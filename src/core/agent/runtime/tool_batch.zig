@@ -189,6 +189,7 @@ pub fn assembleParallelToolResults(
                 },
             }
         };
+        defer execution.finishObservation(hooks.observation_sink, original_call);
         var prepared = try runtime_execution_memory.prepareToolExecutionOutput(arena, config, original_call, execution, null);
         runtime_execution_memory.applyToolResultMemory(
             &prepared.memory,
@@ -202,7 +203,7 @@ pub fn assembleParallelToolResults(
         prepared.memory = try types.dupeToolResultMemory(arena, prepared.memory);
         try runtime_execution_memory.retainToolImages(arena, config, original_call, &prepared);
         const safe_tool_output = prepared.model_output;
-        hooks.observation_sink.tool(arena, .{ .trace = step_ctx }, original_call.id, original_call.name, execution.model_output, safe_tool_output, prepared.memory.truncated, prepared.memory.output_handle);
+        hooks.observation_sink.tool(arena, .{ .trace = step_ctx, .span = execution.observation_context.span }, original_call.id, original_call.name, execution.model_output, safe_tool_output, prepared.memory.truncated, prepared.memory.output_handle);
         if (precomputed == null) {
             runtime_parallel_execution.reportInnerToolUsage(hooks, original_call.name, execution);
             _ = try provisional_statuses.finishExecutedCall(

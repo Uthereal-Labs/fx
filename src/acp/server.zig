@@ -370,6 +370,7 @@ pub const ServerState = struct {
     host_tools: host_tool_runtime.Runtime = .{},
     observation_options: observations.Options = .{},
     observation_sequence: std.atomic.Value(u64) = .init(0),
+    observation_mutex: std.Io.Mutex = .init,
     host_instructions: []u8 = &.{},
     outbound_mutex: std.Io.Mutex = .init,
     outbound_cond: std.Io.Condition = .init,
@@ -2471,7 +2472,7 @@ fn parseInitializeRequest(
 
     var request = InitializeRequest{
         .terminal_ui = acp_types.fxMetaBool(parsed.value.object, "terminal") orelse true,
-        .observation_options = try observations.Options.parse(acp_types.fxMetaField(parsed.value.object, "observations")),
+        .observation_options = observations.Options.parse(acp_types.fxMetaField(parsed.value.object, "observations")) catch .{},
     };
     const capabilities = parsed.value.object.get("clientCapabilities") orelse
         return request;
@@ -2845,7 +2846,9 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     });
     if (state.observation_options.enabled) {
         out.writer.end -= 1;
-        try out.writer.writeAll(",\"_meta\":{\"fx\":{\"observations\":{\"version\":1}}}}");
+        try out.writer.writeAll(",\"_meta\":{\"fx\":{\"observations\":{\"version\":");
+        try out.writer.print("{d}", .{state.observation_options.version});
+        try out.writer.writeAll("}}}}");
     }
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }

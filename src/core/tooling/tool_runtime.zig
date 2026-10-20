@@ -113,6 +113,7 @@ test {
 }
 
 pub const Context = struct {
+    trace_context: ?@import("../shared/trace_context.zig").TraceContext = null,
     observer: ?*observation.Observer = null,
     workspace_root: []const u8,
     access_scope: ?workspace_access.AccessScope = null,
@@ -859,6 +860,7 @@ fn executeRegisteredTool(
     dispatch_ctx.result_commit_sink = &result_commit_token;
     dispatch_ctx.execution_authority = authority;
     dispatch_ctx.mcp_call_options = .{
+        .trace_context = ctx.trace_context,
         .observer = ctx.observer,
         .call_id = call.id,
         .expected_runtime_generation = ctx.expected_mcp_runtime_generation,

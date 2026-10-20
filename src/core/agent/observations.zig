@@ -3,12 +3,15 @@
 //! replay, hidden reasoning, HTTP headers, or transport configuration.
 const std = @import("std");
 const types = @import("../shared/types.zig");
+pub const TraceContext = @import("../shared/trace_context.zig").TraceContext;
 const trace = @import("../shared/debug_trace.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Options = struct {
     enabled: bool = false,
+    version: u8 = 1,
+    parent: ?TraceContext = null,
     capture_content: bool = false,
     max_content_bytes: usize = 262144,
 
@@ -16,11 +19,17 @@ pub const Options = struct {
         const root = value orelse return .{};
         if (root != .object) return error.InvalidObservationOptions;
         for (root.object.keys()) |key| {
-            if (!std.mem.eql(u8, key, "version") and !std.mem.eql(u8, key, "capture_content") and !std.mem.eql(u8, key, "max_content_bytes")) return error.InvalidObservationOptions;
+            if (!std.mem.eql(u8, key, "version") and !std.mem.eql(u8, key, "capture_content") and !std.mem.eql(u8, key, "max_content_bytes") and !std.mem.eql(u8, key, "traceparent") and !std.mem.eql(u8, key, "tracestate")) return error.InvalidObservationOptions;
         }
         const version = root.object.get("version") orelse return error.InvalidObservationOptions;
-        if (version != .integer or version.integer != 1) return error.InvalidObservationOptions;
-        var result = Options{ .enabled = true };
+        if (version != .integer or version.integer < 1 or version.integer > 2) return error.InvalidObservationOptions;
+        var result = Options{ .enabled = true, .version = @intCast(version.integer) };
+        if (result.version == 2) {
+            const parent = root.object.get("traceparent") orelse return error.InvalidObservationOptions;
+            const state = root.object.get("tracestate");
+            if (parent != .string or state != null and state.? != .string) return error.InvalidObservationOptions;
+            result.parent = try TraceContext.parse(parent.string, if (state) |s| s.string else null);
+        }
         if (root.object.get("capture_content")) |item| {
             if (item != .bool) return error.InvalidObservationOptions;
             result.capture_content = item.bool;
@@ -69,7 +78,27 @@ pub const ToolPrepared = struct {
     truncated: bool,
     stored_handle: ?[]const u8,
 };
+pub const ToolStarted = struct {
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    arguments_json: ?[]const u8,
+    arguments_sha256: []const u8,
+    arguments_byte_count: usize,
+    arguments_omitted: bool,
+};
+pub const ToolFinished = struct {
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    outcome: enum { completed, failed, cancelled },
+    output_text: ?[]const u8,
+    output_sha256: ?[]const u8,
+    output_byte_count: ?usize,
+    output_omitted: bool,
+    error_type: ?[]const u8,
+};
 pub const Event = union(enum) {
+    tool_started: ToolStarted,
+    tool_finished: ToolFinished,
     model_request: ModelRequest,
     model_finished: ModelFinished,
     tool_prepared: ToolPrepared,
@@ -80,7 +109,7 @@ pub const RequestDetails = struct {
     max_output_tokens: ?u32 = null,
     provider_options: model_capabilities.ResolvedProviderOptions = .{},
 };
-pub const Context = struct { trace: trace.TraceContext, attempt: ?u32 = null };
+pub const Context = struct { trace: trace.TraceContext, attempt: ?u32 = null, span: ?TraceContext = null };
 pub const Sink = struct {
     context: ?*anyopaque = null,
     emit_fn: ?*const fn (*anyopaque, Context, Event) void = null,
@@ -92,6 +121,40 @@ pub const Sink = struct {
     pub fn emit(self: Sink, context: Context, event: Event) void {
         if (self.enabled()) self.emit_fn.?(self.context.?, context, event);
     }
+    pub fn beginTool(self: Sink, context: Context, call: types.ToolCall) Context {
+        var current = context;
+        if (!self.enabled() or self.options.version != 2) return current;
+        current.span = if (context.span) |parent| parent.child() else if (self.options.parent) |parent| parent.child() else return current;
+        const omitted = !self.options.capture_content or call.arguments_json.len > self.options.max_content_bytes;
+        var hash = hashText(call.arguments_json);
+        self.emit(current, .{ .tool_started = .{
+            .tool_call_id = call.id,
+            .tool_name = call.name,
+            .arguments_json = if (omitted) null else call.arguments_json,
+            .arguments_sha256 = &hash,
+            .arguments_byte_count = call.arguments_json.len,
+            .arguments_omitted = omitted,
+        } });
+        return current;
+    }
+
+    pub fn finishTool(self: Sink, context: Context, call: types.ToolCall, output: ?[]const u8, failed: bool, cancelled: bool, error_type: ?[]const u8) void {
+        if (context.span == null or self.options.version != 2) return;
+        var hash: [64]u8 = undefined;
+        if (output) |text| hash = hashText(text);
+        const omitted = !self.options.capture_content or output == null or output.?.len > self.options.max_content_bytes;
+        self.emit(context, .{ .tool_finished = .{
+            .tool_call_id = call.id,
+            .tool_name = call.name,
+            .outcome = if (cancelled) .cancelled else if (failed) .failed else .completed,
+            .output_text = if (omitted) null else output,
+            .output_sha256 = if (output != null) &hash else null,
+            .output_byte_count = if (output) |text| text.len else null,
+            .output_omitted = omitted,
+            .error_type = error_type,
+        } });
+    }
+
     pub fn request(self: Sink, alloc: Allocator, context: Context, model: []const u8, body: ?[]const u8, instructions: []const types.ChatMessage, messages: []const types.ChatMessage, details: RequestDetails) void {
         if (!self.enabled()) return;
         self.captureRequest(alloc, context, model, body, instructions, messages, details) catch {};

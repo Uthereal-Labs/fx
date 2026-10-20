@@ -79,6 +79,7 @@ pub const Status = struct {
 pub const Error = server_mod.Error || error{ UnknownServer, UnknownCall, TooManyCalls };
 
 const Call = struct {
+    trace_context: ?@import("protocol/wire.zig").TraceContext = null,
     handle: Handle,
     /// The server's handle, once it was handed over.
     sent: ?server_mod.Handle = null,
@@ -216,12 +217,16 @@ pub const Engine = struct {
     /// both are copied. The host's `allow` answers first. Every
     /// call ends with one `called` event, a refused one too.
     pub fn call(e: *Engine, name: []const u8, tool: []const u8, arguments: ?[]const u8) Error!Handle {
+        return e.callWithTrace(name, tool, arguments, null);
+    }
+
+    pub fn callWithTrace(e: *Engine, name: []const u8, tool: []const u8, arguments: ?[]const u8, trace_context: ?@import("protocol/wire.zig").TraceContext) Error!Handle {
         const slot = try e.find(name);
         const allowed = e.host.allow(e.host.context, slot.config.name, tool, arguments);
         const handle = e.next_handle;
         e.next_handle = if (e.next_handle == std.math.maxInt(Handle)) 1 else e.next_handle + 1;
         if (allowed) {
-            const copy: Call = .{ .handle = handle, .name = try e.gpa.dupe(u8, tool), .arguments = if (arguments) |a| try e.gpa.dupe(u8, a) else null };
+            const copy: Call = .{ .trace_context = trace_context, .handle = handle, .name = try e.gpa.dupe(u8, tool), .arguments = if (arguments) |a| try e.gpa.dupe(u8, a) else null };
             slot.calls.append(e.gpa, copy) catch |err| {
                 free(e.gpa, copy);
                 return err;
@@ -416,7 +421,7 @@ pub const Engine = struct {
         for (out.effects()) |effect| switch (effect) {
             .connect => try (try e.ensureServer(slot)).connect(),
             .send => |handle| for (slot.calls.items) |*x| if (x.handle == handle) {
-                x.sent = try slot.server.?.call(x.name, x.arguments);
+                x.sent = try slot.server.?.callWithTrace(x.name, x.arguments, x.trace_context);
             },
             .end => |end| {
                 for (slot.calls.items, 0..) |x, i| if (x.handle == end.call) {

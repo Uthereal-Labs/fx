@@ -219,6 +219,7 @@ pub fn validate_prompt_lanes(
 /// Borrowed typed request. Providers own validation, wire serialization,
 /// endpoint selection, headers, HTTP, and stream reduction.
 pub const ModelRequest = struct {
+    trace_context: ?observations.TraceContext = null,
     observer: ?*observation.Observer = null,
     parent_call_id: ?[]const u8 = null,
     purpose: observation.ModelPurpose = .agent,
@@ -478,7 +479,14 @@ pub const Provider = struct {
 
     pub fn stream(self: Provider, alloc: Allocator, request: ModelRequest) !Result {
         try request.data().validatePrompt();
-        const context = observations.Context{ .trace = request.trace_ctx, .attempt = request.observation_attempt };
+        const parent = request.trace_context orelse request.observation_sink.options.parent;
+        const context = observations.Context{
+            .trace = request.trace_ctx,
+            .attempt = request.observation_attempt,
+            .span = if (request.observation_sink.enabled() and parent != null) parent.?.child() else null,
+        };
+        var observed_request = request;
+        observed_request.trace_context = context.span;
         var names: std.ArrayList([]const u8) = .empty;
         defer names.deinit(alloc);
         if (request.observation_sink.enabled()) {
@@ -487,7 +495,7 @@ pub const Provider = struct {
             for (request.tools.additional_functions) |tool| names.append(alloc, tool.name) catch {};
         }
         request.observation_sink.request(alloc, context, request.model, request.prepared_request_body, request.instructions, request.messages, .{ .available_tool_names = names.items, .tool_choice = request.tool_choice, .max_output_tokens = request.max_output_tokens, .provider_options = request.provider_options });
-        const result = self.stream_fn(self.context, alloc, request) catch |err| {
+        const result = self.stream_fn(self.context, alloc, observed_request) catch |err| {
             request.observation_sink.finished(alloc, context, .{ .model = request.model, .outcome = if (err == error.Cancelled) .cancelled else .failed, .delivery = if (request.delivery.load() == .possibly_sent) .possibly_sent else .definitely_unsent, .admitted = request.attempt_evidence.provider_admitted, .output_text = null, .output_omitted = true, .output_sha256 = null, .output_byte_count = null, .error_type = @errorName(err) });
             return err;
         };
