@@ -530,12 +530,16 @@ pub const Session = struct {
     fn stage(session: *Session, source_blobs: ?storage.Dir) AppendError!Live {
         const env = session.env;
         const s = env.s;
+        const id_ = session.identity.id;
+        const publication = acquirePublicationFence(env, env.options.lock_wait_ms) catch |err| return storage.ioFault(err);
+        defer s.closeFile(publication);
         const tmp = s.ensureDir(env.root, ".tmp") catch |io_err| return storage.ioFault(io_err);
         defer s.closeDir(tmp);
         // An import that staged blobs already has its folder.
-        const dir = if (session.staged) |staged| staged else try session.makeStaging(tmp);
+        var dir = if (session.staged) |staged| staged else try session.makeStaging(tmp);
         session.staged = null;
-        errdefer s.closeDir(dir);
+        var dir_open = true;
+        errdefer if (dir_open) s.closeDir(dir);
         {
             const blobs = s.ensureDir(dir, "blobs") catch |io_err| return storage.ioFault(io_err);
             defer s.closeDir(blobs);
@@ -545,19 +549,41 @@ pub const Session = struct {
             }
         }
         var log = Log.create(s, dir, "log.jsonl", .{}) catch |io_err| return storage.ioFault(io_err);
-        errdefer log.close();
+        var log_open = true;
+        errdefer if (log_open) log.close();
         session.writeFramed(&log, 1, .header) catch |io_err| return storage.ioFault(io_err);
 
         const rename_first = env.isPlanted(.rename_before_fsync);
         if (rename_first) try session.publishRename(tmp);
         s.sync(log.file) catch |io_err| return storage.ioFault(io_err);
         session.observe(.publish_synced);
-        const lock = s.createFile(dir, "lock") catch |io_err| return storage.ioFault(io_err);
-        errdefer s.closeFile(lock);
+        var lock = s.createFile(dir, "lock") catch |io_err| return storage.ioFault(io_err);
+        var lock_open = true;
+        errdefer if (lock_open) s.closeFile(lock);
         if (!(s.tryLock(lock) catch |io_err| return storage.ioFault(io_err))) return error.Io;
         s.syncDir(dir) catch |io_err| return storage.ioFault(io_err);
-        if (!rename_first) try session.publishRename(tmp);
-        s.syncDir(env.root) catch |io_err| return storage.ioFault(io_err);
+        if (!rename_first) {
+            // SMB refuses directory promotion with open child files. The stable
+            // root fence excludes resume/delete until the lifetime flock returns.
+            log.close();
+            log_open = false;
+            s.closeFile(lock);
+            lock_open = false;
+            s.closeDir(dir);
+            dir_open = false;
+            try session.publishRename(tmp);
+            s.syncDir(env.root) catch |io_err| return storage.ioFault(io_err);
+            dir = s.openDir(env.root, id_) catch |io_err| return storage.ioFault(io_err);
+            dir_open = true;
+            lock = s.openFile(dir, "lock", .read_write) catch |io_err| return storage.ioFault(io_err);
+            lock_open = true;
+            if (!(s.tryLock(lock) catch |io_err| return storage.ioFault(io_err))) return error.Io;
+            log.file = s.openFile(dir, "log.jsonl", .read_write) catch |io_err| return storage.ioFault(io_err);
+            log.status = .open;
+            log_open = true;
+        } else {
+            s.syncDir(env.root) catch |io_err| return storage.ioFault(io_err);
+        }
         session.observe(.published);
         return .{ .dir = dir, .log = log, .lock = lock };
     }
@@ -1194,10 +1220,29 @@ const Parts = struct {
 
 /// Everything `openResume` needs before the Session exists; on error,
 /// everything acquired so far is released here.
+/// Never unlink this fence: all publishers, resumers and removers share its
+/// inode. Lock order is root publication fence, then the session lifetime flock.
+fn acquirePublicationFence(env: *const Env, wait_ms: u64) (error{Busy} || storage.IoFault)!storage.File {
+    const s = env.s;
+    const file = s.createFile(env.root, ".publication.lock") catch |err| switch (err) {
+        error.AlreadyExists => s.openFile(env.root, ".publication.lock", .read_write) catch |io_err| return storage.ioFault(io_err),
+        else => |io_err| return storage.ioFault(io_err),
+    };
+    errdefer s.closeFile(file);
+    acquireLock(env, file, wait_ms) catch |err| return switch (err) {
+        error.Busy => error.Busy,
+        else => storage.ioFault(err),
+    };
+    return file;
+}
+
 fn openParts(env: *const Env, options: ResumeOptions) OpenError!Parts {
     const s = env.s;
     const gpa = env.gpa;
     if (!schema.validId(options.id)) return error.NotFound;
+    const publication = try acquirePublicationFence(env, options.lock_wait_ms orelse env.options.lock_wait_ms);
+    var publication_open = true;
+    defer if (publication_open) s.closeFile(publication);
     const dir = s.openDir(env.root, options.id) catch |err| return switch (err) {
         error.NotFound => error.NotFound,
         else => |io_err| storage.ioFault(io_err),
@@ -1209,6 +1254,8 @@ fn openParts(env: *const Env, options: ResumeOptions) OpenError!Parts {
     };
     errdefer s.closeFile(lock);
     if (!env.isPlanted(.skip_flock)) try acquireLock(env, lock, options.lock_wait_ms orelse env.options.lock_wait_ms);
+    s.closeFile(publication);
+    publication_open = false;
 
     var opened = Log.open(gpa, s, dir, "log.jsonl", .read_write, .{}) catch |err| return switch (err) {
         error.NotFound => error.Corrupt,
@@ -1878,6 +1925,8 @@ pub fn childrenOf(env: *const Env, id_: []const u8) DeleteError![][]u8 {
 pub fn trashSession(env: *const Env, id_: []const u8) DeleteError!void {
     const s = env.s;
     if (!schema.validId(id_)) return error.NotFound;
+    const publication = try acquirePublicationFence(env, 0);
+    defer s.closeFile(publication);
     const dir = s.openDir(env.root, id_) catch |err| return notFoundOr(err);
     var dir_open = true;
     defer if (dir_open) s.closeDir(dir);
@@ -1885,11 +1934,14 @@ pub fn trashSession(env: *const Env, id_: []const u8) DeleteError!void {
         error.NotFound => null,
         else => |io_err| return storage.ioFault(io_err),
     };
-    defer if (lock) |l| s.closeFile(l);
+    var lock_open = true;
+    defer if (lock_open) if (lock) |l| s.closeFile(l);
     if (lock) |l| if (!(s.tryLock(l) catch |io_err| return storage.ioFault(io_err))) return error.Busy;
     const trash = s.ensureDir(env.root, ".trash") catch |io_err| return storage.ioFault(io_err);
     defer s.closeDir(trash);
     s.deleteTree(trash, id_) catch |io_err| return storage.ioFault(io_err);
+    if (lock) |l| s.closeFile(l);
+    lock_open = false;
     s.closeDir(dir);
     dir_open = false;
     s.rename(env.root, id_, trash, id_) catch |err| return notFoundOr(err);

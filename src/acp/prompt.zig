@@ -2661,8 +2661,10 @@ fn completeToolCallTransport(
     recordJournalToolResult(ctx, call, result);
     var notice_text: ?[]u8 = null;
     defer if (notice_text) |text| ctx.alloc.free(text);
+    const mcp_identity = ctx.mcpToolIdentity(ctx.alloc, call.name);
+    defer if (mcp_identity) |identity| identity.deinit(ctx.alloc);
     const output_text = blk: {
-        const preview = toolUpdateContentText(result);
+        const preview = tool_call_presentation.toolUpdateContentTextForMcp(mcp_identity, result.status == .failure, result.model_output);
         if (!std.mem.eql(u8, call.name, "shell")) break :blk preview;
         // The preview is clipped, so a snapshot fallback notice is shown on
         // its own line beside the command it affected.
@@ -5827,4 +5829,39 @@ test "ACP prompt agent config carries request options from active session" {
     try std.testing.expectEqualStrings(state.cfg.gateway_chat_url, state.web_search_runtime.gateway_chat_url);
     try std.testing.expectEqualStrings("/models", tool_ctx.gateway_models_path);
     try std.testing.expect(tool_ctx.ultrafast_mode);
+}
+
+test "ACP MCP live completion emits the complete catalog-resolved result" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "mcp-result.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .auto);
+    defer state.deinit();
+    state.writer = .{ .stdout = capture };
+    const runtime = try alloc.create(mcp_runtime.McpRuntime);
+    runtime.* = mcp_runtime.McpRuntime.init(alloc);
+    state.active_session.?.mcp = runtime;
+    try runtime.addServer(.{ .name = try alloc.dupe(u8, "fixture") });
+    const mcp_server = runtime.servers.items[0];
+    mcp_server.state.store(.ready, .release);
+    try mcp_server.tool_catalog.tools.append(alloc, .{
+        .original_name = try alloc.dupe(u8, "echo"),
+        .prefixed_name = try alloc.dupe(u8, "mcp_fixture_echo"),
+        .description = try alloc.dupe(u8, "Echo input"),
+        .input_schema_json = try alloc.dupe(u8, "{\"type\":\"object\"}"),
+        .tags = &.{},
+    });
+    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
+    const payload = "{\"server\":\"fixture\",\"tool\":\"mcp_fixture_echo\",\"result\":{\"structuredContent\":{\"content\":\"" ++ text_utils.repeat("x", 500) ++ "\"}}}";
+    _ = completeToolCallTransport(&ctx, .{ .id = "call_1", .name = "mcp_fixture_echo", .arguments_json = "{}" }, "call_1", .{ .status = .success, .model_output = payload });
+    try capture.sync(io_mod.getIo());
+    const captured = try io_mod.readFileToEnd(alloc, &capture, 16 * 1024);
+    defer alloc.free(captured);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, captured, .{});
+    defer parsed.deinit();
+    const update = parsed.value.object.get("params").?.object.get("update").?.object;
+    try std.testing.expectEqualStrings("completed", update.get("status").?.string);
+    try std.testing.expectEqualStrings(payload, update.get("content").?.array.items[0].object.get("content").?.object.get("text").?.string);
 }
