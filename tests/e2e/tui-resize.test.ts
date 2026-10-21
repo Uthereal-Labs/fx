@@ -3371,14 +3371,14 @@ describe.skipIf(SKIP)("tui: resize", () => {
     },
     {
       issue: "FXC-125",
-      label: "cost",
+      label: "usage",
       width: 120,
       height: 36,
-      surfaceMarker: "[30 days]",
+      surfaceMarker: "not signed in to AI Gateway",
       editedInput: "x",
       async openSurface(active) {
-        await active.sendText("/cost");
-        await active.waitForText("[30 days]", TIMEOUT);
+        await active.sendText("/usage");
+        await active.waitForText("not signed in to AI Gateway", TIMEOUT);
         await active.resizeWindow(60, 12, 500);
       },
     },
@@ -4893,8 +4893,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const lightReplayStart = stdoutAfterLightTheme.lastIndexOf("\x1b[3J");
       expect(lightReplayStart).toBeGreaterThanOrEqual(0);
       const lightReplayAndTail = stdoutAfterLightTheme.slice(lightReplayStart);
-      expect(lightReplayAndTail).toContain("\x1b[38;5;247m");
-      expect(lightReplayAndTail).not.toContain("\x1b[38;5;245m");
+      expect(lightReplayAndTail).toContain(`\x1b[38;5;235m${inlineMarker}`);
+      expect(lightReplayAndTail).not.toContain(`\x1b[38;5;255m${inlineMarker}`);
       const resetCountAfter = countOccurrences(
         Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload)).toString(),
         "\x1b[3J",

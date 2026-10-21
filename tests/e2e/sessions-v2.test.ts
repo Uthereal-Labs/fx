@@ -2025,9 +2025,9 @@ test("a crash while a named subagent works records it interrupted, and its next 
     expect(JSON.parse(resumed.stdout).output).toBe("AFTER_LOST_DONE");
 
     // The reopen recorded the started work as interrupted, as
-    // `tla/Subagents.tla` repairs a child with a log; the next message is new
-    // work for the same child. A child streams no pieces, so its log holds
-    // nothing of the lost work.
+    // `tests/tla/session_manager/Subagents.tla` repairs a child with a
+    // log; the next message is new work for the same child. A child streams
+    // no pieces, so its log holds nothing of the lost work.
     const lines = childLines(fixture, id);
     expect(lines.map((line) => [line.kind, line.outcome ?? null])).toEqual([
       ["child_spawned", null], ["child_finished", "interrupted"], ["child_spawned", null], ["child_finished", "ok"],

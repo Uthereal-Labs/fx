@@ -3,7 +3,7 @@
 //!
 //! This file (L4) is the only public root; fx imports it and nothing else.
 //! A process creates one `Manager` with `init`, which does no disk I/O.
-//! Thirteen operations cover every host (docs/session-manager/system-design.md
+//! Thirteen operations cover every host (`tests/tla/session_manager/system-design.md`
 //! "API"), plus `verify` and `rebuild` for doctor:
 //!
 //!   openNew  openResume  openFork  openImport        -> Session
@@ -68,6 +68,7 @@ pub const SessionReadError = error{ InvalidArgument, SessionClosed, OutOfMemory 
 pub const BlobError = error{ InvalidArgument, NotFound, Corrupt, OutOfMemory } || storage.IoFault;
 pub const ListError = error{ Busy, OutOfMemory } || storage.IoFault;
 pub const DeleteError = error{ InvalidArgument, NotFound, Busy, OutOfMemory } || storage.IoFault;
+pub const DiscardError = error{InvalidArgument} || storage.IoFault;
 pub const VerifyError = error{ InvalidArgument, NotFound, OutOfMemory } || storage.IoFault;
 pub const RebuildError = error{ Busy, OutOfMemory } || storage.IoFault;
 
@@ -84,7 +85,8 @@ pub const InitOptions = struct {
     lock_wait_ms: u64 = 2000,
     /// Snapshot distance (D7).
     snapshot_every_bytes: u64 = session_mod.default_snapshot_every_bytes,
-    /// Index size that triggers a rewrite with one line per id.
+    /// Index size past which an append rewrites the index with one line
+    /// per id, once at least half its lines are stale.
     index_compact_bytes: u64 = 1 << 20,
 };
 
@@ -368,8 +370,21 @@ pub const Manager = struct {
             .parent = options.parent,
             .id = options.id,
             .created_ms = options.created_ms,
+            .import = true,
         });
         return .{ .manager = m, .inner = inner, .import = true };
+    }
+
+    /// The v1 conversion only (D59, D61): removes the staging an abandoned
+    /// import of `id` left in `.tmp/{id}`, so nothing of it stays and the
+    /// next import starts clean. A published session, even a child whose
+    /// root never landed, is left alone: `tests/tla/session_manager/Catalog.tla` lets no removed
+    /// id come back. The caller holds the v1 locks that keep any other
+    /// import of `id` away.
+    pub fn discardImport(m: *Manager, id: []const u8) DiscardError!void {
+        try checkId(id);
+        if (!try readyToRead(m)) return;
+        try session_mod.discardStaging(&m.env, id);
     }
 
     // -- by id, without a lock ------------------------------------------------
@@ -421,7 +436,7 @@ pub const Manager = struct {
         if (!schema.validBlobHash(hash)) return error.InvalidArgument;
         if (!try readyToRead(m)) return error.NotFound;
         try session_mod.blobExists(&m.env, id, hash);
-        return std.fs.path.join(gpa, &.{ m.root_path, id, "blobs", hash });
+        return std.Io.Dir.path.join(gpa, &.{ m.root_path, id, "blobs", hash });
     }
 
     /// Root sessions, newest first, from the index alone.
@@ -431,7 +446,7 @@ pub const Manager = struct {
     }
 
     /// Deletes a session and the children it owns. Busy if any is open.
-    /// Order per session (`tla/Catalog.tla`): children first, then the
+    /// Order per session (`tests/tla/session_manager/Catalog.tla`): children first, then the
     /// rename to `.trash`, the index tombstone, and the purge. fx removes
     /// the matching terminal folders (D13).
     pub fn delete(m: *Manager, id: []const u8) DeleteError!void {
@@ -487,18 +502,30 @@ pub const Session = struct {
     /// Appends a batch and returns the seq of its last line. Returns after
     /// the fsync when the batch holds a durable-class event (D3).
     pub fn append(s: Session, events: []const Event) AppendError!u64 {
-        if (s.import) return error.InvalidArgument;
+        if (s.import and s.inner.awaitsPublish()) return error.InvalidArgument;
         return s.appendChecked(events, null);
     }
 
-    /// Import only: appends a batch stamped with its original time.
+    /// Import only, before `publishImport`: appends a batch stamped with its
+    /// original time. It stays in memory until the publish (D59).
     pub fn appendAt(s: Session, events: []const Event, ts_ms: u64) AppendError!u64 {
-        if (!s.import) return error.InvalidArgument;
+        if (!s.import or !s.inner.awaitsPublish()) return error.InvalidArgument;
         return s.appendChecked(events, ts_ms);
     }
 
+    /// Import only (D59): publishes every batch at once, then lists the
+    /// session. A family publishes its children before its root. Until
+    /// then nothing of the import is visible.
+    pub fn publishImport(s: Session) AppendError!void {
+        if (!s.import) return error.InvalidArgument;
+        try s.manager.ready();
+        try s.inner.publishImport();
+        s.updateIndexAs(.published);
+    }
+
     fn appendChecked(s: Session, events: []const Event, ts_ms: ?u64) AppendError!u64 {
-        try checkEvents(s.manager.gpa, events, s.import);
+        // Only an import's original batches replay v1's interruptions.
+        try checkEvents(s.manager.gpa, events, ts_ms != null);
         // The root opens on the first publish at the latest, and an append
         // that stays held in memory does no disk I/O at all (D2).
         if (!s.inner.staysHeld(events)) try s.manager.ready();
@@ -561,8 +588,8 @@ pub const Session = struct {
         defer arena.deinit();
         var summary = s.indexSummary(arena.allocator()) catch return m.indexStale(s.id());
         switch (why) {
-            .published => summary.opened_ms[@intFromEnum(summary.host)] = summary.updated_ms,
-            .resumed => |host| summary.opened_ms[@intFromEnum(host)] = m.nowMs(),
+            .published => summary.opened_ms[@backingInt(summary.host)] = summary.updated_ms,
+            .resumed => |host| summary.opened_ms[@backingInt(host)] = m.nowMs(),
             .changed => {},
         }
         m.catalog().put(summary) catch m.indexStale(s.id());
@@ -670,7 +697,7 @@ fn checkEvents(gpa: std.mem.Allocator, events: []const Event, import: bool) Appe
             switch (s.key) {
                 .title, .workspace, .client_prompt => try checkJsonString(gpa, s.value),
                 .language => try checkLanguage(gpa, s.value),
-                .prefs, .permissions, .usage, .tool_identities, .moved_files, .compaction_records => try checkJson(gpa, s.value),
+                .prefs, .permissions, .usage, .tool_identities, .moved_files, .compaction_records, .v1_source => try checkJson(gpa, s.value),
             }
             for (s.blobs) |hash| if (!schema.validBlobHash(hash)) return error.InvalidArgument;
         },
@@ -841,7 +868,7 @@ const api_tests = struct {
             f.tmp = testing.tmpDir(.{ .iterate = true });
             const base = try f.tmp.dir.realPathFileAlloc(io, ".", gpa);
             defer gpa.free(base);
-            f.root = try std.fs.path.join(gpa, &.{ base, "sessions", "v2" });
+            f.root = try std.Io.Dir.path.join(gpa, &.{ base, "sessions", "v2" });
             f.recorder = .{};
             f.manager = try api.Manager.init(gpa, io, .{
                 .root = f.root,
@@ -912,7 +939,7 @@ const api_tests = struct {
         try testing.expectEqual(@as(usize, 0), page.items.len);
         page.deinit();
         try testing.expectError(error.NotFound, f.manager.read(gpa, "AAAAAAAAAAAA", .start, .forward, 10));
-        try testing.expectError(error.NotFound, f.manager.getBlob(gpa, "AAAAAAAAAAAA", "0" ** 64));
+        try testing.expectError(error.NotFound, f.manager.getBlob(gpa, "AAAAAAAAAAAA", &@as([64]u8, @splat('0'))));
         try testing.expectError(error.NotFound, f.manager.openResume(.{ .target = .last, .workspace = "/w", .host = .acp }));
         try testing.expectError(error.NotFound, f.manager.verify("AAAAAAAAAAAA"));
         try testing.expectError(error.NotFound, f.manager.delete("AAAAAAAAAAAA"));
@@ -1002,11 +1029,25 @@ const api_tests = struct {
         for ([_][]const u8{ "1786460757753-tie-f", "1786460757753-tie-c", "1786460757753-tie-e", "1786460757753-tie-a", "1786460757753-tie-d", "1786460757753-tie-b" }) |id| {
             const s = try m.openImport(.{ .id = id, .workspace = "/w", .host = .app, .created_ms = 1000 });
             _ = try s.appendAt(&.{ .turn_started, .turn_committed }, 2000);
+            try s.publishImport();
             s.release();
         }
         const ids = try listIds(m, .all);
         defer freeIds(ids);
         try testing.expectEqualStrings("1786460757753-tie-a", ids[0]);
+        // Paged two at a time, through the tie, the order is the same.
+        var cursor: ?ListCursor = null;
+        var paged: usize = 0;
+        while (true) {
+            var page = try m.list(gpa, .all, cursor, 2);
+            defer page.deinit();
+            for (page.items) |item| {
+                try testing.expectEqualStrings(ids[paged], item.id);
+                paged += 1;
+            }
+            cursor = page.next orelse break;
+        }
+        try testing.expectEqual(ids.len, paged);
         const last = try m.openResume(.{ .target = .last, .workspace = "/w", .host = .ask });
         defer last.release();
         try testing.expectEqualStrings(ids[0], last.id());
@@ -1224,7 +1265,7 @@ const api_tests = struct {
         // A torn tail is read around and left in place.
         var root = try f.dir();
         defer root.close(io);
-        const log_path = try std.fs.path.join(gpa, &.{ p_id, "log.jsonl" });
+        const log_path = try std.Io.Dir.path.join(gpa, &.{ p_id, "log.jsonl" });
         defer gpa.free(log_path);
         var torn_len: u64 = 0;
         {
@@ -1249,6 +1290,9 @@ const api_tests = struct {
         try testing.expectError(error.InvalidArgument, s.append(&.{.turn_started}));
         _ = try s.appendAt(&.{ .turn_started, piece, .turn_committed }, 2000);
         _ = try s.appendAt(&.{ .turn_started, .{ .turn_interrupted = .crash } }, 3000);
+        // Held in memory until the publish (D59): nothing is on disk.
+        try testing.expectError(error.NotFound, m.env.s.stat(m.env.root, "1786460757753-v1"));
+        try s.publishImport();
         s.release();
         var page = try m.read(gpa, "1786460757753-v1", .start, .forward, 10);
         defer page.deinit();
@@ -1261,6 +1305,115 @@ const api_tests = struct {
         defer listed.deinit();
         try testing.expectEqual(@as(u64, 1000), listed.items[0].created_ms);
         try testing.expectEqual(@as(u64, 3000), listed.items[0].updated_ms);
+    }
+
+    test "an import stages its blobs, publishes once, and leaves nothing visible when abandoned (D59)" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const id = "1786460757753-staged";
+        {
+            // Abandoned before its publish, as a crash would: nothing visible.
+            const s = try m.openImport(.{ .id = id, .workspace = "/w", .host = .app, .created_ms = 1000 });
+            _ = try s.putBlob("a side file from the abandoned try");
+            _ = try s.appendAt(&.{ .turn_started, piece, .turn_committed }, 2000);
+            s.release();
+        }
+        try testing.expectError(error.NotFound, m.env.s.stat(m.env.root, id));
+        {
+            const s = try m.openImport(.{ .id = id, .workspace = "/w", .host = .app, .created_ms = 1000 });
+            defer s.release();
+            const hash = try s.putBlob("a v1 side file");
+            const refs = [_][]const u8{&hash};
+            _ = try s.appendAt(&.{ .turn_started, piece, .{ .item = .{ .type = "tool_result", .data = "{\"tool\":1}", .blobs = &refs } }, .turn_committed }, 2000);
+            // A reference to a blob that was never staged is refused.
+            const missing = [_][]const u8{&schema.blobHash("never stored")};
+            try testing.expectError(error.InvalidTransition, s.appendAt(&.{ .turn_started, .{ .item = .{ .type = "tool_result", .data = "{}", .blobs = &missing } } }, 3000));
+            try testing.expectError(error.NotFound, m.env.s.stat(m.env.root, id));
+            try s.publishImport();
+            // Published and live: later turns append as usual.
+            _ = try s.append(&.{ .turn_started, piece, .turn_committed });
+            const body = try m.getBlob(gpa, id, &hash);
+            defer gpa.free(body);
+            try testing.expectEqualStrings("a v1 side file", body);
+        }
+        var page = try m.read(gpa, id, .start, .forward, 20);
+        defer page.deinit();
+        // One header, then the imported turn, then the new one: the
+        // abandoned try's lines are nowhere.
+        var headers: usize = 0;
+        var turns: usize = 0;
+        for (page.entries) |entry| if (entry.body) |body| switch (body) {
+            .session_created => headers += 1,
+            .turn_committed => turns += 1,
+            else => {},
+        };
+        try testing.expectEqual(@as(usize, 1), headers);
+        try testing.expectEqual(@as(usize, 2), turns);
+        const resumed = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .app });
+        defer resumed.release();
+    }
+
+    test "discardImport removes an abandoned import's staging and nothing published (D59, D61)" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        // Nothing on disk yet: nothing to do, and the root is not created.
+        try m.discardImport("1786460757753-none");
+        try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, f.root, .{}));
+        try testing.expectError(error.InvalidArgument, m.discardImport("../x"));
+
+        const id = "1786460757753-gone";
+        {
+            const s = try m.openImport(.{ .id = id, .workspace = "/w", .host = .app, .created_ms = 1000 });
+            _ = try s.putBlob("staged before a crash");
+            s.release();
+        }
+        const tmp = try m.env.s.openDir(m.env.root, ".tmp");
+        defer m.env.s.closeDir(tmp);
+        _ = try m.env.s.stat(tmp, id);
+        try m.discardImport(id);
+        try testing.expectError(error.NotFound, m.env.s.stat(tmp, id));
+        try m.discardImport(id);
+
+        // A published session stays, a child whose root never landed too.
+        const child = "1786460757753-orphan";
+        {
+            const s = try m.openImport(.{ .id = child, .workspace = "/w", .host = .app, .role = .child, .parent = "1786460757753-root", .created_ms = 1000 });
+            defer s.release();
+            _ = try s.appendAt(&.{ .turn_started, piece, .turn_committed }, 2000);
+            try s.publishImport();
+        }
+        try m.discardImport(child);
+        var page = try m.read(gpa, child, .start, .forward, 10);
+        defer page.deinit();
+        try testing.expect(page.entries.len >= 4);
+    }
+
+    test "v1_source is a JSON setting kept by the fold and snapshots (D60)" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const id = "1786460757753-source";
+        const value = "{\"fingerprint\":\"ab\"}";
+        {
+            const s = try m.openImport(.{ .id = id, .workspace = "/w", .host = .ask, .created_ms = 1000 });
+            defer s.release();
+            try testing.expectError(error.InvalidArgument, s.appendAt(&.{.{ .set = .{ .key = .v1_source, .value = "not json" } }}, 1500));
+            _ = try s.appendAt(&.{ .turn_started, piece, .turn_committed, .{ .set = .{ .key = .v1_source, .value = value } } }, 2000);
+            try s.publishImport();
+        }
+        var peeked = try m.peek(gpa, id);
+        defer peeked.deinit(gpa);
+        try testing.expectEqualStrings(value, peeked.state.v1_source.?);
+        const resumed = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .ask });
+        defer resumed.release();
+        var st = try resumed.state(gpa);
+        defer st.deinit(gpa);
+        try testing.expectEqualStrings(value, st.v1_source.?);
     }
 
     /// `ts` of the newest line in a session's log.
@@ -1473,6 +1626,45 @@ const api_tests = struct {
         try testing.expect(st.size < 4096);
     }
 
+    test "an index past its compaction size is rewritten once half its lines are stale, not on every append" {
+        var f: Fixture = undefined;
+        try f.initWith(4096);
+        defer f.deinit();
+        const m = f.manager;
+        var first: ?[]u8 = null;
+        defer if (first) |id| gpa.free(id);
+        // Live lines alone are past 4096 bytes.
+        for (0..30) |_| {
+            const s = try m.openNew(.{ .workspace = "/w", .host = .app });
+            _ = try s.append(&.{ .turn_started, .turn_committed });
+            if (first == null) first = try gpa.dupe(u8, s.id());
+            s.release();
+        }
+        var root = try f.dir();
+        defer root.close(io);
+        var before = try root.statFile(io, "index.jsonl", .{});
+        var rewrites: usize = 0;
+        var rewritten_size: u64 = std.math.maxInt(u64);
+        // Once rewritten, the index stays within twice what the rewrite
+        // left, plus the two lines a resume and its close append.
+        var largest_since: u64 = 0;
+        // Two appends each: the resume's and the close's.
+        for (0..60) |_| {
+            (try m.openResume(.{ .target = .{ .id = first.? }, .workspace = "/w", .host = .app })).release();
+            const st = try root.statFile(io, "index.jsonl", .{});
+            if (st.inode != before.inode) {
+                rewrites += 1;
+                rewritten_size = @min(rewritten_size, st.size);
+            } else if (rewrites > 0) largest_since = @max(largest_since, st.size);
+            before = st;
+        }
+        try testing.expect(rewrites >= 1 and rewrites <= 8);
+        try testing.expect(largest_since <= 2 * rewritten_size + 1024);
+        const ids = try listIds(m, .all);
+        defer freeIds(ids);
+        try testing.expectEqual(@as(usize, 30), ids.len);
+    }
+
     test "inputs are checked at the boundary" {
         var f: Fixture = undefined;
         try f.init();
@@ -1485,7 +1677,7 @@ const api_tests = struct {
         defer s.release();
         _ = try s.append(&.{.turn_started});
         try testing.expectError(error.InvalidArgument, s.append(&.{.{ .item = .{ .type = "assistant", .data = "{not json" } }}));
-        for ([_][]const u8{ "", "Steering", "tool-call", "x" ** 33 }) |bad_type| {
+        for ([_][]const u8{ "", "Steering", "tool-call", &@as([33]u8, @splat('x')) }) |bad_type| {
             try testing.expectError(error.InvalidArgument, s.append(&.{.{ .item = .{ .type = bad_type, .data = "{}" } }}));
         }
         try testing.expectError(error.InvalidArgument, s.append(&.{.{ .set = .{ .key = .title, .value = "42" } }}));
@@ -1528,7 +1720,7 @@ const api_tests = struct {
         var dir = try f.dir();
         defer dir.close(io);
         var path: [300]u8 = undefined;
-        const bytes = try dir.readFileAlloc(io, try std.fmt.bufPrint(&path, "{s}/log.jsonl", .{id}), gpa, .limited(1 << 20));
+        const bytes = try dir.readFileAlloc(io, try std.mem.print(&path, "{s}/log.jsonl", .{id}), gpa, .limited(1 << 20));
         defer gpa.free(bytes);
         try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\"kind\":\"item\",\"turn\":1,\"type\":\"steering\""));
     }
@@ -1550,7 +1742,7 @@ const api_tests = struct {
         try expectListedLanguage(m, "\"und-Latn\"");
 
         // Refused: not a string, empty, longer than 24 bytes. Nothing changes.
-        for ([_][]const u8{ "42", "\"\"", "\"" ++ "x" ** 25 ++ "\"" }) |bad| {
+        for ([_][]const u8{ "42", "\"\"", "\"" ++ &@as([25]u8, @splat('x')) ++ "\"" }) |bad| {
             try testing.expectError(error.InvalidArgument, s.append(&.{.{ .set = .{ .key = .language, .value = bad } }}));
         }
         s.release();
@@ -1688,7 +1880,7 @@ const api_tests = struct {
 
             var root = try f.dir();
             defer root.close(io);
-            const path = try std.fmt.allocPrint(gpa, "{s}/blobs/{s}", .{ id, &hash });
+            const path = try gpa.print("{s}/blobs/{s}", .{ id, &hash });
             defer gpa.free(path);
             if (overwrite) {
                 // A blob is read-only (D49), so damage replaces the file, as
@@ -1725,7 +1917,7 @@ const api_tests = struct {
         const m = f.manager;
         const s = try m.openNew(.{ .workspace = "/w", .host = .app });
         // Held before the first turn: nothing is on disk, so no blob exists.
-        const absent = [_][]const u8{"a" ** 64};
+        const absent = [_][]const u8{&@as([64]u8, @splat('a'))};
         try testing.expectError(error.InvalidTransition, s.append(&.{.{ .set = .{ .key = .moved_files, .value = "{}", .blobs = &absent } }}));
         _ = try s.append(&.{ .turn_started, piece, .turn_committed });
         // A malformed hash is refused at the boundary, a missing one by the rule.
@@ -1734,7 +1926,7 @@ const api_tests = struct {
         try testing.expectError(error.InvalidTransition, s.append(&.{.{ .set = .{ .key = .moved_files, .value = "{}", .blobs = &absent } }}));
         const hash = try s.putBlob("a body from the side folder");
         const refs = [_][]const u8{&hash};
-        const value = try std.fmt.allocPrint(gpa, "{{\"map\":\"{s}\"}}", .{&hash});
+        const value = try gpa.print("{{\"map\":\"{s}\"}}", .{&hash});
         defer gpa.free(value);
         _ = try s.append(&.{.{ .set = .{ .key = .moved_files, .value = value, .blobs = &refs } }});
         _ = try s.append(&.{ .turn_started, piece, .turn_committed });
@@ -1759,7 +1951,7 @@ const api_tests = struct {
         // A lost blob that only the setting names damages the session there.
         var root = try f.dir();
         defer root.close(io);
-        const path = try std.fmt.allocPrint(gpa, "{s}/blobs/{s}", .{ id, &hash });
+        const path = try gpa.print("{s}/blobs/{s}", .{ id, &hash });
         defer gpa.free(path);
         try root.deleteFile(io, path);
         try testing.expectEqual(@as(u64, 1), (try m.verify(id)).bad_blobs);
@@ -1781,14 +1973,14 @@ const api_tests = struct {
         // Mid-turn, as auto compaction runs: the records and their map.
         const record = try s.putBlob("T1 shell: ls\nResult:\nfirst\n");
         const first_map = try s.putBlob("{\"compacted-T1.txt\":\"r\"}");
-        const first = try std.fmt.allocPrint(gpa, "{{\"map\":\"{s}\"}}", .{&first_map});
+        const first = try gpa.print("{{\"map\":\"{s}\"}}", .{&first_map});
         defer gpa.free(first);
         _ = try s.append(&.{.{ .set = .{ .key = .compaction_records, .value = first, .blobs = &.{ &record, &first_map } } }});
         _ = try s.append(&.{ piece, .turn_committed });
         // A later compaction rewrites the map; the newest value wins.
         _ = try s.append(&.{.turn_started});
         const second_map = try s.putBlob("{\"compacted-T1.txt\":\"r\",\"compacted-M1.txt\":\"m\"}");
-        const second = try std.fmt.allocPrint(gpa, "{{\"map\":\"{s}\"}}", .{&second_map});
+        const second = try gpa.print("{{\"map\":\"{s}\"}}", .{&second_map});
         defer gpa.free(second);
         _ = try s.append(&.{.{ .set = .{ .key = .compaction_records, .value = second, .blobs = &.{&second_map} } }});
         _ = try s.append(&.{ piece, .turn_committed });
@@ -1854,7 +2046,7 @@ const api_tests = struct {
         try testing.expectEqual(@as(std.posix.mode_t, storage.blob_mode), fork_st.permissions.toMode() & 0o777);
 
         // Only a well-formed hash this session holds has a path.
-        try testing.expectError(error.NotFound, m.blobPath(gpa, id, "b" ** 64));
+        try testing.expectError(error.NotFound, m.blobPath(gpa, id, &@as([64]u8, @splat('b'))));
         try testing.expectError(error.InvalidArgument, m.blobPath(gpa, id, "../x"));
         try testing.expectError(error.NotFound, m.blobPath(gpa, "nosuchsession", &hash));
     }
@@ -1895,7 +2087,7 @@ const api_tests = struct {
         try testing.expectEqualSlices(u8, body, stored);
         var root = try f.dir();
         defer root.close(io);
-        const blobs_path = try std.fmt.allocPrint(gpa, "{s}/blobs", .{s.id()});
+        const blobs_path = try gpa.print("{s}/blobs", .{s.id()});
         defer gpa.free(blobs_path);
         var blobs = try root.openDir(io, blobs_path, .{ .iterate = true });
         defer blobs.close(io);

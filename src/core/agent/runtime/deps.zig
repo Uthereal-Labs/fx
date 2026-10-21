@@ -1,8 +1,8 @@
 const std = @import("std");
+const observation = @import("observation.zig");
 const skill_contract = @import("../../skills/skill_contract.zig");
 const agent_stream_provider = @import("../stream_provider.zig");
 const auth_runtime = @import("../../auth/auth_runtime.zig");
-const session_usage = @import("../../session/session_usage.zig");
 const session_codec = @import("../../session/session_codec.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
@@ -200,7 +200,9 @@ pub const DiffMarkerStyles = struct {
 };
 
 pub const AgentRuntimeDeps = struct {
+    observation_sink: @import("../observations.zig").Sink = .{},
     ctx: *anyopaque,
+    observer: ?*observation.Observer = null,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
     flush_assistant_stream_per_content_chunk: bool = false,
     render_assistant_text: bool = true,
@@ -256,6 +258,10 @@ pub const AgentRuntimeDeps = struct {
     /// Called at every model-request boundary with the turn so far, so each
     /// completed piece is saved as it happens rather than at the turn's end.
     append_turn_piece: ?*const fn (ctx: *anyopaque, progress: TurnProgress) anyerror!void = null,
+    /// Confirms, without writing, that this process still owns the saved
+    /// session after a main-model completion and before its tool calls run.
+    /// Another process may have taken the session over.
+    confirm_session_writer: ?*const fn (ctx: *anyopaque) anyerror!void = null,
     propagate_grant: *const fn (ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) anyerror!void,
     push_event: *const fn (ctx: *anyopaque, event: WorkerEvent) anyerror!void,
     push_text: *const fn (ctx: *anyopaque, emission: TextEmission) anyerror!void,
@@ -290,8 +296,6 @@ pub const AgentRuntimeDeps = struct {
     record_tool_call_failed: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, model_output: []const u8, command_result_json: ?[]const u8) anyerror!void = null,
     report_usage: ?*const fn (ctx: *anyopaque, usage: types.Usage) void = null,
     report_inner_tool_usage: ?*const fn (ctx: *anyopaque, tool_name: []const u8, usage: types.ToolUsage) void = null,
-    usage: ?*session_usage.Usage = null,
-    usage_allocator: Allocator = std.heap.c_allocator,
     // Accent for the +N / -N counts in a committed file's status line.
     // Captured by value at construction; that is safe only while the marker
     // colors never change after startup (they are theme-independent).
@@ -300,6 +304,30 @@ pub const AgentRuntimeDeps = struct {
     pub fn pushContextNotice(self: *const AgentRuntimeDeps, text: []const u8) !void {
         if (self.push_context_notice) |push| return push(self.ctx, text);
         return self.push_system_notice(self.ctx, text);
+    }
+
+    pub fn executeToolCall(self: *const AgentRuntimeDeps, request: ToolExecutionRequest) !ToolExecutionResult {
+        if (self.observer) |observer| observer.emit(.{ .tool_start = .{ .call = request.call } });
+        var observed_request = request;
+        observed_request.observation_context = self.observation_sink.beginTool(request.observation_context, request.call);
+        observed_request.observer = self.observer orelse request.observer;
+        var result = self.execute_tool_call(self.ctx, observed_request) catch |err| {
+            self.observation_sink.finishTool(observed_request.observation_context, request.call, null, true, err == error.Cancelled, @errorName(err));
+            if (self.observer) |observer| observer.emit(.{ .tool_end = .{
+                .call = request.call,
+                .status = if (err == error.Cancelled) "cancelled" else "failure",
+                .error_name = @errorName(err),
+            } });
+            return err;
+        };
+        if (self.observer) |observer| observer.emit(.{ .tool_end = .{
+            .call = request.call,
+            .output = result.model_output,
+            .status = if (result.cancelled) "cancelled" else @tagName(result.status),
+            .usage = result.inner_usage,
+        } });
+        result.observation_context = observed_request.observation_context;
+        return result;
     }
 };
 

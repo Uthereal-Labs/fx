@@ -1,4 +1,6 @@
 const std = @import("std");
+const observation = @import("observation.zig");
+const observations = @import("../observations.zig");
 const skill_contract = @import("../../skills/skill_contract.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const types = @import("../../shared/types.zig");
@@ -91,6 +93,7 @@ pub const ToolFailureKind = enum(u8) {
 };
 
 pub const ToolExecutionResult = struct {
+    observation_context: observations.Context = .{ .trace = .{} },
     model_content_kind: tool_dispatch.ModelContentKind = .ordinary,
     model_output: []const u8,
     status: ToolExecutionStatus = .success,
@@ -115,6 +118,10 @@ pub const ToolExecutionResult = struct {
     deferred_tool_completion: ?DeferredToolCompletion = null,
     command_replay_capture: ?*command_replay_store.Capture = null,
     result_commit: ?result_commit.Token = null,
+
+    pub fn finishObservation(self: ToolExecutionResult, sink: observations.Sink, call: ToolCall) void {
+        sink.finishTool(self.observation_context, call, self.model_output, self.status == .failure, self.cancelled, null);
+    }
 };
 
 test "tool result retains one memory payload across preparation" {
@@ -147,6 +154,8 @@ pub fn unavailableHostToolResult(alloc: Allocator) Allocator.Error!ToolExecution
 }
 
 pub const ToolExecutionRequest = struct {
+    observation_context: observations.Context = .{ .trace = .{} },
+    observer: ?*observation.Observer = null,
     skill_locations: ?*const skill_contract.Locations = null,
     call_allocator: Allocator,
     result_allocator: Allocator,

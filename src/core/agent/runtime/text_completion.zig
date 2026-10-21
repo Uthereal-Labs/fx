@@ -4,10 +4,10 @@
 //! fx-compactor as its model caller.
 
 const std = @import("std");
+const observation = @import("observation.zig");
 const agent_stream_provider = @import("../stream_provider.zig");
 const runtime_gateway_step = @import("gateway_step.zig");
 const compactor = @import("../../compactor/compactor.zig");
-const session_usage = @import("../../session/session_usage.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const model_provider = @import("../../config/model_provider.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
@@ -17,6 +17,8 @@ const types = @import("../../shared/types.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Request = struct {
+    observer: ?*observation.Observer = null,
+    purpose: observation.ModelPurpose = .auxiliary,
     stream_provider: agent_stream_provider.Provider,
     cooperative_pulse: ?agent_stream_provider.CooperativePulse = null,
     credential: agent_stream_provider.CredentialLease,
@@ -28,8 +30,6 @@ pub const Request = struct {
     max_output_tokens: ?u32 = null,
     /// Longest text kept; a longer reply counts as truncated.
     max_bytes: usize,
-    usage: ?*session_usage.Usage = null,
-    usage_allocator: Allocator = std.heap.c_allocator,
     trace_ctx: debug_trace.TraceContext,
     system: []const u8,
     user: []const u8,
@@ -86,6 +86,8 @@ pub fn complete(alloc: Allocator, request: Request) Error!Outcome {
         request.stream_provider,
         alloc,
         .{
+            .observer = request.observer,
+            .purpose = request.purpose,
             .credential = request.credential,
             .session_id = request.session_id,
             .model = request.model,
@@ -108,8 +110,6 @@ pub fn complete(alloc: Allocator, request: Request) Error!Outcome {
             .trace_ctx = request.trace_ctx,
             .cooperative_pulse = request.cooperative_pulse,
         },
-        request.usage,
-        request.usage_allocator,
     ) catch |err| switch (err) {
         error.Cancelled => return error.Cancelled,
         error.OutOfMemory => return error.OutOfMemory,
@@ -143,7 +143,7 @@ pub fn complete(alloc: Allocator, request: Request) Error!Outcome {
 }
 
 fn failed(alloc: Allocator, reason: Reason, comptime fmt: []const u8, args: anytype) Error!Outcome {
-    return .{ .failed = .{ .reason = reason, .detail = try std.fmt.allocPrint(alloc, fmt, args) } };
+    return .{ .failed = .{ .reason = reason, .detail = try alloc.print(fmt, args) } };
 }
 
 const StreamCapture = struct {
@@ -184,6 +184,7 @@ fn onEvent(raw: *anyopaque, event: agent_stream_provider.Event) void {
 /// and its own output limit. A request after the conversation keeps the
 /// conversation's options except Ultrafast, which is reserved for agent turns.
 pub const CompactorCaller = struct {
+    observer: ?*observation.Observer = null,
     stream_provider: agent_stream_provider.Provider,
     cooperative_transport_pulse: ?agent_stream_provider.CooperativePulse = null,
     provider: model_provider.ProviderId,
@@ -200,8 +201,6 @@ pub const CompactorCaller = struct {
     /// What each model accepts.
     capabilities_context: *anyopaque,
     capabilities_fn: *const fn (context: *anyopaque, model: []const u8) model_capabilities.Capabilities,
-    usage: ?*session_usage.Usage = null,
-    usage_allocator: Allocator = std.heap.c_allocator,
     /// The request the agent was about to send. A request after the
     /// conversation repeats it unchanged before its own message. Borrowed.
     conversation: ?agent_stream_provider.RequestData = null,
@@ -246,6 +245,8 @@ pub const CompactorCaller = struct {
         options.ultrafast = false;
         var usage: types.Usage = .{};
         const outcome = try complete(alloc, .{
+            .observer = self.observer,
+            .purpose = .compaction,
             .stream_provider = self.stream_provider,
             .cooperative_pulse = self.cooperative_transport_pulse,
             .credential = if (self.credential_source == .host_managed) .host_managed else .{ .direct = .{
@@ -261,8 +262,6 @@ pub const CompactorCaller = struct {
             .provider_options = options,
             .max_output_tokens = if (own) self.max_output_tokens else model_capabilities.requestOutputTokens(self.capabilities_fn(self.capabilities_context, call.model)),
             .max_bytes = call.max_bytes,
-            .usage = self.usage,
-            .usage_allocator = self.usage_allocator,
             .trace_ctx = call.trace_ctx,
             .system = call.system,
             .user = call.user,

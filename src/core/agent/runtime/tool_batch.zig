@@ -1,4 +1,5 @@
 const std = @import("std");
+const observation = @import("observation.zig");
 const types = @import("../../shared/types.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const diff = @import("../../output/diff.zig");
@@ -23,6 +24,7 @@ const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
 
 pub const StepBatchState = struct {
+    observer: ?*observation.Observer = null,
     step_error_count: usize = 0,
     step_total_count: usize = 0,
     step_had_writes: bool = false,
@@ -99,6 +101,11 @@ pub fn appendToolResultContent(
     if (accounting.record_completion) {
         try runtime_interruption.recordCompletedToolName(arena, completed_tool_names, tool_call.name);
     }
+    if (batch.observer) |observer| observer.emit(.{ .tool_result = .{
+        .call = tool_call,
+        .output = content,
+        .status = accounting.status orelse if (accounting.increment_error) .failure else .success,
+    } });
 }
 
 pub fn appendPermissionFeedback(
@@ -182,6 +189,7 @@ pub fn assembleParallelToolResults(
                 },
             }
         };
+        defer execution.finishObservation(hooks.observation_sink, original_call);
         var prepared = try runtime_execution_memory.prepareToolExecutionOutput(arena, config, original_call, execution, null);
         runtime_execution_memory.applyToolResultMemory(
             &prepared.memory,
@@ -195,6 +203,7 @@ pub fn assembleParallelToolResults(
         prepared.memory = try types.dupeToolResultMemory(arena, prepared.memory);
         try runtime_execution_memory.retainToolImages(arena, config, original_call, &prepared);
         const safe_tool_output = prepared.model_output;
+        hooks.observation_sink.tool(arena, .{ .trace = step_ctx, .span = execution.observation_context.span }, original_call.id, original_call.name, execution.model_output, safe_tool_output, prepared.memory.truncated, prepared.memory.output_handle);
         if (precomputed == null) {
             runtime_parallel_execution.reportInnerToolUsage(hooks, original_call.name, execution);
             _ = try provisional_statuses.finishExecutedCall(
@@ -326,24 +335,6 @@ pub fn processCommittedFileResult(
         return error.InvalidCommittedFileExecutionResult;
     }
     const handoff = execution.committed_file_handoff orelse unreachable;
-    if (hooks.usage) |usage| {
-        usage.recordCommittedLines(
-            handoff.preview.additions,
-            handoff.preview.deletions,
-        ) catch |err| {
-            debug_trace.logf(
-                "session",
-                "usage code accounting failed additions={d} deletions={d} reason={s}",
-                .{
-                    handoff.preview.additions,
-                    handoff.preview.deletions,
-                    @errorName(err),
-                },
-            );
-            usage.markCodeIncomplete();
-        };
-        if (!usage.persistCheckpoint()) usage.markCodeIncomplete();
-    }
     const committed_contract_degraded =
         execution.status != .success or
         !execution.tool_result_memory_prepared or
@@ -394,6 +385,11 @@ pub fn processCommittedFileResult(
         ),
         .tool_result_memory = prepared_memory,
     });
+    if (batch.observer) |observer| observer.emit(.{ .tool_result = .{
+        .call = tool_call,
+        .output = model_output,
+        .status = runtime_execution_memory.persistedStatusForCurrentFxLocalResult(execution.status, model_output),
+    } });
     debug_trace.eventf(
         "tool",
         "committed_result_appended",

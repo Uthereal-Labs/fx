@@ -4290,12 +4290,17 @@ test.skipIf(!tmuxAvailable())(
       );
       expect(pageUpViewport).not.toEqual(tailViewport);
 
+      // Two more pages reach the earlier command's retained output, which the
+      // compact view never shows. Match any retained row rather than one
+      // offset: Ctrl-O wraps long command headings, so a page's landing row
+      // depends on their length.
+      const retainedSetupRow = /CTRL_O_PRESSURE_SETUP_OUTPUT_0(?:[1-6]\d)/;
       await active.sendHexBytes(["1b", "5b", "35", "7e"]);
       await active.sendHexBytes(["1b", "5b", "35", "7e"]);
       const priorCommandViewport = await active.waitForPane(
         (pane) =>
           pane !== pageUpViewport &&
-          pane.includes("CTRL_O_PRESSURE_SETUP_OUTPUT_055"),
+          retainedSetupRow.test(pane),
         TIMEOUT,
       );
       expect(priorCommandViewport).not.toEqual(pageUpViewport);
@@ -5720,7 +5725,8 @@ test.skipIf(!tmuxAvailable())(
       const version = (await runFx(["--version"])).stdout.trim();
       await active.sendHexBytes(["07"]);
 
-      const updatedNotice = `✓ fx has been updated to v${version} (notes)`;
+      const hasReleaseNotes = /^\d+\.\d+\.\d+$/.test(version);
+      const updatedNotice = `✓ fx has been updated to v${version}${hasReleaseNotes ? " (notes)" : ""}`;
       await active.waitForText(updatedNotice, TIMEOUT);
       await active.waitForComposer(TIMEOUT);
       const postUpgradeTrace = readFileSync(tracePath, "utf8");
@@ -5731,10 +5737,14 @@ test.skipIf(!tmuxAvailable())(
       expect(resumed).toContain("UPGRADE_CTRL_G_INITIAL_DONE");
       expect(resumed).toContain(updatedNotice);
       const noticeEscapes = await active.capturePaneEscapes();
-      expect(noticeEscapes).toContain(
-        `(\x1b[4m\x1b]8;;https://fx.sh/changelog#v${version}\x1b\\notes\x1b[0m`,
-      );
-      expect(noticeEscapes).toContain("\x1b]8;;\x1b\\)");
+      if (hasReleaseNotes) {
+        expect(noticeEscapes).toContain(
+          `(\x1b[4m\x1b]8;;https://fx.sh/changelog#v${version}\x1b\\notes\x1b[0m`,
+        );
+        expect(noticeEscapes).toContain("\x1b]8;;\x1b\\)");
+      } else {
+        expect(noticeEscapes).not.toContain("https://fx.sh/changelog#v");
+      }
       expect(resumed).not.toContain("* session resumed:");
       expect(resumed).not.toMatch(/[*✓!✗⊘i] session: resumed:/);
 

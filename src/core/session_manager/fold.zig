@@ -4,7 +4,7 @@
 //! and returns or updates a value it owns. `plan` decides what a batch may
 //! write; `apply` folds a written line into the state; `encodeState` and
 //! `decodeState` turn the state into a snapshot and back. Resuming from the
-//! newest snapshot must equal a full fold (`tla/ResumeSnapshot.tla`).
+//! newest snapshot must equal a full fold (`tests/tla/session_manager/ResumeSnapshot.tla`).
 
 const std = @import("std");
 const schema = @import("schema.zig");
@@ -75,6 +75,7 @@ pub const State = struct {
     tool_identities: ?[]u8 = null,
     moved_files: ?[]u8 = null,
     compaction_records: ?[]u8 = null,
+    v1_source: ?[]u8 = null,
     /// Every child spawned in this session, in first-spawn order (D22).
     children: std.ArrayList(Child) = .empty,
     last_compaction_seq: ?u64 = null,
@@ -197,7 +198,7 @@ pub const State = struct {
     }
 };
 
-const setting_fields = .{ "prefs", "title", "permissions", "usage", "workspace", "language", "client_prompt", "tool_identities", "moved_files", "compaction_records" };
+const setting_fields = .{ "prefs", "title", "permissions", "usage", "workspace", "language", "client_prompt", "tool_identities", "moved_files", "compaction_records", "v1_source" };
 
 fn optionalEql(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null or b == null) return a == null and b == null;
@@ -313,7 +314,7 @@ pub fn plan(state: *const State, events: []const Event, out: []schema.Body) Tran
                 break :blk .{ .turn_interrupted = .{ .turn = turn, .reason = reason } };
             },
             .set => |s| .{ .set = s },
-            // One unfinished work item per child (`tla/Subagents.tla`
+            // One unfinished work item per child (`tests/tla/session_manager/Subagents.tla`
             // OneOpenWork); a finish names exactly that one.
             .child_spawned => |c| blk: {
                 if (openWorkAt(state, events[0..i], c.child) != null) return error.InvalidTransition;

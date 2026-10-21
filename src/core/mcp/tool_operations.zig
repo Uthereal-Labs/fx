@@ -590,8 +590,10 @@ pub const Operations = struct {
                 null,
             options.continuation,
             responderCapabilities(options.input_responder),
+            options.trace_context,
         );
         defer alloc.free(request_body);
+        if (options.mcp_observation) |call| call.request(request_id);
 
         var tool_precommit = ToolPrecommit{
             .alloc = runtime.lifecycle.alloc,
@@ -793,6 +795,7 @@ pub const Operations = struct {
         };
         var transport_precommit = tool_precommit.transport();
         const request_id = try server.reserveRequestId();
+        if (options.mcp_observation) |call| call.request(request_id);
         if (server.legacy_http) |client| {
             if (!client.acquireUse()) return error.McpConnectionClosed;
             const client_version = client.version;
@@ -859,6 +862,7 @@ pub const Operations = struct {
             if (options.progress != null) request_id else null,
             options.continuation,
             responderCapabilities(options.input_responder),
+            options.trace_context,
         );
         defer alloc.free(request_body);
 
@@ -956,6 +960,7 @@ pub const Operations = struct {
             if (options.progress != null) request_id else null,
             options.continuation,
             .{},
+            options.trace_context,
         );
         defer alloc.free(request_body);
 
@@ -1153,6 +1158,7 @@ pub const Operations = struct {
 
         const client = server.legacy_sse orelse return error.McpConnectionClosed;
         const request_id = try server.reserveRequestId();
+        if (options.mcp_observation) |call| call.request(request_id);
         const request_body = try buildToolCallRequestForProtocol(
             alloc,
             request_id,
@@ -1162,6 +1168,7 @@ pub const Operations = struct {
             null,
             options.continuation,
             .{},
+            options.trace_context,
         );
         defer alloc.free(request_body);
         const raw_frame_cap = mcpResponseFrameCap(max_tool_result_bytes);

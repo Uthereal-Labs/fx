@@ -92,6 +92,21 @@ pub fn Runtime(comptime App: type) type {
             return null;
         }
 
+        const TurnWorkspace = struct {
+            root: []const u8,
+            access_scope: ?workspace_access.AccessScope,
+        };
+
+        /// A host workspace owns the root that tools, turns, and project
+        /// context use; otherwise the app's local workspace does.
+        fn turnWorkspace(app: *const App) TurnWorkspace {
+            if (appHostWorkspaceInfo(app)) |info| return .{
+                .root = info.root(),
+                .access_scope = workspace_access.AccessScope.primaryOnly(info.root()),
+            };
+            return .{ .root = app.workspace_root, .access_scope = appAccessScope(app) };
+        }
+
         fn modelVisibleProjectContext(app: *App) []const u8 {
             if (comptime @hasField(App, "context_enabled")) {
                 if (!app.context_enabled) return "";
@@ -174,10 +189,7 @@ pub fn Runtime(comptime App: type) type {
             authority: ?ToolAuthorityView,
         ) tool_runtime.Context {
             const host_workspace = appHostWorkspaceInfo(app);
-            const workspace_root = if (host_workspace) |info|
-                info.root()
-            else
-                app.workspace_root;
+            const workspace = turnWorkspace(app);
             const agent_settings = app.worker.effectiveAgentTurnSettings();
             const permission_snapshot = if (authority) |snapshot|
                 worker_runtime.PermissionSnapshot{
@@ -206,11 +218,8 @@ pub fn Runtime(comptime App: type) type {
             else
                 provider_set.Bundle.Capabilities{};
             var ctx: tool_runtime.Context = .{
-                .workspace_root = workspace_root,
-                .access_scope = if (host_workspace != null)
-                    workspace_access.AccessScope.primaryOnly(workspace_root)
-                else
-                    appAccessScope(app),
+                .workspace_root = workspace.root,
+                .access_scope = workspace.access_scope,
                 .ignored_list_entries = ignored_list_entries,
                 .max_list_entries = max_list_entries,
                 .max_read_file_bytes = max_read_file_bytes,
@@ -321,8 +330,6 @@ pub fn Runtime(comptime App: type) type {
                         .worker_model = provider_runtime.model(app),
                         .gateway_retry_count = gateway_retry_count,
                         .gateway_chat_url = gateway_chat_url,
-                        .usage = &app.session.usage,
-                        .usage_allocator = app.alloc,
                     });
                     ctx.web_search_backend = app.web_search_runtime.dispatchBackend();
                 }
@@ -798,8 +805,6 @@ pub fn Runtime(comptime App: type) type {
                         .worker_model = provider_runtime.model(app),
                         .gateway_retry_count = gateway_retry_count,
                         .gateway_chat_url = gateway_chat_url,
-                        .usage = &app.session.usage,
-                        .usage_allocator = app.alloc,
                     });
                     ctx.web_search_backend = app.web_search_runtime.dispatchBackend();
                 }
@@ -889,21 +894,15 @@ pub fn Runtime(comptime App: type) type {
             _ = gateway_chat_url;
             const permission_snapshot = app_permission_runtime.Runtime(App).livePermissionSnapshot(app);
             const host_workspace = appHostWorkspaceInfo(app);
-            const workspace_root = if (host_workspace) |info|
-                info.root()
-            else
-                app.workspace_root;
+            const workspace = turnWorkspace(app);
             try app.contextRegistry().appendDefaultTransient(.{
-                .workspace_root = workspace_root,
+                .workspace_root = workspace.root,
                 .host_workspace = if (host_workspace) |info| .{
                     .root = info.root(),
                     .cwd = info.cwd(),
                     .home = info.home(),
                 } else null,
-                .access_scope = if (host_workspace != null)
-                    workspace_access.AccessScope.primaryOnly(workspace_root)
-                else
-                    appAccessScope(app),
+                .access_scope = workspace.access_scope,
                 .interactive = true,
                 .permission_mode = permission_snapshot.mode,
                 .stale_shell_handles = app.session.has_stale_shell_handles,
@@ -914,9 +913,10 @@ pub fn Runtime(comptime App: type) type {
             app.context_snapshot.deinit(app.alloc);
             if (!app.context_enabled) return;
 
+            const workspace = turnWorkspace(app);
             app.context_snapshot = app.contextRegistry().gatherDefaultSnapshot(app.alloc, .{
-                .workspace_root = app.workspace_root,
-                .access_scope = appAccessScope(app),
+                .workspace_root = workspace.root,
+                .access_scope = workspace.access_scope,
                 .targets = targets,
                 .context_limits = if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
             }) catch |err| {
@@ -1087,10 +1087,19 @@ pub fn Runtime(comptime App: type) type {
             defer if (app.worker.isCancelRequested()) {
                 app.worker.settleCompactionActivity(operation_id, .{ .outcome = .cancelled });
             };
-            errdefer |err| {
+            compactWithActivity(app, job, gateway_retry_count, operation_id) catch |err| {
                 app.worker.settleCompactionActivity(operation_id, compaction_activity.failure(err, .preparation, app.worker.isCancelRequested()));
                 if (failure_provenance) |out| out.* = .{ .operation_id = operation_id, .turn_id = job.turn_id, .err = err };
-            }
+                return err;
+            };
+        }
+
+        fn compactWithActivity(
+            app: *App,
+            job: worker_runtime.ContextCompactionTask,
+            gateway_retry_count: usize,
+            operation_id: compaction_activity.OperationId,
+        ) anyerror!void {
             var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
             defer arena_state.deinit();
             const arena = arena_state.allocator();
@@ -1124,8 +1133,6 @@ pub fn Runtime(comptime App: type) type {
                 .max_output_tokens = model_capabilities.requestOutputTokens(capabilities),
                 .capabilities_context = deps.ctx,
                 .capabilities_fn = deps.available_model_capabilities,
-                .usage = deps.usage,
-                .usage_allocator = deps.usage_allocator,
             };
             const result = agent_runtime.compactContext(arena, &deps, .{
                 .operation_id = operation_id,
@@ -1246,6 +1253,7 @@ pub fn Runtime(comptime App: type) type {
             session_child_capability: ?*session_child_store.SessionChildCapability,
         ) agent_runtime.Config {
             const prompt_policy = app.promptPolicy();
+            const workspace = turnWorkspace(app);
             return .{
                 .system_prompt = prompt_policy.system_prompt,
                 .model_prompt_overlay = prompt_policy.modelPromptOverlay(job.model),
@@ -1277,8 +1285,8 @@ pub fn Runtime(comptime App: type) type {
                 .provider_order = if (job.provider == .gateway) job.agent_settings.provider_order else &.{},
                 .provider_strict = job.provider == .gateway and job.agent_settings.provider_strict,
                 .first_call_tool_choice = job.agent_settings.first_call_tool_choice,
-                .workspace_root = app.workspace_root,
-                .access_scope = appAccessScope(app),
+                .workspace_root = workspace.root,
+                .access_scope = workspace.access_scope,
                 .origin = if (app.session_persistence.writable) |writable|
                     if (writable.external_prompt_origin == .persistent_child) .subagent else .root
                 else
@@ -1386,14 +1394,14 @@ fn formatMissingSpecToolAction(arena: Allocator, state: ToolActionState, denied_
 
 fn formatInvalidArgsToolAction(arena: Allocator, state: ToolActionState, denied_label: ?[]const u8) ![]const u8 {
     return switch (state) {
-        .active => std.fmt.allocPrint(arena, "● Working…\x1b[0m", .{}),
+        .active => arena.print("● Working…\x1b[0m", .{}),
         .completed => formatToolActionValue(arena, "Completed", "tool call"),
         .denied => formatToolActionValue(arena, denied_label.?, "tool call"),
     };
 }
 
 fn formatToolActionValue(arena: Allocator, label: []const u8, value: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(arena, "● {s}\x1b[0m {s}{s}\x1b[0m", .{ label, shared_theme.current().tool_stdout_style, value });
+    return arena.print("● {s}\x1b[0m {s}{s}\x1b[0m", .{ label, shared_theme.current().tool_stdout_style, value });
 }
 
 /// Command rows keep the muted tool-text base and add shell syntax colors for
@@ -1409,7 +1417,7 @@ fn formatCommandActionValue(arena: Allocator, label: []const u8, command: []cons
         if (theme.light) .light else .dark,
         theme.tool_stdout_style,
     );
-    return std.fmt.allocPrint(arena, "● {s}\x1b[0m {s}\x1b[0m", .{ label, highlighted });
+    return arena.print("● {s}\x1b[0m {s}\x1b[0m", .{ label, highlighted });
 }
 
 fn specLabel(spec: *const tool_dispatch.Tool, state: ToolActionState, denied_label: ?[]const u8) []const u8 {
@@ -1485,13 +1493,12 @@ fn gatherTestProjectContext(_: Allocator, _: context_contract.InitialContextInpu
 }
 
 fn appendTestStaticContext(input: context_contract.StaticContextInput, alloc: Allocator, messages: *std.ArrayList(ChatMessage)) context_contract.ProviderError!void {
-    const content = try std.fmt.allocPrint(alloc, "provider static:{s}", .{input.project_context});
+    const content = try alloc.print("provider static:{s}", .{input.project_context});
     try messages.append(alloc, .{ .role = .system, .content = content });
 }
 
 fn appendTestTransientContext(input: context_contract.TransientContextInput, alloc: Allocator, messages: *std.ArrayList(ChatMessage)) context_contract.ProviderError!void {
-    const content = try std.fmt.allocPrint(
-        alloc,
+    const content = try alloc.print(
         "provider transient:{s}:{s}",
         .{ input.workspace_root, @tagName(input.permission_mode) },
     );
@@ -1524,7 +1531,7 @@ fn gatherFreshProjectContext(alloc: Allocator, input: context_contract.InitialCo
     refresh_targets_match = input.targets.len == 1 and
         input.targets[0].kind == .file and
         std.mem.eql(u8, input.targets[0].path, "/tmp/workspace/images/example.png");
-    const content = try std.fmt.allocPrint(alloc, "fresh:{s}", .{input.workspace_root});
+    const content = try alloc.print("fresh:{s}", .{input.workspace_root});
     errdefer alloc.free(content);
     const notices = try alloc.alloc([]u8, 1);
     errdefer alloc.free(notices);
@@ -1566,9 +1573,14 @@ const RefreshContextApp = struct {
     context_notice_tone: ?types.NoticeTone = null,
     context_notice_visibility: ?types.NoticeVisibility = null,
     session: session_runtime.SessionRuntime = .{ .max_history_turns = 8 },
+    host_info: ?js_host_workspace.Info = null,
 
     fn contextRegistry(self: *const RefreshContextApp) context_contract.Registry {
         return self.context_registry;
+    }
+
+    pub fn workspaceHostInfo(self: *const RefreshContextApp) ?*const js_host_workspace.Info {
+        return if (self.host_info) |*info| info else null;
     }
 
     fn deinit(self: *RefreshContextApp) void {
@@ -1577,7 +1589,7 @@ const RefreshContextApp = struct {
         self.session.deinit(self.alloc);
     }
 
-    fn writeDomainNotice(self: *RefreshContextApp, notice: types.SemanticNotice, _: bool) !void {
+    pub fn writeDomainNotice(self: *RefreshContextApp, notice: types.SemanticNotice, _: bool) !void {
         self.context_notice_tone = notice.tone;
         self.context_notice_visibility = notice.visibility;
         try self.context_notices.appendSlice(self.alloc, notice.body);
@@ -1672,7 +1684,7 @@ const FakeApp = struct {
         return app;
     }
 
-    fn toolRegistry(self: *const FakeApp) tool_dispatch.Registry {
+    pub fn toolRegistry(self: *const FakeApp) tool_dispatch.Registry {
         return self.tool_registry;
     }
 
@@ -1680,7 +1692,7 @@ const FakeApp = struct {
         return self.context_registry;
     }
 
-    fn snapshotMcpModelCatalog(
+    pub fn snapshotMcpModelCatalog(
         self: *FakeApp,
         alloc: Allocator,
         _: types.PermissionRuleSet,
@@ -1863,7 +1875,7 @@ const FakeApp = struct {
 
     pub fn formatToolExecutionErrorForAgent(self: *FakeApp, arena: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {
         _ = self;
-        return std.fmt.allocPrint(arena, "Tool {s} failed: {s}", .{ tool_name, @errorName(err) });
+        return arena.print("Tool {s} failed: {s}", .{ tool_name, @errorName(err) });
     }
 };
 
@@ -2336,7 +2348,7 @@ test "app agent runtime bounds a large multiline run command activity" {
     var app = try FakeApp.init(alloc);
     defer app.deinit();
 
-    const arguments_json = "{\"action\":\"run\",\"command\":\"" ++ ("x\\n" ** 20_000) ++ "\"}";
+    const arguments_json = "{\"action\":\"run\",\"command\":\"" ++ text_utils.repeat("x\\n", 20_000) ++ "\"}";
     const label = try app.describeToolAction(arena, .{
         .id = "large_command",
         .name = "shell",
@@ -2518,6 +2530,62 @@ test "app agent runtime refreshes enabled project context through registry" {
     try std.testing.expectEqualStrings("fresh context notice", app.context_notices.items);
     try std.testing.expectEqual(types.NoticeTone.warning, app.context_notice_tone.?);
     try std.testing.expectEqual(types.NoticeVisibility.full_only, app.context_notice_visibility.?);
+}
+
+const TestHostWorkspace = struct {
+    pub fn workspaceAvailable() i32 {
+        return 1;
+    }
+
+    pub fn workspaceInfo(out_ptr: [*]u8, out_cap: usize) i32 {
+        const json = "{\"version\":1,\"root\":\"/workspace\",\"cwd\":\"/workspace\",\"home\":\"/home/visitor\",\"git\":false,\"ephemeral\":true,\"permission\":\"allow-sandboxed\"}";
+        if (json.len > out_cap) return -3;
+        @memcpy(out_ptr[0..json.len], json);
+        return json.len;
+    }
+};
+
+test "app agent runtime turn workspace prefers the host workspace root" {
+    const alloc = std.testing.allocator;
+    var app = RefreshContextApp{
+        .alloc = alloc,
+        .workspace_root = "/",
+        .context_enabled = true,
+        .context_snapshot = .{},
+        .context_registry = fresh_context_registry,
+    };
+    defer app.deinit();
+
+    const local = Runtime(RefreshContextApp).turnWorkspace(&app);
+    try std.testing.expectEqualStrings("/", local.root);
+    try std.testing.expect(local.access_scope == null);
+
+    app.host_info = try js_host_workspace.Adapter(TestHostWorkspace).loadInfo(alloc);
+    const hosted = Runtime(RefreshContextApp).turnWorkspace(&app);
+    try std.testing.expectEqualStrings("/workspace", hosted.root);
+    const scope = hosted.access_scope orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("/workspace", scope.primary_directory);
+    try std.testing.expectEqual(@as(usize, 0), scope.additional_directories.len);
+}
+
+test "app agent runtime gathers project context from the host workspace root" {
+    const alloc = std.testing.allocator;
+    refresh_gather_calls = 0;
+    var app = RefreshContextApp{
+        .alloc = alloc,
+        .workspace_root = "/",
+        .context_enabled = true,
+        .context_snapshot = .{},
+        .context_registry = fresh_context_registry,
+        .host_info = try js_host_workspace.Adapter(TestHostWorkspace).loadInfo(alloc),
+    };
+    defer app.deinit();
+
+    try Runtime(RefreshContextApp).refreshProjectContext(&app, &.{});
+
+    try std.testing.expectEqual(@as(usize, 1), refresh_gather_calls);
+    const contribution = app.context_snapshot.contribution orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("fresh:/workspace", contribution.content);
 }
 
 test "app agent runtime clears disabled project context without gathering" {
@@ -2880,7 +2948,7 @@ test "manual compaction worker call commits a checkpoint without a continuation"
     const steps = [_]types.ToolExecutionStep{.{ .tool_calls = @constCast(&calls), .tool_results = @constCast(&results) }};
     job.history[0] = try types.dupeHistoryTurn(alloc, .{ .assistant = .{
         .user = .{ .text = @constCast("exact user request") },
-        .assistant = @constCast("exact completed response\n" ++ ("evidence " ** 1_000)),
+        .assistant = @constCast("exact completed response\n" ++ text_utils.repeat("evidence ", 1_000)),
         .execution = .{ .tool_steps = @constCast(&steps) },
     } });
     job.history[1] = try types.dupeHistoryTurn(alloc, .{ .assistant = .{
@@ -3445,12 +3513,12 @@ test "app agent runtime highlights shell command rows over the tool text base" {
     // while the command verb and quoted string pick up syntax palette colors
     // and return to the base after their closes.
     try std.testing.expect(std.mem.startsWith(u8, completed, "● Ran\x1b[0m \x1b[38;5;245m"));
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         completed,
         "\x1b[38;5;252mprintf\x1b[39m\x1b[38;5;245m",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         completed,
         "\x1b[38;5;250m'hello world'\x1b[39m\x1b[38;5;245m",
@@ -3458,7 +3526,7 @@ test "app agent runtime highlights shell command rows over the tool text base" {
     try std.testing.expect(std.mem.endsWith(u8, completed, "\x1b[0m"));
     // The pipe and the command after it take the keyword color, the flag the
     // number color; plain bytes are intact beneath the styling.
-    try std.testing.expect(std.mem.indexOf(u8, completed, "\x1b[38;5;252m|\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, completed, "\x1b[38;5;252mwc\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, completed, "\x1b[38;5;250m-c\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, completed, "\x1b[38;5;252m|\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, completed, "\x1b[38;5;252mwc\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, completed, "\x1b[38;5;250m-c\x1b[39m") != null);
 }

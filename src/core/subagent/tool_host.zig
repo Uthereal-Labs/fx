@@ -1,4 +1,6 @@
 const std = @import("std");
+const execution_observation = @import("../agent/runtime/observation.zig");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const approval_registry = @import("approval_registry.zig");
 const authority = @import("authority.zig");
 const child_state = @import("child_state.zig");
@@ -60,6 +62,15 @@ fn unavailableChildRun(
     return error.ProviderFailed;
 }
 
+test "managed execution receipts retain the pending contract" {
+    var runtime: Runtime = undefined;
+    for ([_]bool{ false, true }) |pending| {
+        const result = try runtime.encodeManaged(std.testing.allocator, .{ .ok = true, .pending = pending });
+        defer std.testing.allocator.free(result.body);
+        try std.testing.expectEqual(pending, result.pending);
+    }
+}
+
 pub const ProgressSink = struct {
     context: *anyopaque,
     publish_fn: *const fn (*anyopaque, types.SubagentStatus) void,
@@ -90,6 +101,7 @@ pub const ModelOverrideResolver = struct {
 };
 
 pub const ExecuteOptions = struct {
+    observer: ?*execution_observation.Observer = null,
     caller_id: []const u8,
     invocation_id: []const u8,
     parent_permission_mode: types.PermissionMode = .yolo,
@@ -108,6 +120,7 @@ pub const ExecuteOptions = struct {
 };
 
 pub const ManagedExecutionResult = struct {
+    pending: bool = false,
     success: bool,
     body: []u8,
     /// The final status model is owned by the result allocator.
@@ -152,7 +165,7 @@ pub const Runtime = struct {
 
     /// A host over a v2 parent, whose children live in its log (D22).
     /// Borrows `children` and the callback contexts until deinit; the
-    /// parent stays open until then (`tla/Wiring.tla`
+    /// parent stays open until then (`tests/tla/session_manager/Wiring.tla`
     /// ParentOutlivesChildren).
     pub fn createV2(
         alloc: Allocator,
@@ -340,6 +353,17 @@ pub const Runtime = struct {
                             };
                             switch (result) {
                                 .receipt => |delivery| {
+                                    if (options.observer) |observer| observer.emit(.{ .delegation = .{
+                                        .call_id = options.invocation_id,
+                                        .child_id = target.child_id,
+                                        .work_id = target.work_id,
+                                        .operation_id = operation_id,
+                                        .phase = switch (delivery) {
+                                            .queued => .feedback_queued,
+                                            .applied => .feedback_applied,
+                                            .not_applied => .feedback_not_applied,
+                                        },
+                                    } });
                                     if (delivery == .queued) {
                                         const queued = queued_receipt.?;
                                         queued_receipt = null;
@@ -370,7 +394,8 @@ pub const Runtime = struct {
                             });
                         },
                         .ready => |ready| {
-                            const result = try self.observeManagedState(
+                            if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = ready.child_id, .work_id = operation_id, .phase = .dispatched } });
+                            const result = self.observeManagedState(
                                 alloc,
                                 ready.child_id,
                                 operation_id,
@@ -379,15 +404,22 @@ pub const Runtime = struct {
                                 options.cancel_flag,
                                 options.steering_worker,
                                 options.model_capability_resolver,
-                            );
+                            ) catch |err| {
+                                if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = ready.child_id, .work_id = operation_id, .phase = if (err == error.Cancelled) .cancelled else .failed } });
+                                return err;
+                            };
+                            if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = ready.child_id, .work_id = operation_id, .phase = if (result.pending) .yielded else if (result.success) .completed else .failed } });
                             break :blk result;
                         },
-                        .completed => |completed| break :blk self.completeManagedResult(
-                            alloc,
-                            completed.child_id,
-                            operation_id,
-                            completed.observation,
-                        ),
+                        .completed => |completed| {
+                            if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = completed.child_id, .work_id = operation_id, .phase = .replayed } });
+                            break :blk self.completeManagedResult(
+                                alloc,
+                                completed.child_id,
+                                operation_id,
+                                completed.observation,
+                            );
+                        },
                     }
                 }
             },
@@ -810,7 +842,7 @@ pub const Runtime = struct {
                     if (steering_worker) |worker| {
                         if (worker.hasPendingPlainSteering()) {
                             debug_trace.eventf("subagent", "steering_wait_yielded", .{}, "child_id={s} work_id={s} child_cancelled=false", .{ child_id, work_id });
-                            const pending_text = try std.fmt.allocPrint(alloc, "{s}\nchild_id={s} work_id={s}", .{ model_contract.steering_pending_result, child_id, work_id });
+                            const pending_text = try alloc.print("{s}\nchild_id={s} work_id={s}", .{ model_contract.steering_pending_result, child_id, work_id });
                             defer alloc.free(pending_text);
                             var pending = try self.encodeManaged(alloc, .{ .ok = true, .pending = true, .result = pending_text });
                             if (status.sink != null) attachStatusPresentation(alloc, &pending, status.current(observation.metrics));
@@ -907,7 +939,7 @@ pub const Runtime = struct {
                 .body = try model_contract.encodeResultAlloc(arena, model_contract.feedbackResult(update.delivery)),
                 .max_result_bytes = tool_result_limits.min_configured_tool_result_bytes,
                 .delivered = false,
-                .receipt_sequence = @as(u64, @intFromEnum(update.delivery)) + 1,
+                .receipt_sequence = @as(u64, @backingInt(update.delivery)) + 1,
             });
         }
         return results.toOwnedSlice(arena);
@@ -1048,6 +1080,7 @@ pub const Runtime = struct {
         _ = self;
         return .{
             .success = result.ok,
+            .pending = result.pending,
             .body = try model_contract.encodeResultAlloc(alloc, result),
         };
     }
@@ -1152,7 +1185,7 @@ fn operationIdAlloc(
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(invocation_id, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
-    return std.fmt.allocPrint(alloc, "fxop:2:m:{d}:{s}", .{ epoch, &hex });
+    return alloc.print("fxop:2:m:{d}:{s}", .{ epoch, &hex });
 }
 
 fn checkYieldedOwnership(alloc: Allocator) !void {
@@ -1182,7 +1215,7 @@ fn checkYieldedOwnership(alloc: Allocator) !void {
 }
 
 test "subagent yielded identity is owned and allocation failures do not leak" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkYieldedOwnership, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkYieldedOwnership, .{});
 }
 
 test "subagent admission preserves an undelivered result before advancing its child" {
@@ -1891,7 +1924,7 @@ test "model override passes through for non-gateway providers" {
 fn formatFailedResult(alloc: Allocator, failure: ?[]const u8, partial: ?[]const u8) ![]u8 {
     const reason = failure orelse "failure reason unavailable";
     const text = partial orelse "";
-    return std.fmt.allocPrint(alloc, "Subagent failed: {s}. Earlier tool calls may have completed; their effects are not rolled back.{s}{s}", .{
+    return alloc.print("Subagent failed: {s}. Earlier tool calls may have completed; their effects are not rolled back.{s}{s}", .{
         reason,
         if (text.len > 0) "\n\nPartial result:\n" else "",
         text,

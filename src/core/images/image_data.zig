@@ -1,5 +1,6 @@
 const std = @import("std");
 const types = @import("../shared/types.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const Allocator = std.mem.Allocator;
 
 pub const max_encoded_image_bytes: usize = 5 * 1024 * 1024;
@@ -16,8 +17,8 @@ pub fn validSourceRef(source_ref: []const u8) bool {
 
 test "source references are bounded opaque UTF-8 without control bytes" {
     try std.testing.expect(validSourceRef("host:screenshot-1"));
-    try std.testing.expect(validSourceRef("é" ** 256));
-    for ([_][]const u8{ "", "a" ** 513, "bad\nref", "bad\x7fref", "\xff" }) |value| {
+    try std.testing.expect(validSourceRef(text_utils.repeat("é", 256)));
+    for ([_][]const u8{ "", text_utils.repeat("a", 513), "bad\nref", "bad\x7fref", "\xff" }) |value| {
         try std.testing.expect(!validSourceRef(value));
     }
 }
@@ -177,9 +178,15 @@ pub fn countRequestImages(messages: []const types.ChatMessage) usize {
     return count;
 }
 
+/// Padded base64 length of `raw_bytes`, or null when it overflows `usize`.
+pub fn encodedImageBytes(raw_bytes: usize) ?usize {
+    const groups = @divTrunc(std.math.add(usize, raw_bytes, 2) catch return null, 3);
+    return std.math.mul(usize, groups, 4) catch null;
+}
+
 pub fn fitsEncodedImageLimit(raw_bytes: usize) bool {
-    const groups = @divTrunc(std.math.add(usize, raw_bytes, 2) catch return false, 3);
-    return (std.math.mul(usize, groups, 4) catch return false) <= max_encoded_image_bytes;
+    const encoded = encodedImageBytes(raw_bytes) orelse return false;
+    return encoded <= max_encoded_image_bytes;
 }
 
 pub const Dimensions = struct {
@@ -189,28 +196,7 @@ pub const Dimensions = struct {
     pub fn exceeds(self: Dimensions, limit: u32) bool {
         return self.width > limit or self.height > limit;
     }
-
-    pub fn exceedsModelLimit(self: Dimensions) bool {
-        return self.exceeds(max_image_dimension);
-    }
 };
-
-/// Writes the model-visible note for an image downscaled from `original` to
-/// `smaller`, including the factor that maps its coordinates back.
-pub fn writeDownscaledNotice(writer: *std.Io.Writer, original: Dimensions, smaller: Dimensions) std.Io.Writer.Error!void {
-    try writer.print(
-        "[Image downscaled from {d}x{d} to {d}x{d} pixels to fit the {d}-pixel limit per side. Multiply coordinates in this image by {d:.2} to get original pixels.]\n",
-        .{ original.width, original.height, smaller.width, smaller.height, max_image_dimension, coordinateScale(original, smaller) },
-    );
-}
-
-/// Ratio from downscaled to original pixels along the longer side.
-fn coordinateScale(original: Dimensions, smaller: Dimensions) f64 {
-    if (original.width >= original.height) {
-        return @as(f64, @floatFromInt(original.width)) / @as(f64, @floatFromInt(smaller.width));
-    }
-    return @as(f64, @floatFromInt(original.height)) / @as(f64, @floatFromInt(smaller.height));
-}
 
 /// Reads pixel dimensions from a PNG, JPEG, GIF, or WebP header without
 /// decoding pixels. Returns null for unsupported, truncated, or malformed
@@ -443,7 +429,7 @@ fn testGif(width: u16, height: u16) [10]u8 {
 }
 
 fn testWebpHeader(chunk: *const [4]u8) [30]u8 {
-    var bytes = [_]u8{0} ** 30;
+    var bytes: [30]u8 = @splat(0);
     @memcpy(bytes[0..4], "RIFF");
     @memcpy(bytes[8..12], "WEBP");
     @memcpy(bytes[12..16], chunk);

@@ -1,5 +1,6 @@
 const std = @import("std");
 const domain = @import("domain.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const session_adapter = @import("../session/session_adapter.zig");
 const session_codec = @import("../session/session_codec.zig");
@@ -15,7 +16,7 @@ const lock_file = "children.lock";
 const owner_marker_file = "owner.json";
 const legacy_control_file = "control.json";
 const lock_deadline_ms: u64 = 2_000;
-const max_state_bytes: usize = 512 * 1024;
+pub const max_state_bytes: usize = 512 * 1024;
 pub const max_children: usize = 256;
 
 const PersistentIdentity = struct {
@@ -52,7 +53,7 @@ pub const Outcome = enum { completed, failed, cancelled, interrupted, lost };
 
 pub const ActiveWork = struct {
     id: []u8,
-    request_fingerprint: [32]u8 = [_]u8{0} ** 32,
+    request_fingerprint: [32]u8 = @splat(0),
     message: []u8,
     root_user_intent_context: []u8 = &.{},
     root_user_messages: [][]u8 = &.{},
@@ -557,7 +558,7 @@ pub const V2Children = struct {
     registry: ?Registry = null,
     /// Settings for children with no log yet, from their admission; taken
     /// when their work first opens them (D34). Keys and models owned.
-    seeds: std.StringArrayHashMapUnmanaged(ChildSeed) = .empty,
+    seeds: std.array_hash_map.String(ChildSeed) = .empty,
 
     pub const ChildSeed = struct {
         preferences: session_codec.DurableSessionPreferences,
@@ -750,6 +751,44 @@ fn planLines(arena: Allocator, old: Registry, next: Registry) ![]session_adapter
                 } });
             }
         }
+    }
+    return lines.toOwnedSlice(arena);
+}
+
+/// The child lines that give a converted parent's v2 log the children
+/// of its v1 `registry` (D22, D56), so `registryFromChildren` rebuilds the
+/// same registry. `has_log[i]` says whether child `i` was converted too:
+/// one that was not is recorded lost (D33, D61), and work still open at
+/// v1's crash is interrupted, as v1 drops it on restart. A child that never
+/// had work has no line to write, which is traced.
+pub fn v1ImportLines(arena: Allocator, registry: Registry, has_log: []const bool) ![]session_adapter.ChildLine {
+    std.debug.assert(has_log.len == registry.children.len);
+    var lines: std.ArrayList(session_adapter.ChildLine) = .empty;
+    for (registry.children, has_log) |child, logged| {
+        const work_id = if (child.active) |active| active.id else child.last_work_id orelse {
+            debug_trace.logf("convert", "action=ChildWithoutWork session={s} child={s}", .{ registry.parent_id, child.id });
+            continue;
+        };
+        const fingerprint_bytes = if (child.active) |active| active.request_fingerprint else child.last_request_fingerprint orelse @as([32]u8, @splat(0));
+        const fingerprint = try arena.dupe(u8, &std.fmt.bytesToHex(fingerprint_bytes, .lower));
+        const outcome: session_adapter.ChildOutcome = if (!logged) .lost else if (child.active != null) .interrupted else switch (child.last_outcome orelse .interrupted) {
+            .completed => .ok,
+            .failed => .failed,
+            .cancelled => .cancelled,
+            .interrupted, .lost => .interrupted,
+        };
+        const failure = if (outcome == .failed) if (child.last_failure) |value| value.view() else null else null;
+        try lines.append(arena, .{ .spawned = .{
+            .child = child.id,
+            .work_id = work_id,
+            .data = try stringifyAlloc(arena, SpawnData{ .agent = child.agentName(), .fingerprint = fingerprint }),
+        } });
+        try lines.append(arena, .{ .finished = .{
+            .child = child.id,
+            .work_id = work_id,
+            .outcome = outcome,
+            .data = if (failure) |text| try stringifyAlloc(arena, FinishData{ .failure = text }) else null,
+        } });
     }
     return lines.toOwnedSlice(arena);
 }
@@ -950,7 +989,9 @@ fn renderActive(writer: *std.Io.Writer, active: ActiveWork) !void {
     );
 }
 
-fn parseRegistry(alloc: Allocator, bytes: []const u8, parent_id: []const u8) !Registry {
+/// A v1 registry from `children.json` bytes, as `Store.load` parses it;
+/// also read by the v1 converter. Caller owns it.
+pub fn parseRegistry(alloc: Allocator, bytes: []const u8, parent_id: []const u8) !Registry {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
     defer parsed.deinit();
     const root = try object(parsed.value);
@@ -1228,7 +1269,7 @@ test "subagent failure codec reads historical absence and rejects invalid detail
     defer parsed.deinit();
     const record = &parsed.value.object.getPtr("children").?.array.items[0];
     const bad_values = [_]std.json.Value{
-        .{ .string = "x" ** (types.ModelFailureDiagnostic.max_bytes + 1) },
+        .{ .string = text_utils.repeat("x", types.ModelFailureDiagnostic.max_bytes + 1) },
         .{ .string = "unsafe\x1b[31m" },
         .{ .integer = 7 },
     };
@@ -1280,7 +1321,7 @@ test "interrupted active work clears ownership and remains round trippable" {
     defer registry.deinit(alloc);
     var active = ActiveWork{
         .id = try alloc.dupe(u8, "work-1"),
-        .request_fingerprint = [_]u8{7} ** 32,
+        .request_fingerprint = @as([32]u8, @splat(7)),
         .message = try alloc.dupe(u8, "review this"),
         .created_at_ms = 1,
     };
@@ -1299,7 +1340,7 @@ test "interrupted active work clears ownership and remains round trippable" {
     try std.testing.expectEqual(Phase.interrupted, child.phase);
     try std.testing.expect(child.active == null);
     try std.testing.expectEqualStrings("work-1", child.last_work_id.?);
-    try std.testing.expectEqual([_]u8{7} ** 32, child.last_request_fingerprint.?);
+    try std.testing.expectEqual(@as([32]u8, @splat(7)), child.last_request_fingerprint.?);
     try std.testing.expectEqual(Outcome.interrupted, child.last_outcome.?);
     const encoded = try renderRegistry(alloc, registry);
     defer alloc.free(encoded);
@@ -1386,7 +1427,7 @@ fn testWork(alloc: Allocator, id: []const u8, fingerprint_byte: u8) !ActiveWork 
     return .{
         .id = owned_id,
         .message = try alloc.dupe(u8, "do the work"),
-        .request_fingerprint = [_]u8{fingerprint_byte} ** 32,
+        .request_fingerprint = @as([32]u8, @splat(fingerprint_byte)),
         .created_at_ms = 1,
     };
 }
@@ -1418,7 +1459,7 @@ test "a v2 registry change writes only the child lines it implies (D22)" {
     try std.testing.expectEqualStrings("work-1", lines[0].spawned.work_id);
     const spawn = try std.json.parseFromSliceLeaky(SpawnData, a, lines[0].spawned.data.?, .{});
     try std.testing.expect(spawn.agent == null);
-    try std.testing.expectEqualStrings("ab" ** 32, spawn.fingerprint);
+    try std.testing.expectEqualStrings(text_utils.repeat("ab", 32), spawn.fingerprint);
     advance(alloc, &old, next);
 
     // A change of phase alone writes nothing.
@@ -1476,7 +1517,7 @@ test "a v2 registry change writes only the child lines it implies (D22)" {
 test "a v2 parent's folded children rebuild the registry v1 would hold (D22)" {
     const alloc = std.testing.allocator;
     const parent_id = "01J00000000000000000000000";
-    const fingerprint = "ab" ** 32;
+    const fingerprint = text_utils.repeat("ab", 32);
     var folded = [_]session_adapter.Child{
         .{ .id = @constCast("01J00000000000000000000001"), .work_id = @constCast("w1"), .open = false, .outcome = .ok, .spawn_data = @constCast("{\"fingerprint\":\"" ++ fingerprint ++ "\",\"later\":1}"), .finish_data = null, .seq = 5 },
         .{ .id = @constCast("01J00000000000000000000002"), .work_id = @constCast("w2"), .open = false, .outcome = .failed, .spawn_data = @constCast("{\"agent\":\"reviewer\",\"fingerprint\":\"" ++ fingerprint ++ "\"}"), .finish_data = @constCast("{\"failure\":\"boom\"}"), .seq = 9 },
@@ -1491,7 +1532,7 @@ test "a v2 parent's folded children rebuild the registry v1 would hold (D22)" {
     try std.testing.expectEqual(Phase.finished, one_off.phase);
     try std.testing.expectEqual(Outcome.completed, one_off.last_outcome.?);
     try std.testing.expectEqualStrings("w1", one_off.last_work_id.?);
-    try std.testing.expectEqual([_]u8{0xab} ** 32, one_off.last_request_fingerprint.?);
+    try std.testing.expectEqual(@as([32]u8, @splat(0xab)), one_off.last_request_fingerprint.?);
     try std.testing.expectEqual(@as(u64, 5), one_off.work_generation);
     try std.testing.expect(one_off.active == null);
     const failed = registry.children[1];
@@ -1581,5 +1622,5 @@ test "v2 children live in the parent's log and come back after a reopen (D22)" {
     try std.testing.expectEqual(Phase.idle, child.phase);
     try std.testing.expectEqualStrings("work-1", child.last_work_id.?);
     try std.testing.expectEqual(Outcome.completed, child.last_outcome.?);
-    try std.testing.expectEqual([_]u8{0x11} ** 32, child.last_request_fingerprint.?);
+    try std.testing.expectEqual(@as([32]u8, @splat(0x11)), child.last_request_fingerprint.?);
 }

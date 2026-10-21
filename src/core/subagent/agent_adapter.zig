@@ -276,8 +276,7 @@ pub fn run(
     const child_system_prompt = if (message.system_prompt_overlay.len == 0)
         config.system_prompt
     else
-        std.fmt.allocPrint(
-            arena,
+        arena.print(
             "{s}\n\n<subagent_instructions>\n{s}\n</subagent_instructions>",
             .{ config.system_prompt, message.system_prompt_overlay },
         ) catch return error.OutOfMemory;
@@ -414,6 +413,7 @@ fn withoutSubagentFunctions(
 fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
     return .{
         .ctx = context,
+        .observer = context.config.tool_context.observer,
         .agent_stream_provider = context.config.tool_context.agent_stream_provider,
         .tool_registry = context.config.tool_context.tool_registry,
         .context_registry = context.config.context_registry,
@@ -463,8 +463,6 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .refresh_gateway_credential = refreshGatewayCredential,
         .format_tool_execution_error = formatToolExecutionError,
         .report_usage = reportUsage,
-        .usage = &context.turn.sessionRuntime().usage,
-        .usage_allocator = context.turn.alloc,
     };
 }
 
@@ -910,7 +908,7 @@ fn resolveToolActionDisplayTarget(raw: *anyopaque, arena: Allocator, call: types
 
 fn describeToolActionDenied(raw: *anyopaque, arena: Allocator, call: types.ToolCall, file_path: ?[]const u8, label: []const u8, dynamic_names: []const []const u8) ![]const u8 {
     const action = try describeToolAction(raw, arena, call, file_path, dynamic_names);
-    return std.fmt.allocPrint(arena, "{s}: {s}", .{ label, action });
+    return arena.print("{s}: {s}", .{ label, action });
 }
 
 fn permissionTargetForCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall, dynamic_names: []const []const u8) ![]const u8 {
