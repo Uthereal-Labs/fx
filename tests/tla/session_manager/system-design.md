@@ -1063,6 +1063,10 @@ Settled after main's new compactor landed (2026-10-01):
   a side folder kept only for records, which D48 rules out. `Fork.tla`
   `SetBlob` now lists a blob inside a turn as well as outside it, since
   compaction runs mid-turn; such a setting is checked as an item is.
+  Opt-in saved-result aliases use the same named-record mechanism for their
+  owner-scoped mapping. They retain physical artifact references and add no
+  session-manager transition. Their record is listed with the next tool-result
+  batch, and a fork selects its own owner namespace.
 
 Settled after the first dogfood finding (2026-10-01):
 - **D51 Decision:** the message that issues running calls keeps its text

@@ -245,6 +245,7 @@ pub const ActiveSessionState = struct {
     account_id: ?[]const u8 = null,
     agent_step_limit: usize,
     max_tool_result_bytes: usize,
+    short_tool_result_handles: bool = false,
     fast_mode: bool,
     ultrafast_mode: bool = false,
     effort: types.ReasoningEffort,
@@ -334,6 +335,7 @@ pub const ServerState = struct {
     permission_rules: types.PermissionRuleSet = .{},
     agent_step_limit: usize = 0,
     max_tool_result_bytes: usize = 64 * 1024,
+    short_tool_result_handles: bool = false,
     auto_compact_percent: u8 = compactor.default_percent,
     context_limits: config_runtime.context_limits.Values = .{},
     fast_mode: bool = false,
@@ -2752,6 +2754,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.permission_rules = startup.takePermissionRules();
     state.agent_step_limit = startup.agent_step_limit;
     state.max_tool_result_bytes = startup.max_tool_result_bytes;
+    state.short_tool_result_handles = startup.short_tool_result_handles;
     state.auto_compact_percent = startup.auto_compact_percent;
     state.context_limits = startup.context_limits;
     state.context_limits.applyCommandLine(state.cfg.context_limit_overrides);

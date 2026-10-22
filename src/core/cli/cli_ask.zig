@@ -587,6 +587,7 @@ const AskContext = struct {
     reviewer_model: []const u8 = "",
     agent_step_limit: usize = 0,
     max_tool_result_bytes: usize = 64 * 1024,
+    short_tool_result_handles: bool = false,
     auto_compact_percent: u8 = compactor.default_percent,
     context_limits: config_runtime.context_limits.Values = .{},
     fast_mode: bool = false,
@@ -1165,6 +1166,7 @@ const AskContext = struct {
             .max_read_file_line_len = self.cfg.max_read_file_line_len,
             .max_command_output_bytes = self.cfg.max_command_output_bytes,
             .max_tool_result_bytes = self.max_tool_result_bytes,
+            .short_tool_result_handles = self.short_tool_result_handles,
             .auto_compact_percent = self.auto_compact_percent,
             .api_key = self.api_key,
             .agent_stream_provider = self.agentStreamProvider(),
@@ -1746,6 +1748,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.requested_resume = options.resume_target;
     ctx.agent_step_limit = startup.agent_step_limit;
     ctx.max_tool_result_bytes = startup.max_tool_result_bytes;
+    ctx.short_tool_result_handles = startup.short_tool_result_handles;
     ctx.auto_compact_percent = startup.auto_compact_percent;
     ctx.context_limits = startup.context_limits;
     ctx.context_limits.applyCommandLine(cfg.context_limit_overrides);
@@ -2068,6 +2071,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .custom_tool_guidance = tool_projection.custom_guidance,
         .agent_step_limit = startup.agent_step_limit,
         .max_tool_result_bytes = startup.max_tool_result_bytes,
+        .short_tool_result_handles = startup.short_tool_result_handles,
         .auto_compact_percent = startup.auto_compact_percent,
         .cancel_flag = ctx.cancelFlag(),
         .fast_mode = ctx.fast_mode,

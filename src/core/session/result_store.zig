@@ -8,6 +8,7 @@ const artifact_digest = @import("artifact_digest.zig");
 const session_child_store = @import("session_child_store.zig");
 const session_codec = @import("session_codec.zig");
 const compactor = @import("../compactor/compactor.zig");
+const result_aliases = @import("result_aliases.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -17,6 +18,43 @@ pub const read_default_bytes: usize = 8 * 1024;
 pub const read_max_bytes: usize = 64 * 1024;
 pub const full_read_chunk_bytes: usize = 64 * 1024;
 pub const stored_text_max_bytes: usize = 8 * 1024 * 1024;
+
+test "short result previews retain physical blobs and echo exact aliases on reads" {
+    const alloc = std.testing.allocator;
+    var memory = session_child_store.MemoryBlobsForTesting.init(alloc);
+    defer memory.deinit();
+    var capability = try session_child_store.SessionChildCapability.initBlobs(alloc, memory.blobs(), "", .writable);
+    defer capability.deinit();
+    const raw = try alloc.alloc(u8, large_result_threshold_bytes + 1);
+    defer alloc.free(raw);
+    @memset(raw, 'x');
+    const prepared = try prepareManagedWithAliases(alloc, &capability, "call", "read_file", raw.len, raw, 1024, true);
+    defer alloc.free(@constCast(prepared.model_output));
+    defer alloc.free(@constCast(prepared.memory.output_handle.?));
+    defer alloc.free(@constCast(prepared.memory.preview.?));
+    const physical = prepared.memory.output_handle.?;
+    try std.testing.expect(std.mem.startsWith(u8, physical, "result-"));
+    try std.testing.expect(std.mem.find(u8, prepared.model_output, "Ftest-owner:1") != null);
+    try std.testing.expect(std.mem.find(u8, prepared.model_output, physical) == null);
+    const complete = try readForReplayManaged(alloc, &capability, physical, raw.len);
+    defer alloc.free(complete);
+    try std.testing.expectEqualSlices(u8, raw, complete);
+    const range = try readByRangeManaged(alloc, &capability, "Ftest-owner:1", 1, raw.len);
+    defer alloc.free(range);
+    try std.testing.expect(std.mem.startsWith(u8, range, "<tool_result handle=\"Ftest-owner:1\" start_byte=\"1\""));
+    const query = try searchByQueryManaged(alloc, &capability, "Ftest-owner:1", "xxx");
+    defer alloc.free(query);
+    try std.testing.expect(std.mem.startsWith(u8, query, "<tool_result_query handle=\"Ftest-owner:1\">"));
+    try std.testing.expectError(error.UnknownResultAlias, readByRangeManaged(alloc, &capability, "Fforeign:1", 1, 32));
+    const historical = try readByRangeManaged(alloc, &capability, physical, 1, 32);
+    defer alloc.free(historical);
+    try std.testing.expect(std.mem.find(u8, historical, physical) != null);
+    const ordinary = try prepareManaged(alloc, &capability, "ordinary", "read_file", raw.len, raw, 1024);
+    defer alloc.free(@constCast(ordinary.model_output));
+    defer alloc.free(@constCast(ordinary.memory.output_handle.?));
+    defer alloc.free(@constCast(ordinary.memory.preview.?));
+    try std.testing.expect(std.mem.find(u8, ordinary.model_output, ordinary.memory.output_handle.?) != null);
+}
 
 pub const PreparedResult = struct {
     model_output: []const u8,
@@ -114,11 +152,24 @@ pub fn prepareManaged(
     durable_output: []const u8,
     inline_cap: usize,
 ) !PreparedResult {
+    return prepareManagedWithAliases(alloc, capability, tool_call_id, tool_name, output_bytes, durable_output, inline_cap, false);
+}
+
+pub fn prepareManagedWithAliases(
+    alloc: Allocator,
+    capability: ?*session_child_store.SessionChildCapability,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    output_bytes: usize,
+    durable_output: []const u8,
+    inline_cap: usize,
+    short_handles: bool,
+) !PreparedResult {
     if (capability) |managed| {
         if (output_bytes > large_result_threshold_bytes or
             durable_output.len > inline_cap)
         {
-            return prepareStoredResult(
+            var prepared = try prepareStoredResult(
                 alloc,
                 .{ .managed = managed },
                 tool_call_id,
@@ -126,6 +177,19 @@ pub fn prepareManaged(
                 output_bytes,
                 durable_output,
             );
+            errdefer {
+                alloc.free(@constCast(prepared.model_output));
+                alloc.free(@constCast(prepared.memory.output_handle.?));
+                alloc.free(@constCast(prepared.memory.preview.?));
+            }
+            if (short_handles) {
+                const alias = try result_aliases.register(alloc, managed, prepared.memory.output_handle.?);
+                defer alloc.free(alias);
+                const shown = try formatStoredResultOutput(alloc, alias, prepared.memory.preview.?, prepared.memory.stored_output_bytes);
+                alloc.free(@constCast(prepared.model_output));
+                prepared.model_output = shown;
+            }
+            return prepared;
         }
         return prepareExternallyBackedInlineResult(
             alloc,
@@ -544,8 +608,10 @@ pub fn readByRangeManaged(
     start_byte: usize,
     byte_count: usize,
 ) ![]u8 {
-    try validateHandle(handle);
-    const text = try readStoredTextManaged(alloc, capability, handle);
+    const physical = if (result_aliases.isAlias(handle)) try result_aliases.resolve(alloc, capability, handle) else try alloc.dupe(u8, handle);
+    defer alloc.free(physical);
+    try validateHandle(physical);
+    const text = try readStoredTextManaged(alloc, capability, physical);
     defer alloc.free(text);
     const start = if (start_byte == 0) 0 else @min(start_byte - 1, text.len);
     const requested = @min(if (byte_count == 0) read_default_bytes else byte_count, read_max_bytes);
@@ -595,10 +661,12 @@ pub fn searchByQueryManaged(
     handle: []const u8,
     query: []const u8,
 ) ![]u8 {
-    try validateHandle(handle);
+    const physical = if (result_aliases.isAlias(handle)) try result_aliases.resolve(alloc, capability, handle) else try alloc.dupe(u8, handle);
+    defer alloc.free(physical);
+    try validateHandle(physical);
     const trimmed_query = std.mem.trim(u8, query, " \t\r\n");
     if (trimmed_query.len == 0) return error.InvalidQuery;
-    const text = try readStoredTextManaged(alloc, capability, handle);
+    const text = try readStoredTextManaged(alloc, capability, physical);
     defer alloc.free(text);
 
     var out: std.Io.Writer.Allocating = .init(alloc);

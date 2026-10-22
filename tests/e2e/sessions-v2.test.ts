@@ -554,6 +554,62 @@ test("a tool turn keeps its result as a blob of the session and v1 ignores the v
   }
 }, TIMEOUT * 3);
 
+test("short saved-result aliases preserve physical blobs and resume after profile opt-out", async () => {
+  const fixture = createFixture("fx-v2-short-result-");
+  const profile = join(fixture.home, ".fx", "settings.json");
+  mkdirSync(join(fixture.home, ".fx"), { recursive: true });
+  writeFileSync(profile, JSON.stringify({ short_tool_result_handles: true, max_tool_result_bytes: 1024 }));
+  const needle = "SHORT_RESULT_EVIDENCE_8251";
+  const lines = Array.from({ length: 400 }, (_, i) => `${i}: ${"x".repeat(80)}`);
+  lines[250] = needle;
+  writeFileSync(join(fixture.workspace, "large.txt"), lines.join("\n"));
+  let step = 0;
+  let alias = "";
+  const gateway = startDynamicFakeGateway((body) => {
+    switch (step++) {
+      case 0:
+        return fakeGatewayToolCall("short-file", "read_file", { path: "large.txt" });
+      case 1:
+        alias = /<tool_result_handle>(F[^<]+)<\/tool_result_handle>/.exec(body)?.[1] ?? "";
+        expect(alias).toMatch(/^F[A-Za-z0-9_-]+:1$/);
+        return fakeGatewayToolCall("short-range", "read_tool_result", { request: { handle: alias, start_byte: 1, byte_count: 256 } });
+      case 2:
+        expect(body).toContain(`handle=\\\"${alias}\\\"`);
+        return fakeGatewayToolCall("short-query", "read_tool_result", { request: { handle: alias, query: needle } });
+      case 3:
+        expect(body).toContain(needle);
+        return fakeGatewayFinalText("SHORT_RESULT_SAVED");
+      case 4:
+        expect(body).toContain(`<tool_result_handle>${alias}</tool_result_handle>`);
+        return fakeGatewayToolCall("resumed-short-query", "read_tool_result", { request: { handle: alias, query: needle } });
+      case 5:
+        expect(body).toContain(needle);
+        return fakeGatewayFinalText("SHORT_RESULT_RESUMED");
+      default:
+        throw new Error("Unexpected model request");
+    }
+  });
+  try {
+    const created = await ask(fixture, gateway, ["Inspect the saved file."]);
+    expect(created.code).toBe(0);
+    const id = JSON.parse(created.stdout).session_id;
+    expect(alias).toBe(`F${id}:1`);
+    const result = logLines(fixture, id).find((line: any) => line.type === "tool_result" && itemData(line).call_id === "short-file");
+    const physical = itemData(result).artifact_ref;
+    expect(physical).toMatch(/^result-[a-f0-9]{64}\.txt$/);
+    expect(readFileSync(blobPath(fixture, id, physical), "utf8")).toContain(needle);
+    writeFileSync(profile, JSON.stringify({ short_tool_result_handles: false, max_tool_result_bytes: 1024 }));
+    const resumed = await ask(fixture, gateway, ["--resume", id, "Read the saved evidence again."]);
+    expect(resumed.code).toBe(0);
+    expect(JSON.parse(resumed.stdout).output).toBe("SHORT_RESULT_RESUMED");
+    expect(step).toBe(6);
+    expectWholeLog(fixture, id);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
 test("a long command output is kept as one read-only blob, and the model pages it after a resume", async () => {
   const fixture = createFixture("fx-v2-replay-");
   // Past the inline capture limit, the output spools outside the session

@@ -18,6 +18,7 @@ const session_layout = @import("session_layout.zig");
 const session_replay = @import("session_replay.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
 const result_store = @import("result_store.zig");
+const result_aliases = @import("result_aliases.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
@@ -2846,9 +2847,16 @@ fn restoreExecutionResultBodies(
     for (execution.tool_steps) |*step| for (step.tool_results) |*result| {
         const handle = result.output_handle orelse continue;
         if (!result.truncated and result.output.len == result.stored_output_bytes) continue;
-        const body = if (result.truncated)
-            try result_store.formatStoredResultOutput(alloc, handle, result.preview orelse "", result.stored_output_bytes)
-        else blk: {
+        const body = if (result.truncated) blk: {
+            if (capability.* == null) {
+                const path = try io_mod.dirRealpathAlloc(alloc, dir.dir, ".");
+                defer alloc.free(path);
+                capability.* = try session_child_store.SessionChildCapability.init(alloc, dir.dir, path, .read_only);
+            }
+            const display = try result_aliases.display(alloc, &capability.*.?, handle);
+            defer alloc.free(display);
+            break :blk try result_store.formatStoredResultOutput(alloc, display, result.preview orelse "", result.stored_output_bytes);
+        } else blk: {
             if (capability.* == null) {
                 const path = try io_mod.dirRealpathAlloc(alloc, dir.dir, ".");
                 defer alloc.free(path);

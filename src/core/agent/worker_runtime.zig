@@ -25,6 +25,7 @@ const text_utils = @import("../shared/text_utils.zig");
 
 pub const AgentTurnSettings = struct {
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
+    short_tool_result_handles: bool = false,
     auto_compact_percent: u8 = compactor.default_percent,
     first_call_tool_choice: types.ToolChoice = .auto,
     fast_mode: bool = false,

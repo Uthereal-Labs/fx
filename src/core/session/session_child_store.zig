@@ -87,6 +87,7 @@ pub const Blobs = struct {
     pub const Hash = [artifact_digest.blob_hex_bytes]u8;
 
     pub const VTable = struct {
+        owner_id: *const fn (ctx: *anyopaque) []const u8,
         put: *const fn (ctx: *anyopaque, bytes: []const u8) BlobError!Hash,
         /// The first `len` bytes of an open file outside the session.
         put_file: *const fn (ctx: *anyopaque, file: std.Io.File, len: u64) BlobError!Hash,
@@ -622,6 +623,7 @@ const CapabilityImpl = struct {
 /// `path` has a file.
 pub const MemoryBlobsForTesting = struct {
     alloc: Allocator,
+    owner_id: []const u8 = "test-owner",
     dir: ?[]const u8 = null,
     mutex: std.Io.Mutex = .init,
     bodies: std.StringHashMapUnmanaged([]u8) = .empty,
@@ -631,6 +633,7 @@ pub const MemoryBlobsForTesting = struct {
     puts: usize = 0,
 
     const vtable: Blobs.VTable = .{
+        .owner_id = ownerID,
         .put = put,
         .put_file = putFile,
         .put_record = putRecord,
@@ -676,6 +679,10 @@ pub const MemoryBlobsForTesting = struct {
 
     fn from(ctx: *anyopaque) *MemoryBlobsForTesting {
         return @ptrCast(@alignCast(ctx));
+    }
+
+    fn ownerID(ctx: *anyopaque) []const u8 {
+        return from(ctx).owner_id;
     }
 
     fn put(ctx: *anyopaque, bytes: []const u8) BlobError!Blobs.Hash {
@@ -782,6 +789,15 @@ pub const MemoryBlobsForTesting = struct {
 
 pub const SessionChildCapability = struct {
     impl: *CapabilityImpl,
+
+    pub fn ownerID(self: *const SessionChildCapability) []const u8 {
+        if (self.impl.blobs) |blobs| return blobs.vtable.owner_id(blobs.ctx);
+        const path = if (self.impl.legacy_direct_kind != null)
+            std.Io.Dir.path.dirname(self.impl.display_session_path) orelse self.impl.display_session_path
+        else
+            self.impl.display_session_path;
+        return std.Io.Dir.path.basename(path);
+    }
 
     pub fn duplicate(
         self: *const SessionChildCapability,

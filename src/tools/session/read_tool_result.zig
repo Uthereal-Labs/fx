@@ -1,5 +1,6 @@
 const std = @import("std");
 const result_store = @import("../../core/session/result_store.zig");
+const result_aliases = @import("../../core/session/result_aliases.zig");
 const command_replay_store = @import("../../core/session/command_replay_store.zig");
 const session_child_store = @import("../../core/session/session_child_store.zig");
 const io_mod = @import("../../core/shared/io.zig");
@@ -212,7 +213,7 @@ fn readOutput(ctx: tool_dispatch.DispatchContext, input: *Input) ![]u8 {
             .search => unreachable,
         };
         return ordinary catch |err| switch (err) {
-            error.ResultHandleNotFound => switch (input.selector) {
+            error.ResultHandleNotFound => if (result_aliases.isAlias(input.handle)) return err else switch (input.selector) {
                 .query => |query| command_replay_store.searchAgentQueryManaged(
                     ctx.allocator,
                     capability,
@@ -233,6 +234,14 @@ fn readOutput(ctx: tool_dispatch.DispatchContext, input: *Input) ![]u8 {
         };
     }
 
+    if (result_aliases.isAlias(input.handle)) {
+        const dir = ctx.tool_result_dir orelse return error.UnknownResultAlias;
+        return switch (input.selector) {
+            .query => |query| result_store.searchByQuery(ctx.allocator, dir, input.handle, query),
+            .range => |range| result_store.readByRange(ctx.allocator, dir, input.handle, range.start_byte, range.byte_count),
+            .search => unreachable,
+        };
+    }
     if (ctx.ephemeral_command_replay) |store| {
         return switch (input.selector) {
             .query => |query| command_replay_store.searchAgentQueryEphemeral(
@@ -277,6 +286,21 @@ pub fn readsOnly(_: tool_dispatch.ToolInput) bool {
 
 pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
     return false;
+}
+
+test "short result aliases never fall through to command replay when their artifact is unavailable" {
+    const alloc = std.testing.allocator;
+    var memory = session_child_store.MemoryBlobsForTesting.init(alloc);
+    defer memory.deinit();
+    var capability = try session_child_store.SessionChildCapability.initBlobs(alloc, memory.blobs(), "", .writable);
+    defer capability.deinit();
+    const alias = try result_aliases.register(alloc, &capability, "result-missing.txt");
+    defer alloc.free(alias);
+    var input: Input = .{ .handle = alias };
+    try std.testing.expectError(error.ResultHandleNotFound, readOutput(.{ .allocator = alloc, .session_child_capability = &capability }, &input));
+    input.handle = @constCast("Fforeign:1");
+    try std.testing.expectError(error.UnknownResultAlias, readOutput(.{ .allocator = alloc, .session_child_capability = &capability }, &input));
+    try std.testing.expectError(error.UnknownResultAlias, readOutput(.{ .allocator = alloc }, &input));
 }
 
 test "read_tool_result decodes range and query inputs" {

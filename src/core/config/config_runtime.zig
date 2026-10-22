@@ -47,6 +47,7 @@ pub const Settings = struct {
     yolo_acknowledged: ?bool = null,
     max_agent_steps: ?usize = null,
     max_tool_result_bytes: ?usize = null,
+    short_tool_result_handles: ?bool = null,
     /// Share of usable input, 10 to 80 percent, at which automatic
     /// compaction starts. Profile-only.
     auto_compact_percent: ?u8 = null,
@@ -1642,6 +1643,10 @@ fn parseProfileOnlyFields(
     tolerate_non_object_user_containers: bool,
     parse_workspace_statusline: bool,
 ) !void {
+    if (root.object.get("short_tool_result_handles")) |value| {
+        if (value != .bool) return error.InvalidShortToolResultHandlesType;
+        settings.short_tool_result_handles = value.bool;
+    }
     if (root.object.contains("skill_match_fuzzy")) return error.RetiredSkillMatchFuzzy;
     if (root.object.get("auto_compact_percent")) |value| {
         if (value != .integer) return error.InvalidAutoCompactPercentType;
@@ -1965,6 +1970,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.yolo_acknowledged) |value| target.yolo_acknowledged = value;
     if (incoming.max_agent_steps) |value| target.max_agent_steps = value;
     if (incoming.max_tool_result_bytes) |value| target.max_tool_result_bytes = value;
+    if (incoming.short_tool_result_handles) |value| target.short_tool_result_handles = value;
     if (incoming.auto_compact_percent) |value| target.auto_compact_percent = value;
     target.context_limits.merge(incoming.context_limits);
     if (incoming.first_call_tool_choice) |value| target.first_call_tool_choice = value;
@@ -2716,6 +2722,22 @@ test "max_tool_result_bytes parses resolves merges and serializes" {
     const json = try serializeJsonObject(std.testing.allocator, parsed.value);
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.find(u8, json, "\"max_tool_result_bytes\":131072") != null);
+}
+
+test "short result handles are profile-only and default off" {
+    const alloc = std.testing.allocator;
+    var absent = try parseSettingsJson(alloc, "{}");
+    defer absent.deinit(alloc);
+    try std.testing.expect(absent.short_tool_result_handles == null);
+    var enabled = try parseSettingsJson(alloc, "{\"short_tool_result_handles\":true}");
+    defer enabled.deinit(alloc);
+    try std.testing.expectEqual(true, enabled.short_tool_result_handles.?);
+    try mergeSettings(&absent, &enabled, alloc);
+    try std.testing.expectEqual(true, absent.short_tool_result_handles.?);
+    var project = try parseSettingsJsonForLayer(alloc, "{\"short_tool_result_handles\":true}", .project);
+    defer project.deinit(alloc);
+    try std.testing.expect(project.short_tool_result_handles == null);
+    try std.testing.expectError(error.InvalidShortToolResultHandlesType, parseSettingsJson(alloc, "{\"short_tool_result_handles\":1}"));
 }
 
 test "max_tool_result_bytes rejects non-positive caps" {
