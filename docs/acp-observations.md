@@ -117,6 +117,40 @@ adapter can extract that parent before creating its transport span. These header
 are separate from the model body, so they do not alter request-body digests.
 The tracing contract carries no exporter credentials.
 
+## Delegated execution with version 3
+
+Request `version: 3` with the same trace and capture options to observe delegated
+children. Require the version 3 acknowledgement before consuming this contract.
+Each envelope adds a required `work_id`: `null` for root events and the native
+work identity for child events. `session_id` identifies the emitting root or
+child session. The sequence remains connection-wide across concurrent children.
+
+| Additional event | Data |
+| --- | --- |
+| `child.started` | `root_session_id`, `parent_session_id`, and the originating `tool_call_id`. |
+| `child.finished` | `outcome` (`completed`, `failed`, or `cancelled`) and nullable `error_type`. |
+
+The lifecycle envelopes identify a fresh child execution span parented to the
+exact native `subagent` tool span. Both use `turn_id: 0`, `step_id: 0`, and
+`attempt: null`. Registration precedes worker startup; completion follows the
+worker's final native observation. A startup failure after registration emits a
+failed completion. A yielded parent receipt leaves the child span open until
+the worker finishes. Replaying completed work creates no worker or child span.
+
+Child model attempts and tools retain their own native coordinates and parent
+to the child execution span. Model HTTP headers identify the exact model span;
+MCP call metadata identifies the exact tool span. Trace state belongs to the
+live worker and is never written into session or queued-work records. A resumed
+execution uses the current connection's trace context.
+
+Hosts should bind the root session from the successful ACP session operation,
+register children only beneath an observed delegation call, and validate each
+child's session, work identity, and ancestry. Current delegation permits direct
+root children. Unknown children, sequence gaps, unmatched completions, and
+unfinished descendants prevent a complete trace. Only root model output should
+update the root answer. Hosts with an authenticated model adapter can also
+compare its admitted calls with native observations to detect a missing stream.
+
 ## Verify the built binary
 
 Build from the repository root, then run the provider-free driver:
@@ -137,7 +171,13 @@ engines, model HTTP headers, content opt-out, and invalid-context fallback. Writ
 an actual version 2 capture with `--observations-v2-output /tmp/fx-observations.v2.json`.
 The multi-call case checks separate MCP receipts;
 dynamic MCP tools execute sequentially in this fixture. It does not exercise
-the runtime's parallel builtin-tool branch.
+the runtime's parallel builtin-tool branch in the version 2 case.
+
+Version 3 cases exercise concurrent native children, cold MCP discovery on both
+engines, exact model and MCP parents, child steering, completed-work replay, and
+cancellation. Managed-owner tests cover trace context across yielded work.
+Save an actual child capture with
+`--observations-v3-output /tmp/fx-observations.v3.json`.
 
 Focused native unit tests can run with:
 
