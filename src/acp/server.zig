@@ -369,7 +369,8 @@ pub const ServerState = struct {
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
     host_tools: host_tool_runtime.Runtime = .{},
     observation_options: observations.Options = .{},
-    observation_sequence: std.atomic.Value(u64) = .init(0),
+    /// Protected by observation_mutex, including allocation and frame emission.
+    observation_sequence: u64 = 0,
     observation_mutex: std.Io.Mutex = .init,
     host_instructions: []u8 = &.{},
     outbound_mutex: std.Io.Mutex = .init,
