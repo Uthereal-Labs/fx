@@ -1926,7 +1926,8 @@ fn emitObservationJson(state: *server.ServerState, context: observations.Context
     if (state.observation_options.version >= 2 and context.span == null) return;
     var out = std.Io.Writer.Allocating.init(state.alloc);
     defer out.deinit();
-    try std.json.Stringify.value(.{ .version = state.observation_options.version, .sequence = state.observation_sequence.fetchAdd(1, .monotonic) + 1, .session_id = context.session_id orelse return, .turn_id = context.trace.turn_id, .step_id = context.trace.step_id, .attempt = context.attempt, .timestamp_ms = io_mod.milliTimestamp() }, .{}, &out.writer);
+    state.observation_sequence += 1;
+    try std.json.Stringify.value(.{ .version = state.observation_options.version, .sequence = state.observation_sequence, .session_id = context.session_id orelse return, .turn_id = context.trace.turn_id, .step_id = context.trace.step_id, .attempt = context.attempt, .timestamp_ms = io_mod.milliTimestamp() }, .{}, &out.writer);
     // Add a tagged data object without serializing opaque runtime state.
     out.writer.end -= 1;
     if (state.observation_options.version == 3) {
