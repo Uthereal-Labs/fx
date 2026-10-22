@@ -316,6 +316,232 @@ class ObservationTest(unittest.TestCase):
         self.assertEqual(len(request["content_sha256"]), 64)
 
 
+class ChildObservationTest(unittest.TestCase):
+    observations_v3_output: Path | None = None
+
+    def exercise(self, *, engine: str = "v1", mode: str = "concurrent", enabled: bool = True, version: int = 3, parent: str = ROOT_TRACEPARENT, capture: bool = True) -> dict:
+        receipts: list[dict] = []
+        counters: dict[str, int] = {}
+        both_children = threading.Barrier(2)
+        provider_started = threading.Event()
+        release_child = threading.Event()
+        child_count = 2 if mode in {"concurrent", "replay"} else 1
+
+        class Provider(BaseHTTPRequestHandler):
+            def log_message(self, *_: object) -> None:
+                pass
+
+            def do_POST(self) -> None:
+                raw = self.rfile.read(int(self.headers["Content-Length"]))
+                body = json.loads(raw)
+                users = " ".join(str(m.get("content", "")) for m in body["messages"] if m["role"] == "user")
+                scope = next((name for name in ("CHILD_A_FIXTURE", "CHILD_B_FIXTURE") if name in users), "root")
+                index = counters.get(scope, 0)
+                counters[scope] = index + 1
+                receipts.append({"scope": scope, "index": index, "body": raw, "headers": {k.lower(): v for k, v in self.headers.items()}, "tools": [t["function"]["name"] for t in body.get("tools", [])]})
+                child = scope != "root"
+                calls: list[dict] = []
+                if not child and (index == 0 or mode == "replay" and index == 1):
+                    for i in range(child_count):
+                        calls.append({"index": i, "id": f"delegate_{i}", "type": "function", "function": {"name": "subagent", "arguments": json.dumps({"request": {"action": "run", "task": f"CHILD_{chr(65 + i)}_FIXTURE: discover the echo fixture and read its value."}})}})
+                elif child and index == 0:
+                    if child_count == 2:
+                        both_children.wait(timeout=10)
+                    calls.append({"index": 0, "id": f"discover_{scope}", "type": "function", "function": {"name": "capability_search", "arguments": json.dumps({"server": "koi_test", "query": "echo"})}})
+                elif child and index == 1:
+                    calls.append({"index": 0, "id": f"echo_{scope}", "type": "function", "function": {"name": "mcp_koi_test_echo", "arguments": "{}"}})
+                delta = {"tool_calls": calls} if calls else {"content": "CHILD_DONE" if child else "ROOT_DONE"}
+                output = "".join("data: " + json.dumps(event) + "\n\n" for event in [
+                    {"id": "fixture", "model": "local-model", "choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
+                    {"id": "fixture", "model": "local-model", "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls" if calls else "stop"}]},
+                    {"id": "fixture", "model": "local-model", "choices": [], "usage": {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15}},
+                ]) + "data: [DONE]\n\n"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(output.encode())))
+                self.end_headers()
+                if child and index == 0 and mode in {"cancel", "yield"}:
+                    provider_started.set()
+                    release_child.wait(timeout=15)
+                try:
+                    self.wfile.write(output.encode())
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        with tempfile.TemporaryDirectory(prefix="fx-child-observations-") as directory:
+            root = Path(directory)
+            home, workspace = root / "home", root / "workspace"
+            (home / ".fx").mkdir(parents=True)
+            workspace.mkdir()
+            mcp_path = root / "mcp.jsonl"
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            settings = {
+                "provider": "local", "auto_upgrade": False, "session_titles": False,
+                "permission": {"*": "deny", "subagent": "allow", "capability_search": "allow", "mcp_koi_test_echo": "allow"},
+                "providers": {"local": {"protocol": "openai-chat-completions", "base_url": f"http://127.0.0.1:{server.server_port}/v1", "auth": {"type": "none"}, "model_metadata": {"local-model": {"context_window": 262144, "max_output_tokens": 8192, "supports_tool_use": True}}}},
+                "models": {"local": "local-model"},
+            }
+            (home / ".fx/settings.json").write_text(json.dumps(settings))
+            environment = {"HOME": str(home), "PATH": os.defpath, "FX_AUTO_UPGRADE": "0", "FX_SOUND": "0", "FX_SESSIONS_V2": "1", "FX_DISABLE_KEYCHAIN": "1", "FX_MCP_ENGINE": engine}
+            process = subprocess.Popen([str(ObservationTest.binary.resolve()), "acp"], cwd=workspace, env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            frames: list[dict] = []
+            lines: queue.Queue[str] = queue.Queue()
+            def consume() -> None:
+                for line in process.stdout:
+                    lines.put(line)
+            threading.Thread(target=consume, daemon=True).start()
+            def send(identifier: int | None, method: str, params: dict) -> None:
+                message = {"jsonrpc": "2.0", "method": method, "params": params}
+                if identifier is not None:
+                    message["id"] = identifier
+                process.stdin.write(json.dumps(message) + "\n")
+                process.stdin.flush()
+            def receive(identifier: int) -> dict:
+                while True:
+                    message = json.loads(lines.get(timeout=30))
+                    frames.append(message)
+                    if message.get("id") == identifier:
+                        self.assertNotIn("error", message)
+                        return message["result"]
+                    self.assertFalse("id" in message, "Unexpected permission request")
+            try:
+                options = {"version": version, "capture_content": capture, "max_content_bytes": 262144, "traceparent": parent, "tracestate": "vendor=value"}
+                send(1, "initialize", {"protocolVersion": 1, "clientCapabilities": {}, **({"_meta": {"fx": {"observations": options}}} if enabled else {})})
+                initialized = receive(1)
+                send(2, "session/new", {"cwd": str(workspace), "mcpServers": [{"name": "koi_test", "command": sys.executable, "args": [str(Path(__file__).resolve()), "--mcp-fixture", "--trace-output", str(mcp_path)], "env": [], "_meta": {"fx": {"alwaysLoaded": False}}}], "_meta": {"fx": {"hooks": {"captureContent": False}}}})
+                session = receive(2)
+                send(3, "session/prompt", {"sessionId": session["sessionId"], "prompt": [{"type": "text", "text": "ROOT_FIXTURE: delegate the bounded independent tasks concurrently."}]})
+                steered = False
+                cancelled = False
+                responses: dict[int, dict] = {}
+                while 3 not in responses or steered and 4 not in responses:
+                    message = json.loads(lines.get(timeout=30))
+                    frames.append(message)
+                    self.assertNotIn("error", message)
+                    if message.get("id") in {3, 4}:
+                        responses[message["id"]] = message["result"]
+                    elif "id" in message:
+                        self.fail("Unexpected permission request")
+                    observation = message.get("params", {}) if message.get("method") == "fx/observation" else {}
+                    if mode in {"cancel", "yield"} and observation.get("event", {}).get("kind") == "model.request" and observation.get("work_id") is not None and not steered and not cancelled:
+                        self.assertTrue(provider_started.wait(timeout=5))
+                        if mode == "cancel":
+                            send(None, "session/cancel", {"sessionId": session["sessionId"]})
+                            cancelled = True
+                        else:
+                            send(4, "session/prompt", {"sessionId": session["sessionId"], "prompt": [{"type": "text", "text": "Steer the root while the delegated worker continues."}], "_meta": {"fx": {"steer": True}}})
+                            steered = True
+                            threading.Timer(0.2, release_child.set).start()
+                    if mode == "yield" and observation.get("event", {}).get("kind") == "tool.finished" and observation["event"]["data"]["tool_name"] == "subagent":
+                        release_child.set()
+                release_child.set()
+                process.stdin.close()
+                self.assertEqual(process.wait(timeout=10), 0)
+                self.assertEqual(process.stderr.read(), "")
+            finally:
+                release_child.set()
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+                server.shutdown()
+                server.server_close()
+                if not process.stdin.closed:
+                    process.stdin.close()
+                process.stdout.close()
+                process.stderr.close()
+            observations = [f["params"] for f in frames if f.get("method") == "fx/observation"]
+            mcp = [json.loads(line) for line in mcp_path.read_text().splitlines()] if mcp_path.exists() else []
+            return {"observations": observations, "receipts": receipts, "mcp": mcp, "root": session["sessionId"], "result": responses[3], "initialized": initialized, "frames": frames}
+
+    def test_v3_concurrent_children_keep_exact_model_and_mcp_parents(self) -> None:
+        for engine in ("v1", "v2"):
+            with self.subTest(engine=engine):
+                run = self.exercise(engine=engine)
+                events = run["observations"]
+                starts = [v for v in events if v["event"]["kind"] == "child.started"]
+                ends = [v for v in events if v["event"]["kind"] == "child.finished"]
+                self.assertEqual((len(starts), len(ends), len(run["mcp"])), (2, 2, 2))
+                self.assertEqual([v["sequence"] for v in events], list(range(1, len(events) + 1)))
+                self.assertEqual(len({v["session_id"] for v in starts}), 2)
+                self.assertLess(max(v["sequence"] for v in starts), min(v["sequence"] for v in ends))
+                spans = {v["trace"]["span_id"]: v for v in events if v["event"]["kind"] in {"model.request", "tool.started", "child.started"}}
+                models = [v for v in events if v["event"]["kind"] == "model.request"]
+                self.assertEqual(len(models), len(run["receipts"]))
+                for event in starts:
+                    dispatcher = spans[event["trace"]["parent_span_id"]]
+                    self.assertEqual(dispatcher["event"]["data"]["tool_name"], "subagent")
+                    self.assertEqual(dispatcher["event"]["data"]["tool_call_id"], event["event"]["data"]["tool_call_id"])
+                    self.assertEqual(event["event"]["data"]["root_session_id"], run["root"])
+                    self.assertEqual(event["event"]["data"]["parent_session_id"], run["root"])
+                    terminal = next(v for v in ends if v["session_id"] == event["session_id"])
+                    for key in ("trace", "work_id", "turn_id", "step_id", "attempt"):
+                        self.assertEqual(event[key], terminal[key])
+                    self.assertEqual((event["turn_id"], event["step_id"], event["attempt"]), (0, 0, None))
+                    self.assertEqual(terminal["event"]["data"]["outcome"], "completed")
+                    descendants = [v for v in events if v["session_id"] == event["session_id"] and v["event"]["kind"] not in {"child.started", "child.finished"}]
+                    self.assertTrue(descendants)
+                    for child in descendants:
+                        self.assertEqual(child["work_id"], event["work_id"])
+                        self.assertEqual(child["trace"]["parent_span_id"], event["trace"]["span_id"])
+                        self.assertLess(event["sequence"], child["sequence"])
+                        self.assertLess(child["sequence"], terminal["sequence"])
+                for receipt in run["receipts"]:
+                    model = next(v for v in models if v["event"]["data"]["request"]["sha256"] == hashlib.sha256(receipt["body"]).hexdigest())
+                    self.assertEqual(receipt["headers"]["traceparent"], f"00-{model['trace']['trace_id']}-{model['trace']['span_id']}-01")
+                    self.assertEqual(receipt["headers"]["tracestate"], "vendor=value")
+                    if receipt["index"] == 0:
+                        self.assertNotIn("mcp_koi_test_echo", receipt["tools"])
+                for call in run["mcp"]:
+                    span = spans[call["params"]["_meta"]["traceparent"].split("-")[2]]
+                    self.assertEqual(span["event"]["data"]["tool_name"], "mcp_koi_test_echo")
+                    self.assertIsNotNone(span["work_id"])
+                    self.assertEqual(call["params"]["_meta"]["tracestate"], "vendor=value")
+                if engine == "v1" and self.observations_v3_output is not None:
+                    self.observations_v3_output.write_text(json.dumps(events))
+
+    def test_v3_completed_replay_does_not_start_a_second_child_execution(self) -> None:
+        run = self.exercise(mode="replay")
+        self.assertEqual(sum(v["event"]["kind"] == "child.started" for v in run["observations"]), 2)
+        self.assertEqual(len(run["mcp"]), 2)
+        self.assertTrue(any(f.get("method") == "libfx/hook" and f["params"].get("type") == "delegation" and f["params"]["data"]["phase"] == "replayed" for f in run["frames"]))
+
+    def test_v3_cancel_finishes_child_and_all_native_descendants(self) -> None:
+        run = self.exercise(mode="cancel")
+        self.assertEqual(run["result"]["stopReason"], "cancelled")
+        events = run["observations"]
+        end = next(v for v in events if v["event"]["kind"] == "child.finished")
+        self.assertEqual(end["event"]["data"]["outcome"], "cancelled")
+        for event in events:
+            if event["event"]["kind"] in {"model.request", "tool.started", "child.started"}:
+                finish = {"model.request": "model.finished", "tool.started": "tool.finished", "child.started": "child.finished"}[event["event"]["kind"]]
+                self.assertTrue(any(v["event"]["kind"] == finish and v["trace"] == event["trace"] for v in events))
+
+    def test_v3_acp_steering_preserves_the_same_live_child_execution(self) -> None:
+        run = self.exercise(mode="yield")
+        events = run["observations"]
+        start = next(v for v in events if v["event"]["kind"] == "child.started")
+        dispatcher = next(v for v in events if v["event"]["kind"] == "tool.finished" and v["trace"]["span_id"] == start["trace"]["parent_span_id"])
+        end = next(v for v in events if v["event"]["kind"] == "child.finished")
+        self.assertLess(end["sequence"], dispatcher["sequence"])
+        self.assertEqual(sum(v["event"]["kind"] == "child.started" for v in events), 1)
+        self.assertEqual(len(run["mcp"]), 1)
+
+    def test_v3_opt_out_and_invalid_negotiation_do_not_change_delegated_work(self) -> None:
+        for options in ({"enabled": False}, {"version": 99}, {"parent": "malformed"}):
+            with self.subTest(options=options):
+                run = self.exercise(**options)
+                self.assertEqual(run["observations"], [])
+                self.assertEqual(len(run["mcp"]), 2)
+                self.assertTrue(all("traceparent" not in r["headers"] for r in run["receipts"]))
+        run = self.exercise(capture=False)
+        for event in run["observations"]:
+            if event["event"]["kind"] == "model.request":
+                self.assertIsNone(event["event"]["data"]["request"]["content_json"])
+            elif event["event"]["kind"] == "tool.started":
+                self.assertIsNone(event["event"]["data"]["arguments_json"])
+
+
 if __name__ == "__main__":
     if "--mcp-fixture" in sys.argv:
         mcp_fixture()
@@ -327,5 +553,9 @@ if __name__ == "__main__":
         if "--observations-v2-output" in sys.argv:
             index = sys.argv.index("--observations-v2-output")
             ObservationTest.observations_v2_output = Path(sys.argv[index + 1]).resolve()
+            del sys.argv[index:index + 2]
+        if "--observations-v3-output" in sys.argv:
+            index = sys.argv.index("--observations-v3-output")
+            ChildObservationTest.observations_v3_output = Path(sys.argv[index + 1]).resolve()
             del sys.argv[index:index + 2]
         unittest.main()
