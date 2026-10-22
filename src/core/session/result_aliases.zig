@@ -53,6 +53,16 @@ pub fn register(alloc: Allocator, capability: *child_store.SessionChildCapabilit
 }
 
 pub fn display(alloc: Allocator, capability: *child_store.SessionChildCapability, physical: []const u8) ![]u8 {
+    validateOwner(capability.ownerID()) catch |err| {
+        // Legacy creation replays history from an unpublished `creating+...`
+        // directory. It has no alias owner yet. Keep physical previews only
+        // when there is no registry to bypass or silently reinterpret.
+        if (capability.holdsBlobs()) return err;
+        var entries = try capability.iterate(alloc, .tool_results);
+        defer entries.deinit();
+        for (entries.names) |name| if (std.mem.startsWith(u8, name, record_prefix)) return err;
+        return alloc.dupe(u8, physical);
+    };
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const registry = try load(arena.allocator(), capability);
@@ -87,10 +97,14 @@ fn validatePhysical(physical: []const u8) !void {
     for (physical) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_' and byte != '.') return error.InvalidResultAlias;
 }
 
-fn load(alloc: Allocator, capability: *child_store.SessionChildCapability) !Registry {
-    const owner = capability.ownerID();
+fn validateOwner(owner: []const u8) !void {
     if (owner.len == 0 or owner.len > 128) return error.InvalidResultAliasOwner;
     for (owner) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_') return error.InvalidResultAliasOwner;
+}
+
+fn load(alloc: Allocator, capability: *child_store.SessionChildCapability) !Registry {
+    const owner = capability.ownerID();
+    try validateOwner(owner);
     const record_name = try recordName(alloc, owner);
     const bytes = if (capability.holdsBlobs())
         capability.readBlob(alloc, .tool_results, record_name, max_bytes) catch |err| switch (err) {
@@ -227,6 +241,28 @@ test "short result aliases survive reopening a legacy owner and reject changed o
     defer alloc.free(corrupt_path);
     try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = corrupt_path, .data = "{\"version\":1,\"owner\":\"foreign\",\"handles\":[\"result-legacy.txt\"]}" });
     try std.testing.expectError(error.InvalidResultAliasOwner, resolve(alloc, &reopened, alias));
+    try std.testing.expectError(error.InvalidResultAliasOwner, display(alloc, &reopened, "result-legacy.txt"));
+}
+
+test "short result display preserves unregistered legacy staging previews only" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io_mod.getIo(), "creating+temporary", std.Io.File.Permissions.fromMode(0o700));
+    var staging = try tmp.dir.openDir(io_mod.getIo(), "creating+temporary", .{ .iterate = true });
+    defer staging.close(io_mod.getIo());
+    const path = try io_mod.dirRealpathAlloc(alloc, staging, ".");
+    defer alloc.free(path);
+    var capability = try child_store.SessionChildCapability.init(alloc, staging, path, .writable);
+    defer capability.deinit();
+    const shown = try display(alloc, &capability, "saved-command-output.txt");
+    defer alloc.free(shown);
+    try std.testing.expectEqualStrings("saved-command-output.txt", shown);
+    try std.testing.expectError(error.InvalidResultAliasOwner, register(alloc, &capability, "result-one.txt"));
+    try std.testing.expectError(error.InvalidResultAliasOwner, resolve(alloc, &capability, "Ftemporary:1"));
+    var entry = try capability.atomicReplace(alloc, .tool_results, "tool-result-aliases-native-owner.json", "{}");
+    entry.deinit(alloc);
+    try std.testing.expectError(error.InvalidResultAliasOwner, display(alloc, &capability, "saved-command-output.txt"));
 }
 
 test "short result aliases report exhaustion without changing existing bindings" {

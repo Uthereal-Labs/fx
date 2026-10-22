@@ -18,4 +18,6 @@ Physical result handles, blobs, artifact references, content checks, byte ranges
 
 Each owner can register 4,096 results, within a 1 MiB mapping envelope. Exhaustion or an invalid mapping fails explicitly instead of recycling an alias or exposing a different result. Older results without an alias retain their original native handles.
 
+Legacy session creation temporarily replays history before its directory receives the native session ID. Physical previews remain readable during that step when no alias registry exists. Registration and resolution still require an exact valid owner; an existing registry never receives this fallback.
+
 The focused native tests cover owner separation, concurrent duplicate admission, reopening, retained-turn compaction, physical-byte preservation, range/query echoes, and rejection without command-replay fallback. The `sessions-v2.test.ts` scenario `short saved-result aliases preserve physical blobs and resume after profile opt-out` exercises the built binary through a local fake gateway. It makes no provider calls.
