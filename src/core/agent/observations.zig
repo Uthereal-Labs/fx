@@ -22,9 +22,9 @@ pub const Options = struct {
             if (!std.mem.eql(u8, key, "version") and !std.mem.eql(u8, key, "capture_content") and !std.mem.eql(u8, key, "max_content_bytes") and !std.mem.eql(u8, key, "traceparent") and !std.mem.eql(u8, key, "tracestate")) return error.InvalidObservationOptions;
         }
         const version = root.object.get("version") orelse return error.InvalidObservationOptions;
-        if (version != .integer or version.integer < 1 or version.integer > 2) return error.InvalidObservationOptions;
+        if (version != .integer or version.integer < 1 or version.integer > 3) return error.InvalidObservationOptions;
         var result = Options{ .enabled = true, .version = @intCast(version.integer) };
-        if (result.version == 2) {
+        if (result.version >= 2) {
             const parent = root.object.get("traceparent") orelse return error.InvalidObservationOptions;
             const state = root.object.get("tracestate");
             if (parent != .string or state != null and state.? != .string) return error.InvalidObservationOptions;
@@ -96,7 +96,18 @@ pub const ToolFinished = struct {
     output_omitted: bool,
     error_type: ?[]const u8,
 };
+pub const ChildStarted = struct {
+    root_session_id: []const u8,
+    parent_session_id: []const u8,
+    tool_call_id: []const u8,
+};
+pub const ChildFinished = struct {
+    outcome: enum { completed, failed, cancelled },
+    error_type: ?[]const u8,
+};
 pub const Event = union(enum) {
+    child_started: ChildStarted,
+    child_finished: ChildFinished,
     tool_started: ToolStarted,
     tool_finished: ToolFinished,
     model_request: ModelRequest,
@@ -109,21 +120,55 @@ pub const RequestDetails = struct {
     max_output_tokens: ?u32 = null,
     provider_options: model_capabilities.ResolvedProviderOptions = .{},
 };
-pub const Context = struct { trace: trace.TraceContext, attempt: ?u32 = null, span: ?TraceContext = null };
+pub const Context = struct {
+    trace: trace.TraceContext,
+    attempt: ?u32 = null,
+    span: ?TraceContext = null,
+    session_id: ?[]const u8 = null,
+    work_id: ?[]const u8 = null,
+};
 pub const Sink = struct {
     context: ?*anyopaque = null,
     emit_fn: ?*const fn (*anyopaque, Context, Event) void = null,
     options: Options = .{},
+    session_id: ?[]const u8 = null,
+    work_id: ?[]const u8 = null,
 
     pub fn enabled(self: Sink) bool {
         return self.options.enabled and self.emit_fn != null and self.context != null;
     }
     pub fn emit(self: Sink, context: Context, event: Event) void {
-        if (self.enabled()) self.emit_fn.?(self.context.?, context, event);
+        if (!self.enabled()) return;
+        var identified = context;
+        identified.session_id = context.session_id orelse self.session_id;
+        identified.work_id = context.work_id orelse self.work_id;
+        self.emit_fn.?(self.context.?, identified, event);
     }
+    /// The caller owns the child and work IDs until finishChild returns.
+    pub fn beginChild(self: Sink, child_id: []const u8, work_id: []const u8, call_id: []const u8) Sink {
+        if (!self.enabled() or self.options.version != 3) return .{};
+        const parent = self.options.parent orelse return .{};
+        const root_id = self.session_id orelse return .{};
+        var child = self;
+        child.session_id = child_id;
+        child.work_id = work_id;
+        child.options.parent = parent.child();
+        child.emit(.{ .trace = .{}, .span = child.options.parent }, .{ .child_started = .{
+            .root_session_id = root_id,
+            .parent_session_id = root_id,
+            .tool_call_id = call_id,
+        } });
+        return child;
+    }
+
+    pub fn finishChild(self: Sink, outcome: ChildFinished) void {
+        if (self.options.version != 3 or self.work_id == null) return;
+        self.emit(.{ .trace = .{}, .span = self.options.parent }, .{ .child_finished = outcome });
+    }
+
     pub fn beginTool(self: Sink, context: Context, call: types.ToolCall) Context {
         var current = context;
-        if (!self.enabled() or self.options.version != 2) return current;
+        if (!self.enabled() or self.options.version < 2) return current;
         current.span = if (context.span) |parent| parent.child() else if (self.options.parent) |parent| parent.child() else return current;
         const omitted = !self.options.capture_content or call.arguments_json.len > self.options.max_content_bytes;
         var hash = hashText(call.arguments_json);
@@ -139,7 +184,7 @@ pub const Sink = struct {
     }
 
     pub fn finishTool(self: Sink, context: Context, call: types.ToolCall, output: ?[]const u8, failed: bool, cancelled: bool, error_type: ?[]const u8) void {
-        if (context.span == null or self.options.version != 2) return;
+        if (context.span == null or self.options.version < 2) return;
         var hash: [64]u8 = undefined;
         if (output) |text| hash = hashText(text);
         const omitted = !self.options.capture_content or output == null or output.?.len > self.options.max_content_bytes;

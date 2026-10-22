@@ -101,6 +101,7 @@ pub const ModelOverrideResolver = struct {
 };
 
 pub const ExecuteOptions = struct {
+    observation_sink: @import("../agent/observations.zig").Sink = .{},
     observer: ?*execution_observation.Observer = null,
     caller_id: []const u8,
     invocation_id: []const u8,
@@ -394,7 +395,6 @@ pub const Runtime = struct {
                             });
                         },
                         .ready => |ready| {
-                            if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = ready.child_id, .work_id = operation_id, .phase = .dispatched } });
                             const result = self.observeManagedState(
                                 alloc,
                                 ready.child_id,
@@ -564,7 +564,13 @@ pub const Runtime = struct {
         if (admitted == .ready) {
             const child_id = admitted.ready.child_id;
             try self.retainYielded(child_id, operation_id, options.max_result_bytes, if (options.steering_worker != null) 64 else child_state.max_children);
-            _ = self.managed.start(child_id) catch |err| {
+            if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = child_id, .work_id = operation_id, .phase = .dispatched } });
+            _ = self.managed.start(child_id, .{
+                .sink = options.observation_sink,
+                .work_id = operation_id,
+                .tool_call_id = options.invocation_id,
+            }) catch |err| {
+                if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = child_id, .work_id = operation_id, .phase = .failed } });
                 debug_trace.eventf("subagent", "steering_wait_registration_dropped", .{}, "child_id={s} work_id={s} reason=start_failed error={s}", .{ child_id, operation_id, @errorName(err) });
                 self.removeYielded(child_id, operation_id);
                 return err;
@@ -811,6 +817,9 @@ pub const Runtime = struct {
                     self.managed.cancel(child_id) catch |err| switch (err) {
                         error.ChildUnavailable => {},
                     };
+                    // Complete the child's native observations before the caller
+                    // can finish its root turn and release connection ownership.
+                    self.managed.cancelAndJoin(child_id);
                     return error.Cancelled;
                 }
             }
@@ -1530,7 +1539,21 @@ fn checkObservationFailureBookkeeping(fail_publication: bool) !void {
         entered: std.Io.Event = .unset,
         release: std.Io.Event = .unset,
         publication_failures: usize = 0,
+        starts: usize = 0,
+        finishes: usize = 0,
+        bad_identity: bool = false,
+        expected_work: []const u8 = "",
         cancel: ?*std.atomic.Value(bool) = null,
+
+        fn observe(raw: *anyopaque, context: @import("../agent/observations.zig").Context, event: @import("../agent/observations.zig").Event) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (context.session_id == null or context.work_id == null or !std.mem.eql(u8, context.work_id.?, self.expected_work)) self.bad_identity = true;
+            switch (event) {
+                .child_started => self.starts += 1,
+                .child_finished => self.finishes += 1,
+                else => {},
+            }
+        }
 
         fn resolve(_: ?*anyopaque, alloc: Allocator, _: []const u8) authority.HostResolveError!authority.HostAuthority {
             return authority.HostAuthority.capture(alloc, &.{}, &.{}, .{}, &.{});
@@ -1599,7 +1622,22 @@ fn checkObservationFailureBookkeeping(fail_publication: bool) !void {
     defer registry.deinit(alloc);
     try std.testing.expectEqual(child_state.Phase.running, registry.findById(child_id).?.phase);
     if (fail_publication) runtime.managed.state_store.options.replace_ops = .{ .ctx = &fixture, .sync_file = Fixture.failSync };
-    try std.testing.expectEqual(managed_owner.StartResult.started, try runtime.managed.start(child_id));
+    fixture.expected_work = work_id;
+    const caller_work = try alloc.dupe(u8, work_id);
+    const started = runtime.managed.start(child_id, .{
+        .sink = .{
+            .context = &fixture,
+            .emit_fn = Fixture.observe,
+            .session_id = runtime.root_id,
+            .options = .{ .enabled = true, .version = 3, .parent = try @import("../shared/trace_context.zig").TraceContext.parse("00-0123456789abcdef0123456789abcdef-0123456789abcdef-01", null) },
+        },
+        .work_id = caller_work,
+        .tool_call_id = "observed_handoff",
+    });
+    alloc.free(caller_work);
+    try std.testing.expectEqual(managed_owner.StartResult.started, try started);
+    try std.testing.expectEqual(@as(usize, 1), fixture.starts);
+    try std.testing.expectEqual(@as(usize, 0), fixture.finishes);
     try fixture.entered.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(1000) } });
     try std.testing.expect(runtime.managed.hasRunningChild(child_id));
     try std.testing.expect(!runtime.managed.hasRunningChild("other-child"));
@@ -1646,6 +1684,8 @@ fn checkObservationFailureBookkeeping(fail_publication: bool) !void {
         try std.testing.expect(!runtime.managed.hasRunningWork());
         try std.testing.expect(!try runtime.waitYielded(&worker));
     }
+    try std.testing.expectEqual(@as(usize, 1), fixture.finishes);
+    try std.testing.expect(!fixture.bad_identity);
 }
 
 test "subagent observation failure drops unpublished completed work" {
