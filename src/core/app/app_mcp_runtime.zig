@@ -2660,6 +2660,7 @@ pub const State = struct {
     ) ![][]u8 {
         if (self.leaseHost()) |l| {
             defer l.deinit();
+            try l.host.catalog.prepareDelegation(null);
             return l.host.catalog.snapshotToolNames(alloc, permission_rules);
         }
         var lease = self.acquire() orelse return alloc.alloc([]u8, 0);

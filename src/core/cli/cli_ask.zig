@@ -4025,6 +4025,7 @@ fn resolveAskSubagentAuthority(
     if (ctx.mcp != null) {
         _ = activateAskMcp(ctx) catch return error.HostAuthorityUnavailable;
     }
+    if (ctx.mcp_host) |h| try h.catalog.prepareDelegation(ctx.cancelFlag());
     const integrations = if (ctx.mcp_host) |h|
         h.catalog.snapshotToolNames(alloc, ctx.permission_rules)
     else if (ctx.mcp) |mcp|
