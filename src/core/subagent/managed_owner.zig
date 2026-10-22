@@ -1,4 +1,5 @@
 const std = @import("std");
+const observations = @import("../agent/observations.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const approval_registry = @import("approval_registry.zig");
 const authority = @import("authority.zig");
@@ -29,9 +30,17 @@ pub const Observation = struct {
     metrics: live_metrics.Snapshot = .{},
 };
 
+pub const StartObservation = struct {
+    sink: observations.Sink = .{},
+    work_id: []const u8 = "",
+    tool_call_id: []const u8 = "",
+};
+
 const Slot = struct {
     owner: *Owner,
     child_id: []u8,
+    observation_sink: observations.Sink = .{},
+    trace_work_id: ?[]u8 = null,
     metrics: live_metrics.LiveMetrics = .{},
     cancel: std.atomic.Value(bool) = .init(false),
     shutdown: std.atomic.Value(bool) = .init(false),
@@ -216,7 +225,7 @@ pub const Owner = struct {
         return false;
     }
 
-    pub fn start(self: *Owner, child_id: []const u8) StartError!StartResult {
+    pub fn start(self: *Owner, child_id: []const u8, observation: StartObservation) StartError!StartResult {
         start_attempt: while (true) {
             const finished = blk: {
                 self.mutex.lockUncancelable(io_mod.getIo());
@@ -248,8 +257,15 @@ pub const Owner = struct {
                 errdefer self.alloc.free(slot.child_id);
                 try self.slots.append(self.alloc, slot);
                 errdefer _ = self.slots.pop();
-                slot.thread = std.Thread.spawn(.{}, slotMain, .{slot}) catch
+                if (observation.sink.enabled() and observation.sink.options.version == 3) {
+                    slot.trace_work_id = try self.alloc.dupe(u8, observation.work_id);
+                    slot.observation_sink = observation.sink.beginChild(slot.child_id, slot.trace_work_id.?, observation.tool_call_id);
+                }
+                errdefer if (slot.trace_work_id) |id| self.alloc.free(id);
+                slot.thread = std.Thread.spawn(.{}, slotMain, .{slot}) catch {
+                    slot.observation_sink.finishChild(.{ .outcome = .failed, .error_type = "ThreadSpawnFailed" });
                     return error.ThreadSpawnFailed;
+                };
                 return .started;
             };
             destroySlot(self, finished);
@@ -449,6 +465,7 @@ pub const Owner = struct {
 
 fn destroySlot(owner: *Owner, slot: *Slot) void {
     if (slot.thread) |thread| thread.join();
+    if (slot.trace_work_id) |id| owner.alloc.free(id);
     owner.mutex.lockUncancelable(io_mod.getIo());
     while (slot.waiters != 0) owner.waiters_changed.waitUncancelable(io_mod.getIo(), &owner.mutex);
     owner.mutex.unlock(io_mod.getIo());
@@ -523,6 +540,14 @@ test "child feedback allocation failure preserves ownership" {
 fn slotMain(slot: *Slot) void {
     const owner = slot.owner;
     const outcome = runOne(slot);
+    slot.observation_sink.finishChild(.{
+        .outcome = switch (outcome.outcome) {
+            .completed => .completed,
+            .cancelled, .interrupted => .cancelled,
+            .failed, .lost => .failed,
+        },
+        .error_type = if (outcome.outcome == .failed or outcome.outcome == .lost) "ChildExecutionFailed" else null,
+    });
     // Startup must not inspect the old slot between saved and in-memory completion.
     // Take owner before registry, matching cancellation and approval lock ordering.
     owner.mutex.lockUncancelable(io_mod.getIo());
@@ -566,6 +591,7 @@ fn runOne(slot: *Slot) OneOutcome {
     turn.phase_context = owner;
     turn.phase_fn = Owner.phaseTransition;
     turn.live_metrics = &slot.metrics;
+    turn.observation_sink = slot.observation_sink;
     owner.mutex.lockUncancelable(io_mod.getIo());
     slot.worker = turn.workerRuntime();
     slot.work_id = turn.active_work_id;

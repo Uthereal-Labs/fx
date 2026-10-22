@@ -245,6 +245,7 @@ pub const TurnContext = struct {
         child_state.Phase,
     ) anyerror!void = null,
     live_metrics: ?*live_metrics.LiveMetrics = null,
+    observation_sink: @import("../agent/observations.zig").Sink = .{},
     failure_diagnostic: ?types.ModelFailureDiagnostic = null,
     committed: bool = false,
 

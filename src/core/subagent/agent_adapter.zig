@@ -414,6 +414,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
     return .{
         .ctx = context,
         .observer = context.config.tool_context.observer,
+        .observation_sink = context.turn.observation_sink,
         .agent_stream_provider = context.config.tool_context.agent_stream_provider,
         .tool_registry = context.config.tool_context.tool_registry,
         .context_registry = context.config.context_registry,

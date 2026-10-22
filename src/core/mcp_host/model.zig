@@ -279,6 +279,21 @@ pub const Catalog = struct {
         return .{ .updated = .{ .name = try alloc.dupe(u8, name), .schema_json = projection.selected.model_output, .mcp_binding = current } };
     }
 
+    /// Load cold catalogs before capturing immutable child authority, without
+    /// selecting their schemas for the parent model. Existing bindings stay intact.
+    pub fn prepareDelegation(c: *Catalog, cancel: Cancel) Allocator.Error!void {
+        for (c.runtime.servers(), 0..) |server, i| {
+            if (cancel) |flag| if (flag.load(.acquire)) return;
+            if (server.held != null) continue;
+            c.mutex.lockUncancelable(c.io);
+            const cold = c.lists[i].state == .unknown;
+            c.mutex.unlock(c.io);
+            if (cold) c.refresh(i, cancel) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+            };
+        }
+    }
+
     /// The names of the tools in the lists the catalog has, owned by `alloc`.
     pub fn snapshotToolNames(c: *Catalog, alloc: Allocator, permission_rules: types.PermissionRuleSet) ![][]u8 {
         var names: std.ArrayList([]u8) = .empty;

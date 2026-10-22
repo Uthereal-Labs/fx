@@ -832,6 +832,7 @@ fn resolveSubagentAuthority(
     }
     state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
     defer state.subagent_authority_mutex.unlock(io_mod.getIo());
+    if (active.mcp_host) |h| try h.catalog.prepareDelegation(&active.cancel_flag);
     const integrations = if (active.mcp_host) |h|
         h.catalog.snapshotToolNames(alloc, active.permission_rules)
     else if (active.mcp) |mcp|

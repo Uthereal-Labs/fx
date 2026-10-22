@@ -420,6 +420,15 @@ const AcpContext = struct {
         try self.sendUpdate(out.writer.buffered());
     }
 
+    fn observationSink(self: *AcpContext) observations.Sink {
+        return .{
+            .context = @ptrCast(self.state),
+            .emit_fn = emitObservation,
+            .options = self.state.observation_options,
+            .session_id = self.session_id,
+        };
+    }
+
     fn toolContext(self: *AcpContext) tool_runtime.Context {
         const session = if (self.state.active_session) |*active| active else unreachable;
         const provider_capabilities = self.state.cfg.provider_set.select(session.provider).capabilities;
@@ -435,6 +444,7 @@ const AcpContext = struct {
         }
         var tc: tool_runtime.Context = .{
             .observer = self.observer,
+            .observation_sink = self.observationSink(),
             .workspace_root = self.state.workspace_root,
             .access_scope = self.state.workspace_access.scope(self.state.workspace_root),
             .ignored_list_entries = self.state.cfg.ignored_list_entries,
@@ -1905,21 +1915,25 @@ fn localFileTargetPath(alloc: Allocator, uri_text: []const u8) Allocator.Error!?
 }
 
 fn emitObservation(raw: *anyopaque, context: observations.Context, event: observations.Event) void {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw));
-    emitObservationJson(ctx, context, event) catch {};
+    const state: *server.ServerState = @ptrCast(@alignCast(raw));
+    emitObservationJson(state, context, event) catch {};
 }
 
-fn emitObservationJson(ctx: *AcpContext, context: observations.Context, event: observations.Event) !void {
+fn emitObservationJson(state: *server.ServerState, context: observations.Context, event: observations.Event) !void {
     // Parallel tools allocate sequence numbers and write their frames under one lock.
-    ctx.state.observation_mutex.lockUncancelable(io_mod.getIo());
-    defer ctx.state.observation_mutex.unlock(io_mod.getIo());
-    if (ctx.state.observation_options.version == 2 and context.span == null) return;
-    var out = std.Io.Writer.Allocating.init(ctx.alloc);
+    state.observation_mutex.lockUncancelable(io_mod.getIo());
+    defer state.observation_mutex.unlock(io_mod.getIo());
+    if (state.observation_options.version >= 2 and context.span == null) return;
+    var out = std.Io.Writer.Allocating.init(state.alloc);
     defer out.deinit();
-    try std.json.Stringify.value(.{ .version = ctx.state.observation_options.version, .sequence = ctx.state.observation_sequence.fetchAdd(1, .monotonic) + 1, .session_id = ctx.session_id, .turn_id = context.trace.turn_id, .step_id = context.trace.step_id, .attempt = context.attempt, .timestamp_ms = io_mod.milliTimestamp() }, .{}, &out.writer);
+    try std.json.Stringify.value(.{ .version = state.observation_options.version, .sequence = state.observation_sequence.fetchAdd(1, .monotonic) + 1, .session_id = context.session_id orelse return, .turn_id = context.trace.turn_id, .step_id = context.trace.step_id, .attempt = context.attempt, .timestamp_ms = io_mod.milliTimestamp() }, .{}, &out.writer);
     // Add a tagged data object without serializing opaque runtime state.
     out.writer.end -= 1;
-    if (ctx.state.observation_options.version == 2) {
+    if (state.observation_options.version == 3) {
+        try out.writer.writeAll(",\"work_id\":");
+        try std.json.Stringify.value(context.work_id, .{}, &out.writer);
+    }
+    if (state.observation_options.version >= 2) {
         const span = context.span orelse return;
         try out.writer.writeAll(",\"trace\":");
         try std.json.Stringify.value(span.wire(), .{}, &out.writer);
@@ -1928,6 +1942,8 @@ fn emitObservationJson(ctx: *AcpContext, context: observations.Context, event: o
     switch (event) {
         inline else => |value, tag| {
             const kind = switch (tag) {
+                .child_started => "child.started",
+                .child_finished => "child.finished",
                 .tool_started => "tool.started",
                 .tool_finished => "tool.finished",
                 .model_request => "model.request",
@@ -1941,7 +1957,7 @@ fn emitObservationJson(ctx: *AcpContext, context: observations.Context, event: o
         },
     }
     try out.writer.writeAll("}}");
-    try ctx.state.writer.writeNotification(ctx.alloc, "fx/observation", out.writer.buffered());
+    try state.writer.writeNotification(state.alloc, "fx/observation", out.writer.buffered());
 }
 
 fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
@@ -1949,7 +1965,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
     return .{
         .ctx = @ptrCast(ctx),
         .observer = ctx.observer,
-        .observation_sink = .{ .context = @ptrCast(ctx), .emit_fn = emitObservation, .options = ctx.state.observation_options },
+        .observation_sink = ctx.observationSink(),
         .agent_stream_provider = server.streamProviderFor(ctx.state, ctx.state.active_session.?.provider),
         .confirm_session_writer = confirmSessionWriter,
         .report_usage = reportUsage,
@@ -2588,7 +2604,6 @@ fn executeToolCall(
     ctx.sendToolCallProgressText(acp_id, null) catch {};
 
     var tool_ctx = ctx.toolContext();
-    tool_ctx.trace_context = request.observation_context.span;
     var elicitation_responder = AcpElicitationResponderContext{
         .acp = ctx,
         .tool_call_id = acp_id,

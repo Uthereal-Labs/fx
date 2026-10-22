@@ -114,6 +114,7 @@ test {
 
 pub const Context = struct {
     trace_context: ?@import("../shared/trace_context.zig").TraceContext = null,
+    observation_sink: @import("../agent/observations.zig").Sink = .{},
     observer: ?*observation.Observer = null,
     workspace_root: []const u8,
     access_scope: ?workspace_access.AccessScope = null,
@@ -399,6 +400,7 @@ pub fn executeToolCallAuthorized(
     };
     var execution_ctx = ctx;
     execution_ctx.observer = request.observer orelse ctx.observer;
+    execution_ctx.trace_context = request.observation_context.span orelse ctx.trace_context;
     execution_ctx.skill_locations = request.skill_locations orelse ctx.skill_locations;
     if (request.permission_mode) |permission_mode| {
         execution_ctx.permission_mode = permission_mode;
@@ -2189,8 +2191,11 @@ fn executeSubagentProvider(
         return subagentProviderFailure(arena, "caller_unavailable");
     const identity_epoch = host.issueOperationIdentity(invocation_id);
     var progress_bridge = SubagentProgressBridge.init(arena, ctx, state.call);
+    var child_sink = ctx.observation_sink;
+    child_sink.options.parent = ctx.trace_context;
     const output = host.executeManaged(arena, request, .{
         .observer = ctx.observer,
+        .observation_sink = child_sink,
         .caller_id = caller_id,
         .invocation_id = invocation_id,
         .parent_permission_mode = ctx.permission_mode,
