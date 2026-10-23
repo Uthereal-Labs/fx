@@ -54,6 +54,7 @@ const session_summary_codec = @import("session_summary_codec.zig");
 const v1_conversion = @import("v1_conversion.zig");
 const child_state = @import("../subagent/child_state.zig");
 const artifact_digest = @import("artifact_digest.zig");
+const result_aliases = @import("result_aliases.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const model_provider = @import("../config/model_provider.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -730,6 +731,7 @@ const BlobHost = struct {
     const Hash = session_child_store.Blobs.Hash;
 
     const vtable: session_child_store.Blobs.VTable = .{
+        .owner_id = ownerID,
         .put = put,
         .put_file = putFile,
         .put_record = putRecord,
@@ -779,6 +781,10 @@ const BlobHost = struct {
         const hash = handle.putBlob(bytes) catch |err| return host.storeFailed(err);
         try host.remember(hash);
         return hash;
+    }
+
+    fn ownerID(ctx: *anyopaque) []const u8 {
+        return from(ctx).id;
     }
 
     fn putFile(ctx: *anyopaque, file: std.Io.File, len: u64) session_child_store.BlobError!Hash {
@@ -3334,6 +3340,8 @@ noinline fn replay(
     /// and each compaction's stored data where its line sits: `summary(data)`.
     sink: ReplaySink,
 ) !void {
+    var alias_capability: ?session_child_store.SessionChildCapability = if (src.host) |host| try session_child_store.SessionChildCapability.initBlobs(alloc, host.blobs(), "", .read_only) else null;
+    defer if (alias_capability) |*capability| capability.deinit();
     var builder = session_log.ConversationTurnBuilder.init(alloc);
     defer builder.deinit();
     var interrupted_item = false;
@@ -3407,10 +3415,10 @@ noinline fn replay(
                             try represented.append(ta, try ta.dupe(u8, value.call_id));
                         },
                         .steering => |value| try builder.appendSteering(value.text),
-                        .turn_completed => |value| try sink.turn(try presentStoredResults(alloc, try builder.finishAssistant(value)), lastStarted(entry)),
+                        .turn_completed => |value| try sink.turn(try presentStoredResults(alloc, if (alias_capability) |*cap| cap else null, try builder.finishAssistant(value)), lastStarted(entry)),
                         .interrupted => |value| {
                             interrupted_item = true;
-                            try sink.turn(try presentStoredResults(alloc, try builder.finishInterrupted(value)), lastStarted(entry));
+                            try sink.turn(try presentStoredResults(alloc, if (alias_capability) |*cap| cap else null, try builder.finishInterrupted(value)), lastStarted(entry));
                         },
                         .context_checkpoint => return error.InvalidConversationFrame,
                     }
@@ -3433,7 +3441,7 @@ noinline fn replay(
                         return err;
                     };
                     if (answered > 0) debug_trace.logf("session", "event=sessions_v2_replay_unfinished_tools session={s} turn={d} calls={d}", .{ src.id, ended.turn, answered });
-                    try sink.turn(try presentStoredResults(alloc, turn), ended.turn);
+                    try sink.turn(try presentStoredResults(alloc, if (alias_capability) |*cap| cap else null, turn), ended.turn);
                 },
                 .compacted => |line| try sink.summary(line.data),
                 .session_created, .turn_committed, .set, .child_spawned, .child_finished, .snapshot, .closed => {},
@@ -3448,7 +3456,7 @@ noinline fn replay(
 /// shows it (`session_log.zig` `restoreExecutionResultBodies`): the preview
 /// wrapped with its handle and stored size, so the model knows where the
 /// rest is. Takes `turn`, freeing it on failure.
-fn presentStoredResults(alloc: Allocator, turn: types.HistoryTurn) !types.HistoryTurn {
+fn presentStoredResults(alloc: Allocator, capability: ?*session_child_store.SessionChildCapability, turn: types.HistoryTurn) !types.HistoryTurn {
     var shown = turn;
     errdefer types.freeHistoryTurn(alloc, shown);
     const execution = switch (shown) {
@@ -3459,7 +3467,9 @@ fn presentStoredResults(alloc: Allocator, turn: types.HistoryTurn) !types.Histor
     for (execution.tool_steps) |*step| for (step.tool_results) |*result| {
         if (!result.truncated) continue;
         const handle = result.output_handle orelse continue;
-        const body = try result_store.formatStoredResultOutput(alloc, handle, result.preview orelse "", result.stored_output_bytes);
+        const display = if (capability) |cap| try result_aliases.display(alloc, cap, handle) else try alloc.dupe(u8, handle);
+        defer alloc.free(display);
+        const body = try result_store.formatStoredResultOutput(alloc, display, result.preview orelse "", result.stored_output_bytes);
         alloc.free(result.output);
         result.output = body;
     };
@@ -6302,6 +6312,60 @@ test "a schema 3 family converts its children from the relationship index, with 
     defer kid.deinit(alloc);
     try testing.expectEqualStrings("v1-old-root", kid.parent.?);
     try testing.expect(!V1Home.exists(&t, "v1-old-root") and !V1Home.exists(&t, "v1-old-kid"));
+}
+
+test "short result aliases survive durable resume and retained-turn compaction" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(alloc, &t.store, "/w", .ask, testSeed(&model));
+    var closed = false;
+    defer if (!closed) s.close();
+    const id = try alloc.dupe(u8, s.id());
+    defer alloc.free(id);
+    try s.beginTurn();
+    const capability = try s.childCapability();
+    const raw = try alloc.alloc(u8, result_store.large_result_threshold_bytes + 1);
+    defer alloc.free(raw);
+    @memset(raw, 'x');
+    const prepared = try result_store.prepareManagedWithAliases(alloc, capability, "call-1", "shell", raw.len, raw, 1024, true);
+    defer alloc.free(@constCast(prepared.model_output));
+    defer alloc.free(@constCast(prepared.memory.output_handle.?));
+    defer alloc.free(@constCast(prepared.memory.preview.?));
+    const alias = try result_aliases.display(alloc, capability, prepared.memory.output_handle.?);
+    defer alloc.free(alias);
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call-1"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = @constCast(prepared.model_output),
+        .output_handle = @constCast(prepared.memory.output_handle.?),
+        .preview = @constCast(prepared.memory.preview.?),
+        .output_bytes = raw.len,
+        .stored_output_bytes = raw.len,
+        .truncated = true,
+    }};
+    var steps: [1]types.ToolExecutionStep = undefined;
+    try s.commitTurn(toolTurn("run it", &results, &steps), types.ConversationLanguage.default());
+    s.close();
+    closed = true;
+    const resumed = try Session.resumeSession(alloc, &t.store, .{ .id = id }, "/w", .ask);
+    defer resumed.close();
+    var before = try resumed.restore(alloc);
+    defer before.deinit(alloc);
+    const shown = before.history[0].assistant.execution.tool_steps[0].tool_results[0];
+    try testing.expectEqualStrings(prepared.memory.output_handle.?, shown.output_handle.?);
+    try testing.expect(std.mem.find(u8, shown.output, alias) != null);
+    try testing.expect(std.mem.find(u8, shown.output, prepared.memory.output_handle.?) == null);
+    const read = try result_store.readByRangeManaged(alloc, try resumed.childCapability(), alias, 1, 32);
+    defer alloc.free(read);
+    try testing.expect(std.mem.find(u8, read, alias) != null);
+    try resumed.commitCompaction(.{ .summary = @constCast("Keep saved result."), .removed_turn_count = 0, .compaction_count = 1 }, false, .{ .turns = 0 });
+    var after = try resumed.restore(alloc);
+    defer after.deinit(alloc);
+    try testing.expect(std.mem.find(u8, after.history[1].assistant.execution.tool_steps[0].tool_results[0].output, alias) != null);
 }
 
 test "a stored result that kept only its preview replays as v1 shows it: wrapped with its handle" {

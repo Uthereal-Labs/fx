@@ -151,6 +151,42 @@ unfinished descendants prevent a complete trace. Only root model output should
 update the root answer. Hosts with an authenticated model adapter can also
 compare its admitted calls with native observations to detect a missing stream.
 
+## Current assistant responses with version 4
+
+Request `version: 4` with the same trace and capture options, and require the
+version 4 acknowledgement. Version 4 retains version 3's delegated execution
+and adds `response` to every `model.finished` payload. Versions 1 through 3
+retain their existing notification fields.
+
+For a completed model request, `response` contains:
+
+| Field | Meaning |
+| --- | --- |
+| `content_json` | A JSON assistant message with `role: "assistant"`, nullable `content`, and `tool_calls`. Each call contains only `id`, `name`, and its exact `arguments_json` string. |
+| `sha256` | SHA-256 of the complete UTF-8 assistant-message projection. |
+| `byte_count` | Length of that projection in bytes, before any content omission. |
+| `omitted` | Whether capture is disabled or the whole projection exceeds `max_content_bytes`. When true, `content_json` is `null`. |
+| `content_projection` | The fixed value `assistant_message_no_reasoning`. |
+
+fx captures the finalized provider completion before orchestration or tool
+execution. The message describes only the current completion; preceding tool
+results and conversation turns remain in `model.request`. Tool-only completions
+retain their calls with nullable text. Invalid argument strings remain unchanged
+so a host never mistakes an invented empty object for the model's output.
+Provider replay, hidden reasoning, provider-side tool results, and transport
+state are excluded. The complete projection is omitted as one field when it
+does not fit; individual calls are never silently removed.
+
+For failed or cancelled requests, `response` is `null`. The existing
+`output_text`, `output_sha256`, `output_byte_count`, and `output_omitted` fields
+continue to describe assistant text independently. The response digest identifies
+the safe projection, not a raw provider response or a request-body digest.
+
+Hosts can translate the projected messages into their tracing backend's chat
+format without changing model inputs or tool arguments. For example, a tracing
+backend that expects OpenAI-style calls can map `name` and `arguments_json` to
+`function.name` and `function.arguments`, retaining each call's `id`.
+
 ## Verify the built binary
 
 Build from the repository root, then run the provider-free driver:
@@ -173,11 +209,14 @@ The multi-call case checks separate MCP receipts;
 dynamic MCP tools execute sequentially in this fixture. It does not exercise
 the runtime's parallel builtin-tool branch in the version 2 case.
 
-Version 3 cases exercise concurrent native children, cold MCP discovery on both
+Version 3 and 4 cases exercise concurrent native children, cold MCP discovery on both
 engines, exact model and MCP parents, child steering, completed-work replay, and
 cancellation. Managed-owner tests cover trace context across yielded work.
 Save an actual child capture with
 `--observations-v3-output /tmp/fx-observations.v3.json`.
+Version 4 also checks current tool calls, content limits, and the retained legacy
+fields. Save an actual version 4 child capture with
+`--observations-v4-output /tmp/fx-observations.v4.json`.
 
 Focused native unit tests can run with:
 

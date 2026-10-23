@@ -496,7 +496,7 @@ pub const Provider = struct {
         }
         request.observation_sink.request(alloc, context, request.model, request.prepared_request_body, request.instructions, request.messages, .{ .available_tool_names = names.items, .tool_choice = request.tool_choice, .max_output_tokens = request.max_output_tokens, .provider_options = request.provider_options });
         const result = self.stream_fn(self.context, alloc, observed_request) catch |err| {
-            request.observation_sink.finished(alloc, context, .{ .model = request.model, .outcome = if (err == error.Cancelled) .cancelled else .failed, .delivery = if (request.delivery.load() == .possibly_sent) .possibly_sent else .definitely_unsent, .admitted = request.attempt_evidence.provider_admitted, .output_text = null, .output_omitted = true, .output_sha256 = null, .output_byte_count = null, .error_type = @errorName(err) });
+            request.observation_sink.finished(alloc, context, .{ .model = request.model, .outcome = if (err == error.Cancelled) .cancelled else .failed, .delivery = if (request.delivery.load() == .possibly_sent) .possibly_sent else .definitely_unsent, .admitted = request.attempt_evidence.provider_admitted, .output_text = null, .output_omitted = true, .output_sha256 = null, .output_byte_count = null, .error_type = @errorName(err) }, &.{});
             return err;
         };
         var ids: std.ArrayList([]const u8) = .empty;
@@ -504,7 +504,7 @@ pub const Provider = struct {
         if (request.observation_sink.enabled() and result == .completed) {
             for (result.completed.completion.tool_calls) |call| ids.append(alloc, call.id) catch {};
         }
-        request.observation_sink.finished(alloc, context, .{ .model = request.model, .tool_call_ids = ids.items, .outcome = if (result == .completed) .completed else .failed, .delivery = if (request.delivery.load() == .possibly_sent) .possibly_sent else .definitely_unsent, .admitted = request.attempt_evidence.provider_admitted, .output_text = if (result == .completed) result.completed.completion.content else null, .output_omitted = true, .output_sha256 = null, .output_byte_count = null, .usage = if (result == .completed) .{ .input_tokens = result.completed.completion.usage.input_tokens, .output_tokens = result.completed.completion.usage.output_tokens } else null, .error_type = if (result == .failed) @tagName(result.failed.kind) else null });
+        request.observation_sink.finished(alloc, context, .{ .model = request.model, .tool_call_ids = ids.items, .outcome = if (result == .completed) .completed else .failed, .delivery = if (request.delivery.load() == .possibly_sent) .possibly_sent else .definitely_unsent, .admitted = request.attempt_evidence.provider_admitted, .output_text = if (result == .completed) result.completed.completion.content else null, .output_omitted = true, .output_sha256 = null, .output_byte_count = null, .usage = if (result == .completed) .{ .input_tokens = result.completed.completion.usage.input_tokens, .output_tokens = result.completed.completion.usage.output_tokens } else null, .error_type = if (result == .failed) @tagName(result.failed.kind) else null }, if (result == .completed) result.completed.completion.tool_calls else &.{});
         return result;
     }
 

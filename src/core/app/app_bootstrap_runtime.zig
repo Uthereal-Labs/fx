@@ -548,6 +548,7 @@ pub fn Runtime(comptime App: type) type {
             app.permission_engine.replaceRules(app.alloc, startup.takePermissionRules());
             app.agent_step_limit = startup.agent_step_limit;
             app.worker.agent_turn_settings.max_tool_result_bytes = startup.max_tool_result_bytes;
+            app.worker.agent_turn_settings.short_tool_result_handles = startup.short_tool_result_handles;
             app.worker.agent_turn_settings.auto_compact_percent = startup.auto_compact_percent;
             if (comptime @hasField(App, "context_limits")) app.context_limits = startup.context_limits;
             app.worker.agent_turn_settings.first_call_tool_choice = startup.first_call_tool_choice;
@@ -950,6 +951,7 @@ var active_app_for_pointer_check: ?*TestApp = null;
 fn makeStartupState(alloc: Allocator) !app_lifecycle.StartupState {
     var state = app_lifecycle.StartupState{ .agent_step_limit = 19 };
     state.max_tool_result_bytes = 131072;
+    state.short_tool_result_handles = true;
     state.first_call_tool_choice = .none;
     state.workspace_root = try alloc.dupe(u8, "/workspace");
     errdefer alloc.free(state.workspace_root);
@@ -1292,6 +1294,7 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
     try std.testing.expectEqual(types.PermissionMode.auto, app.permission_engine.mode);
     try std.testing.expectEqual(@as(usize, 19), app.agent_step_limit);
     try std.testing.expectEqual(@as(usize, 131072), app.worker.agent_turn_settings.max_tool_result_bytes);
+    try std.testing.expect(app.worker.agent_turn_settings.short_tool_result_handles);
     try std.testing.expectEqual(types.ToolChoice.none, app.worker.agent_turn_settings.first_call_tool_choice);
     try std.testing.expect(app.worker.agent_turn_settings.fast_mode);
     try std.testing.expect(!app.worker.agent_turn_settings.ultrafast_mode);

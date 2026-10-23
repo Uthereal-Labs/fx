@@ -7397,12 +7397,13 @@ fn writeSessionFixture(
 ) !void {
     const owned_history = try alloc.alloc(types.HistoryTurn, history.len);
     var copied: usize = 0;
-    errdefer {
+    var history_owned = true;
+    errdefer if (history_owned) {
         for (owned_history[0..copied]) |turn| {
             session_runtime.freeHistoryTurn(alloc, turn);
         }
         alloc.free(owned_history);
-    }
+    };
     for (history, 0..) |turn, index| {
         owned_history[index] = try session_runtime.dupeHistoryTurn(alloc, turn);
         copied += 1;
@@ -7424,9 +7425,31 @@ fn writeSessionFixture(
         .total_input_tokens = 17,
         .total_output_tokens = 23,
     };
+    history_owned = false;
     defer state.deinit(alloc);
     var loaded = try store.startWritableSession(alloc, state);
     loaded.deinit(alloc);
+}
+
+test "resume fixture frees copied history once when session creation fails" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try Runtime(TestApp).initializePersistence(&app, true);
+    const history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("fixture failure") },
+        .assistant = @constCast("retained history"),
+    } }};
+    try std.testing.expectError(error.InvalidDurableField, writeSessionFixture(alloc, app.session_persistence.store.?, "", &history, 0));
 }
 
 test "initializePersistence silently skips optional missing home and errors when required" {

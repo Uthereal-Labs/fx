@@ -631,7 +631,7 @@ pub fn prepareCapturedToolModelOutput(
             raw_output,
         );
         if (config.session_child_capability != null) {
-            return result_store.prepareManaged(
+            return result_store.prepareManagedWithAliases(
                 arena,
                 config.session_child_capability,
                 tool_call.id,
@@ -639,6 +639,7 @@ pub fn prepareCapturedToolModelOutput(
                 raw_output.len,
                 sanitized_output,
                 config.max_tool_result_bytes,
+                config.short_tool_result_handles,
             );
         }
         return result_store.prepare(

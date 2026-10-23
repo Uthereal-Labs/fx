@@ -454,6 +454,7 @@ const AcpContext = struct {
             .max_read_file_line_len = self.state.cfg.max_read_file_line_len,
             .max_command_output_bytes = self.state.cfg.max_command_output_bytes,
             .max_tool_result_bytes = session.max_tool_result_bytes,
+            .short_tool_result_handles = session.short_tool_result_handles,
             .auto_compact_percent = self.state.auto_compact_percent,
             .api_key = session.api_key,
             .agent_stream_provider = server.streamProviderFor(self.state, session.provider),
@@ -1439,6 +1440,7 @@ fn buildAgentConfig(
         .custom_tool_guidance = sections.custom_tool_guidance,
         .agent_step_limit = session.agent_step_limit,
         .max_tool_result_bytes = session.max_tool_result_bytes,
+        .short_tool_result_handles = session.short_tool_result_handles,
         .auto_compact_percent = state.auto_compact_percent,
         .cancel_flag = &session.cancel_flag,
         .fast_mode = session.fast_mode,
@@ -1930,7 +1932,7 @@ fn emitObservationJson(state: *server.ServerState, context: observations.Context
     try std.json.Stringify.value(.{ .version = state.observation_options.version, .sequence = state.observation_sequence, .session_id = context.session_id orelse return, .turn_id = context.trace.turn_id, .step_id = context.trace.step_id, .attempt = context.attempt, .timestamp_ms = io_mod.milliTimestamp() }, .{}, &out.writer);
     // Add a tagged data object without serializing opaque runtime state.
     out.writer.end -= 1;
-    if (state.observation_options.version == 3) {
+    if (state.observation_options.version >= 3) {
         try out.writer.writeAll(",\"work_id\":");
         try std.json.Stringify.value(context.work_id, .{}, &out.writer);
     }
@@ -1954,7 +1956,8 @@ fn emitObservationJson(state: *server.ServerState, context: observations.Context
             try out.writer.writeAll("\"kind\":");
             try std.json.Stringify.value(kind, .{}, &out.writer);
             try out.writer.writeAll(",\"data\":");
-            try std.json.Stringify.value(value, .{}, &out.writer);
+            _ = value;
+            try observations.writeEventData(&out.writer, event, state.observation_options.version);
         },
     }
     try out.writer.writeAll("}}");

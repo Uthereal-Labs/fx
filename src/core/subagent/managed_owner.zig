@@ -257,7 +257,7 @@ pub const Owner = struct {
                 errdefer self.alloc.free(slot.child_id);
                 try self.slots.append(self.alloc, slot);
                 errdefer _ = self.slots.pop();
-                if (observation.sink.enabled() and observation.sink.options.version == 3) {
+                if (observation.sink.enabled() and observation.sink.options.version >= 3) {
                     slot.trace_work_id = try self.alloc.dupe(u8, observation.work_id);
                     slot.observation_sink = observation.sink.beginChild(slot.child_id, slot.trace_work_id.?, observation.tool_call_id);
                 }

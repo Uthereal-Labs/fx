@@ -29,7 +29,7 @@ def mcp_fixture() -> None:
         if method == "initialize":
             result = {"protocolVersion": request["params"]["protocolVersion"], "capabilities": {"tools": {}}, "serverInfo": {"name": "fixture", "version": "1"}}
         elif method == "tools/list":
-            result = {"tools": [{"name": "echo", "description": "Return the local fixture source.", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}, "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}}]}
+            result = {"tools": [{"name": "echo", "description": "Return the local fixture source.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "additionalProperties": False}, "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}}]}
         elif method == "tools/call":
             if "--trace-output" in sys.argv:
                 path = Path(sys.argv[sys.argv.index("--trace-output") + 1])
@@ -46,7 +46,7 @@ class ObservationTest(unittest.TestCase):
     observations_output: Path | None = None
     observations_v2_output: Path | None = None
 
-    def exercise(self, *, enabled: bool, limit: int = 262144, tool: bool = True, capture: bool = True, call_count: int = 1, hooks: bool = False, version: int = 1, engine: str = "v1", parent: str = ROOT_TRACEPARENT, tool_failure: bool = False) -> tuple[list[dict], list[bytes]]:
+    def exercise(self, *, enabled: bool, limit: int = 262144, tool: bool = True, capture: bool = True, call_count: int = 1, hooks: bool = False, version: int = 1, engine: str = "v1", parent: str = ROOT_TRACEPARENT, tool_failure: bool = False, tool_arguments: str = "{}") -> tuple[list[dict], list[bytes]]:
         bodies: list[bytes] = []
         provider_headers: list[dict[str, str]] = []
 
@@ -59,7 +59,7 @@ class ObservationTest(unittest.TestCase):
                 bodies.append(raw)
                 provider_headers.append(dict(self.headers.items()))
                 first = len(bodies) == 1 and tool
-                delta = {"tool_calls": [{"index": index, "id": f"fixture_call_{index + 1}", "type": "function", "function": {"name": "mcp_koi_test_echo", "arguments": "{}"}} for index in range(call_count)], "reasoning": "PRIVATE_REASONING_FIXTURE"} if first else {"content": "Scoped fixture answer."}
+                delta = {"tool_calls": [{"index": index, "id": f"fixture_call_{index + 1}", "type": "function", "function": {"name": "mcp_koi_test_echo", "arguments": tool_arguments}} for index in range(call_count)], "reasoning": "PRIVATE_REASONING_FIXTURE"} if first else {"content": "Scoped fixture answer."}
                 events = [
                     {"id": "fixture", "model": "local-model", "choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
                     {"id": "fixture", "model": "local-model", "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls" if first else "stop"}]},
@@ -117,9 +117,9 @@ class ObservationTest(unittest.TestCase):
             try:
                 initialize = {"protocolVersion": 1, "clientCapabilities": {}, "_meta": {"fx": {"terminal": False}}}
                 if enabled:
-                    initialize["_meta"]["fx"]["observations"] = {"version": version, "capture_content": capture, "max_content_bytes": limit, **({"traceparent": parent, "tracestate": "vendor=value"} if version == 2 else {})}
+                    initialize["_meta"]["fx"]["observations"] = {"version": version, "capture_content": capture, "max_content_bytes": limit, **({"traceparent": parent, "tracestate": "vendor=value"} if version >= 2 else {})}
                 initialized = request(1, "initialize", initialize)
-                if enabled and version in (1, 2) and parent == ROOT_TRACEPARENT:
+                if enabled and version in (1, 2, 3, 4) and parent == ROOT_TRACEPARENT:
                     self.assertEqual(initialized["_meta"]["fx"]["observations"]["version"], version)
                 else:
                     self.assertNotIn("_meta", initialized)
@@ -204,6 +204,43 @@ class ObservationTest(unittest.TestCase):
         self.assertEqual({value["tool_call_id"] for value in prepared}, {"fixture_call_1", "fixture_call_2"})
         visible = [message["content"] for message in json.loads(bodies[1])["messages"] if message["role"] == "tool"]
         self.assertEqual([value["model_visible"]["content_text"] for value in prepared], visible)
+
+    def test_v4_current_response_preserves_exact_calls_before_execution(self) -> None:
+        arguments = json.dumps({"query": 'quoted "value" and unicode λ'})
+        for engine in ("v1", "v2"):
+            with self.subTest(engine=engine):
+                observations, bodies = self.exercise(enabled=True, version=4, engine=engine, call_count=2, tool_arguments=arguments)
+                finished = [o["event"]["data"] for o in observations if o["event"]["kind"] == "model.finished"]
+                self.assertEqual(len(finished), 2)
+                for data in finished:
+                    response = data["response"]
+                    raw = response["content_json"].encode()
+                    self.assertEqual(response["sha256"], hashlib.sha256(raw).hexdigest())
+                    self.assertEqual(response["byte_count"], len(raw))
+                    self.assertEqual(response["content_projection"], "assistant_message_no_reasoning")
+                    self.assertFalse(response["omitted"])
+                first = json.loads(finished[0]["response"]["content_json"])
+                self.assertEqual(first["role"], "assistant")
+                self.assertEqual(first["tool_calls"], [{"id": f"fixture_call_{i+1}", "name": "mcp_koi_test_echo", "arguments_json": arguments} for i in range(2)])
+                self.assertEqual(finished[0]["tool_call_ids"], [call["id"] for call in first["tool_calls"]])
+                final = json.loads(finished[1]["response"]["content_json"])
+                self.assertEqual(final, {"role": "assistant", "content": "Scoped fixture answer.", "tool_calls": []})
+                self.assertNotIn("PRIVATE_REASONING_FIXTURE", json.dumps(observations))
+                self.assertIn("PRIVATE_REASONING_FIXTURE", bodies[1].decode())
+                for call in self.mcp_requests:
+                    self.assertEqual(call["params"]["arguments"], json.loads(arguments))
+
+    def test_v4_response_capture_limits_preserve_digest_without_content(self) -> None:
+        for options in ({"capture": False}, {"limit": 1}):
+            with self.subTest(options=options):
+                observations, _ = self.exercise(enabled=True, version=4, tool=False, **options)
+                data = next(o["event"]["data"] for o in observations if o["event"]["kind"] == "model.finished")
+                response = data["response"]
+                self.assertTrue(response["omitted"])
+                self.assertIsNone(response["content_json"])
+                self.assertGreater(response["byte_count"], 1)
+                self.assertEqual(len(response["sha256"]), 64)
+                self.assertNotIn("Scoped fixture answer", json.dumps(observations))
 
     def test_v2_exact_native_tool_and_model_parents_reach_both_mcp_engines(self) -> None:
         for engine in ("v1", "v2"):
@@ -318,6 +355,7 @@ class ObservationTest(unittest.TestCase):
 
 class ChildObservationTest(unittest.TestCase):
     observations_v3_output: Path | None = None
+    observations_v4_output: Path | None = None
 
     def exercise(self, *, engine: str = "v1", mode: str = "concurrent", enabled: bool = True, version: int = 3, parent: str = ROOT_TRACEPARENT, capture: bool = True) -> dict:
         receipts: list[dict] = []
@@ -454,11 +492,13 @@ class ChildObservationTest(unittest.TestCase):
             mcp = [json.loads(line) for line in mcp_path.read_text().splitlines()] if mcp_path.exists() else []
             return {"observations": observations, "receipts": receipts, "mcp": mcp, "root": session["sessionId"], "result": responses[3], "initialized": initialized, "frames": frames}
 
-    def test_v3_concurrent_children_keep_exact_model_and_mcp_parents(self) -> None:
-        for engine in ("v1", "v2"):
-            with self.subTest(engine=engine):
-                run = self.exercise(engine=engine)
+    def test_v3_and_v4_concurrent_children_keep_exact_model_and_mcp_parents(self) -> None:
+        for version, engine in ((3, "v1"), (3, "v2"), (4, "v1"), (4, "v2")):
+            with self.subTest(version=version, engine=engine):
+                run = self.exercise(engine=engine, version=version)
                 events = run["observations"]
+                self.assertEqual(run["initialized"]["_meta"]["fx"]["observations"]["version"], version)
+                self.assertTrue(all(event["version"] == version for event in events))
                 starts = [v for v in events if v["event"]["kind"] == "child.started"]
                 ends = [v for v in events if v["event"]["kind"] == "child.finished"]
                 self.assertEqual((len(starts), len(ends), len(run["mcp"])), (2, 2, 2))
@@ -497,8 +537,16 @@ class ChildObservationTest(unittest.TestCase):
                     self.assertEqual(span["event"]["data"]["tool_name"], "mcp_koi_test_echo")
                     self.assertIsNotNone(span["work_id"])
                     self.assertEqual(call["params"]["_meta"]["tracestate"], "vendor=value")
-                if engine == "v1" and self.observations_v3_output is not None:
-                    self.observations_v3_output.write_text(json.dumps(events))
+                for event in events:
+                    if event["event"]["kind"] == "model.finished":
+                        if version == 3:
+                            self.assertNotIn("response", event["event"]["data"])
+                        else:
+                            self.assertIsNotNone(event["event"]["data"]["response"])
+                if engine == "v1":
+                    destination = self.observations_v3_output if version == 3 else self.observations_v4_output
+                    if destination is not None:
+                        destination.write_text(json.dumps(events))
 
     def test_v3_completed_replay_does_not_start_a_second_child_execution(self) -> None:
         run = self.exercise(mode="replay")
@@ -557,5 +605,9 @@ if __name__ == "__main__":
         if "--observations-v3-output" in sys.argv:
             index = sys.argv.index("--observations-v3-output")
             ChildObservationTest.observations_v3_output = Path(sys.argv[index + 1]).resolve()
+            del sys.argv[index:index + 2]
+        if "--observations-v4-output" in sys.argv:
+            index = sys.argv.index("--observations-v4-output")
+            ChildObservationTest.observations_v4_output = Path(sys.argv[index + 1]).resolve()
             del sys.argv[index:index + 2]
         unittest.main()

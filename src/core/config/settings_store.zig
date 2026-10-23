@@ -1945,6 +1945,9 @@ fn validateKnownSettingsObject(
     if (object.get("max_agent_steps")) |value| {
         if (value != .integer or value.integer < 0) return error.InvalidSettingsFormat;
     }
+    if (object.get("short_tool_result_handles")) |value| {
+        if (value != .bool) return error.InvalidSettingsFormat;
+    }
     if (object.get("max_tool_result_bytes")) |value| {
         if (value != .integer or value.integer < tool_result_limits.min_configured_tool_result_bytes) {
             return error.InvalidSettingsFormat;
