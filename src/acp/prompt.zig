@@ -1932,7 +1932,7 @@ fn emitObservationJson(state: *server.ServerState, context: observations.Context
     try std.json.Stringify.value(.{ .version = state.observation_options.version, .sequence = state.observation_sequence, .session_id = context.session_id orelse return, .turn_id = context.trace.turn_id, .step_id = context.trace.step_id, .attempt = context.attempt, .timestamp_ms = io_mod.milliTimestamp() }, .{}, &out.writer);
     // Add a tagged data object without serializing opaque runtime state.
     out.writer.end -= 1;
-    if (state.observation_options.version == 3) {
+    if (state.observation_options.version >= 3) {
         try out.writer.writeAll(",\"work_id\":");
         try std.json.Stringify.value(context.work_id, .{}, &out.writer);
     }
@@ -1956,7 +1956,8 @@ fn emitObservationJson(state: *server.ServerState, context: observations.Context
             try out.writer.writeAll("\"kind\":");
             try std.json.Stringify.value(kind, .{}, &out.writer);
             try out.writer.writeAll(",\"data\":");
-            try std.json.Stringify.value(value, .{}, &out.writer);
+            _ = value;
+            try observations.writeEventData(&out.writer, event, state.observation_options.version);
         },
     }
     try out.writer.writeAll("}}");

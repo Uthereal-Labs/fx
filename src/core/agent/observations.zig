@@ -22,7 +22,7 @@ pub const Options = struct {
             if (!std.mem.eql(u8, key, "version") and !std.mem.eql(u8, key, "capture_content") and !std.mem.eql(u8, key, "max_content_bytes") and !std.mem.eql(u8, key, "traceparent") and !std.mem.eql(u8, key, "tracestate")) return error.InvalidObservationOptions;
         }
         const version = root.object.get("version") orelse return error.InvalidObservationOptions;
-        if (version != .integer or version.integer < 1 or version.integer > 3) return error.InvalidObservationOptions;
+        if (version != .integer or version.integer < 1 or version.integer > 4) return error.InvalidObservationOptions;
         var result = Options{ .enabled = true, .version = @intCast(version.integer) };
         if (result.version >= 2) {
             const parent = root.object.get("traceparent") orelse return error.InvalidObservationOptions;
@@ -68,7 +68,16 @@ pub const ModelFinished = struct {
     output_byte_count: ?usize,
     usage: ?struct { input_tokens: ?u64, output_tokens: ?u64 } = null,
     error_type: ?[]const u8 = null,
+    response: ?AssistantResponse = null,
 };
+pub const AssistantResponse = struct {
+    content_json: ?[]const u8,
+    sha256: []const u8,
+    byte_count: usize,
+    omitted: bool,
+    content_projection: enum { assistant_message_no_reasoning } = .assistant_message_no_reasoning,
+};
+const ProjectedToolCall = struct { id: []const u8, name: []const u8, arguments_json: []const u8 };
 pub const Digest = struct { sha256: []const u8, byte_count: usize };
 pub const ToolPrepared = struct {
     tool_call_id: []const u8,
@@ -114,6 +123,29 @@ pub const Event = union(enum) {
     model_finished: ModelFinished,
     tool_prepared: ToolPrepared,
 };
+
+/// Preserve older negotiated payloads when a newer event adds fields.
+pub fn writeEventData(writer: *std.Io.Writer, event: Event, version: u8) !void {
+    switch (event) {
+        .model_finished => |value| {
+            if (version >= 4) return std.json.Stringify.value(value, .{}, writer);
+            try std.json.Stringify.value(.{
+                .model = value.model,
+                .tool_call_ids = value.tool_call_ids,
+                .outcome = value.outcome,
+                .delivery = value.delivery,
+                .admitted = value.admitted,
+                .output_text = value.output_text,
+                .output_omitted = value.output_omitted,
+                .output_sha256 = value.output_sha256,
+                .output_byte_count = value.output_byte_count,
+                .usage = value.usage,
+                .error_type = value.error_type,
+            }, .{}, writer);
+        },
+        inline else => |value| try std.json.Stringify.value(value, .{}, writer),
+    }
+}
 pub const RequestDetails = struct {
     available_tool_names: []const []const u8 = &.{},
     tool_choice: types.ToolChoice = .auto,
@@ -146,7 +178,7 @@ pub const Sink = struct {
     }
     /// The caller owns the child and work IDs until finishChild returns.
     pub fn beginChild(self: Sink, child_id: []const u8, work_id: []const u8, call_id: []const u8) Sink {
-        if (!self.enabled() or self.options.version != 3) return .{};
+        if (!self.enabled() or self.options.version < 3) return .{};
         const parent = self.options.parent orelse return .{};
         const root_id = self.session_id orelse return .{};
         var child = self;
@@ -162,7 +194,7 @@ pub const Sink = struct {
     }
 
     pub fn finishChild(self: Sink, outcome: ChildFinished) void {
-        if (self.options.version != 3 or self.work_id == null) return;
+        if (self.options.version < 3 or self.work_id == null) return;
         self.emit(.{ .trace = .{}, .span = self.options.parent }, .{ .child_finished = outcome });
     }
 
@@ -252,8 +284,14 @@ pub const Sink = struct {
         const omitted = !self.options.capture_content or visible.len > self.options.max_content_bytes;
         self.emit(context, .{ .tool_prepared = .{ .tool_call_id = id, .tool_name = name, .original = .{ .sha256 = try digest(arena, original), .byte_count = original.len }, .model_visible = .{ .sha256 = try digest(arena, visible), .byte_count = visible.len, .content_text = if (omitted) null else visible, .omitted = omitted }, .truncated = truncated, .stored_handle = handle } });
     }
-    pub fn finished(self: Sink, alloc: Allocator, context: Context, value: ModelFinished) void {
+    pub fn finished(self: Sink, alloc: Allocator, context: Context, value: ModelFinished, calls: []const types.ToolCall) void {
         if (!self.enabled()) return;
+        self.captureFinished(alloc, context, value, calls) catch {};
+    }
+    fn captureFinished(self: Sink, alloc: Allocator, context: Context, value: ModelFinished, calls: []const types.ToolCall) !void {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const arena = scratch.allocator();
         var event = value;
         var hash: [64]u8 = undefined;
         if (value.output_text) |text| {
@@ -263,7 +301,17 @@ pub const Sink = struct {
             event.output_omitted = !self.options.capture_content or text.len > self.options.max_content_bytes;
             if (event.output_omitted) event.output_text = null;
         }
-        _ = alloc;
+        var response_hash: [64]u8 = undefined;
+        if (self.options.version >= 4 and value.outcome == .completed) {
+            const response = try std.json.Stringify.valueAlloc(arena, .{
+                .role = @as(enum { assistant }, .assistant),
+                .content = value.output_text,
+                .tool_calls = try projectToolCalls(arena, calls),
+            }, .{});
+            response_hash = hashText(response);
+            const omitted = !self.options.capture_content or response.len > self.options.max_content_bytes;
+            event.response = .{ .content_json = if (omitted) null else response, .sha256 = &response_hash, .byte_count = response.len, .omitted = omitted };
+        }
         self.emit(context, .{ .model_finished = event });
     }
 };
@@ -280,12 +328,16 @@ fn writeMessages(alloc: Allocator, writer: *std.Io.Writer, messages: []const typ
     try writer.writeByte('[');
     for (messages, 0..) |message, index| {
         if (index != 0) try writer.writeByte(',');
-        const Call = struct { id: []const u8, name: []const u8, arguments_json: []const u8 };
-        const calls = try alloc.alloc(Call, message.tool_calls.len);
-        for (message.tool_calls, calls) |call, *copy| copy.* = .{ .id = call.id, .name = call.name, .arguments_json = call.arguments_json };
+        const calls = try projectToolCalls(alloc, message.tool_calls);
         try std.json.Stringify.value(.{ .role = @tagName(message.role), .content = message.content, .tool_call_id = message.tool_call_id, .tool_name = message.tool_name, .tool_calls = calls }, .{}, writer);
     }
     try writer.writeByte(']');
+}
+
+fn projectToolCalls(alloc: Allocator, calls: []const types.ToolCall) ![]const ProjectedToolCall {
+    const projected = try alloc.alloc(ProjectedToolCall, calls.len);
+    for (calls, projected) |call, *copy| copy.* = .{ .id = call.id, .name = call.name, .arguments_json = call.arguments_json };
+    return projected;
 }
 
 test "observations options require explicit supported bounded opt in" {
@@ -338,4 +390,80 @@ test "observations omit bounded content explicitly and stay silent by default" {
     try std.testing.expect(std.mem.find(u8, collector.data.?, "VISIBLE_RECEIPT") == null);
     try std.testing.expect(std.mem.find(u8, collector.data.?, "\"omitted\":true") != null);
     try std.testing.expect(std.mem.find(u8, collector.data.?, &hashText("VISIBLE_RECEIPT")) != null);
+}
+
+test "observations v4 capture exact current tool calls without provider state" {
+    var collector = TestCollector{};
+    defer collector.deinit();
+    const sink = Sink{ .context = &collector, .emit_fn = TestCollector.emit, .options = .{ .enabled = true, .version = 4, .capture_content = true } };
+    const calls = [_]types.ToolCall{
+        .{ .id = "call_1", .name = "capability_search", .arguments_json = "{\"query\":\"visible\"}", .provider_result = "PRIVATE_TOOL_RESULT" },
+        .{ .id = "call_2", .name = "echo", .arguments_json = "malformed arguments stay unchanged" },
+    };
+    sink.finished(std.testing.allocator, .{ .trace = .{} }, .{ .model = "test", .outcome = .completed, .delivery = .possibly_sent, .admitted = true, .output_text = "Current response", .output_omitted = true, .output_sha256 = null, .output_byte_count = null }, &calls);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, collector.data.?, .{});
+    defer parsed.deinit();
+    const finished = parsed.value.object.get("model_finished").?.object;
+    try std.testing.expectEqualStrings("Current response", finished.get("output_text").?.string);
+    try std.testing.expectEqualStrings(&hashText("Current response"), finished.get("output_sha256").?.string);
+    const response = finished.get("response").?.object;
+    const content = response.get("content_json").?.string;
+    try std.testing.expectEqualStrings(&hashText(content), response.get("sha256").?.string);
+    try std.testing.expectEqual(content.len, @as(usize, @intCast(response.get("byte_count").?.integer)));
+    const message = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, content, .{});
+    defer message.deinit();
+    try std.testing.expectEqualStrings("assistant", message.value.object.get("role").?.string);
+    try std.testing.expectEqualStrings("Current response", message.value.object.get("content").?.string);
+    const projected = message.value.object.get("tool_calls").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), projected.len);
+    for (calls, projected) |call, value| {
+        try std.testing.expectEqualStrings(call.id, value.object.get("id").?.string);
+        try std.testing.expectEqualStrings(call.name, value.object.get("name").?.string);
+        try std.testing.expectEqualStrings(call.arguments_json, value.object.get("arguments_json").?.string);
+        try std.testing.expectEqual(@as(usize, 3), value.object.count());
+    }
+    try std.testing.expect(std.mem.find(u8, collector.data.?, "PRIVATE_") == null);
+}
+
+test "observations v4 response limits cover the whole tool-only message" {
+    const expected = "{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_1\",\"name\":\"echo\",\"arguments_json\":\"{}\"}]}";
+    for ([_]bool{ false, true }) |capture| {
+        for ([_]usize{ 1, expected.len }) |limit| {
+            var collector = TestCollector{};
+            defer collector.deinit();
+            const sink = Sink{ .context = &collector, .emit_fn = TestCollector.emit, .options = .{ .enabled = true, .version = 4, .capture_content = capture, .max_content_bytes = limit } };
+            sink.finished(std.testing.allocator, .{ .trace = .{} }, .{ .model = "test", .outcome = .completed, .delivery = .possibly_sent, .admitted = true, .output_text = null, .output_omitted = true, .output_sha256 = null, .output_byte_count = null }, &.{.{ .id = "call_1", .name = "echo", .arguments_json = "{}" }});
+            const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, collector.data.?, .{});
+            defer parsed.deinit();
+            const response = parsed.value.object.get("model_finished").?.object.get("response").?.object;
+            try std.testing.expectEqualStrings(&hashText(expected), response.get("sha256").?.string);
+            try std.testing.expectEqual(expected.len, @as(usize, @intCast(response.get("byte_count").?.integer)));
+            const omitted = !capture or limit < expected.len;
+            try std.testing.expectEqual(omitted, response.get("omitted").?.bool);
+            if (omitted) try std.testing.expect(response.get("content_json").? == .null) else try std.testing.expectEqualStrings(expected, response.get("content_json").?.string);
+        }
+    }
+}
+
+test "observations failed and cancelled models have no completed response" {
+    for ([_]@FieldType(ModelFinished, "outcome"){ .failed, .cancelled }) |outcome| {
+        var collector = TestCollector{};
+        defer collector.deinit();
+        const sink = Sink{ .context = &collector, .emit_fn = TestCollector.emit, .options = .{ .enabled = true, .version = 4, .capture_content = true } };
+        sink.finished(std.testing.allocator, .{ .trace = .{} }, .{ .model = "test", .outcome = outcome, .delivery = .definitely_unsent, .admitted = false, .output_text = null, .output_omitted = true, .output_sha256 = null, .output_byte_count = null }, &.{});
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, collector.data.?, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("model_finished").?.object.get("response").? == .null);
+    }
+}
+
+test "observations preserve legacy model completion wire fields" {
+    const value = ModelFinished{ .model = "test", .outcome = .completed, .delivery = .possibly_sent, .admitted = true, .output_text = null, .output_omitted = true, .output_sha256 = null, .output_byte_count = null };
+    const expected = "{\"model\":\"test\",\"tool_call_ids\":[],\"outcome\":\"completed\",\"delivery\":\"possibly_sent\",\"admitted\":true,\"output_text\":null,\"output_omitted\":true,\"output_sha256\":null,\"output_byte_count\":null,\"usage\":null,\"error_type\":null}";
+    for ([_]u8{ 1, 2, 3 }) |version| {
+        var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer out.deinit();
+        try writeEventData(&out.writer, .{ .model_finished = value }, version);
+        try std.testing.expectEqualStrings(expected, out.writer.buffered());
+    }
 }
