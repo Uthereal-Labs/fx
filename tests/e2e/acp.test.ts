@@ -922,6 +922,7 @@ test("configured provider ACP finishes the final root iteration without tools", 
     expect(result.result.stopReason).toBe("end_turn");
     expect(calls).toBe(2);
     expect(client.rawLines.join("\n")).toContain("remaining coverage is incomplete");
+    expect(client.rawLines.join("\n")).toContain('"message_kind":"assistant"');
     client.endStdin();
     expect(await client.waitForExit()).toBe(0);
     expect(client.stderr).toBe("");
@@ -941,6 +942,7 @@ test("configured provider ACP reports an exhausted step cap as max model turns",
     const result = await client.request("session/prompt", { prompt: [{ type: "text", text: "Read the evidence." }] }) as any;
     expect(result.error).toBeUndefined();
     expect(result.result.stopReason).toBe("max_model_turns");
+    expect(client.rawLines.join("\n")).toContain('"message_kind":"operational"');
     expect(fixture.requests).toHaveLength(1);
     client.endStdin();
     expect(await client.waitForExit()).toBe(0);

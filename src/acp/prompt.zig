@@ -193,10 +193,7 @@ test "ultrafastPromptAllowed requires a verified Gateway capability" {
     try std.testing.expect(!ultrafastCapabilityAllowed(.gateway, true, false));
 }
 
-const AgentMessageKind = enum {
-    assistant,
-    operational,
-};
+const AgentMessageKind = acp_types.AgentMessageKind;
 
 const AcpContext = struct {
     alloc: Allocator,
@@ -252,7 +249,7 @@ const AcpContext = struct {
         defer if (plain.ptr != text.ptr) self.alloc.free(plain);
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
-        try acp_types.writeAgentMessageChunk(&out.writer, message_id, plain);
+        try acp_types.writeClassifiedAgentMessageChunk(&out.writer, message_id, plain, self.message_kind orelse .assistant);
         try self.sendUpdate(out.writer.buffered());
     }
 

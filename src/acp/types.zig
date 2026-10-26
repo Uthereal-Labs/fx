@@ -164,12 +164,20 @@ pub fn writeSessionUpdate(w: *std.Io.Writer, session_id: []const u8, update_json
     try w.writeAll("}");
 }
 
+pub const AgentMessageKind = enum { assistant, operational };
+
 pub fn writeAgentMessageChunk(w: *std.Io.Writer, message_id: []const u8, text: []const u8) !void {
+    try writeClassifiedAgentMessageChunk(w, message_id, text, .assistant);
+}
+
+pub fn writeClassifiedAgentMessageChunk(w: *std.Io.Writer, message_id: []const u8, text: []const u8, kind: AgentMessageKind) !void {
     try w.writeAll("{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":");
     try writeJsonStr(message_id, w);
     try w.writeAll(",\"content\":{\"type\":\"text\",\"text\":");
     try writeJsonStr(text, w);
-    try w.writeAll("}}");
+    try w.writeAll("},\"_meta\":{\"fx\":{\"message_kind\":");
+    try writeJsonStr(@tagName(kind), w);
+    try w.writeAll("}}}");
 }
 
 /// ACP v1 Session Notice: shown to the user, never part of the session's
@@ -440,7 +448,7 @@ test "writeAgentMessageChunk produces valid json" {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try writeAgentMessageChunk(&out.writer, "message-1", "Hello world");
-    const expected = "{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":\"message-1\",\"content\":{\"type\":\"text\",\"text\":\"Hello world\"}}";
+    const expected = "{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":\"message-1\",\"content\":{\"type\":\"text\",\"text\":\"Hello world\"},\"_meta\":{\"fx\":{\"message_kind\":\"assistant\"}}}";
     try std.testing.expectEqualStrings(expected, out.writer.buffered());
 }
 

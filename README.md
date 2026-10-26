@@ -178,3 +178,5 @@ ACP hosts can opt in through the profile's `settings.json`:
 `finish_root_iteration` defaults to `false` and project `.fx.json` files cannot enable it. With a positive step cap, the final root iteration requests an answer without tools or delegation. It uses the normal streaming and history path and asks the model to disclose retained evidence gaps. Child iteration behavior is unchanged. An unbounded cap of `0` has no final iteration.
 
 This policy does not reserve shared model requests, tokens, or time owned by an embedding host. Those limits can still prevent a final answer. Exhausting the native step cap returns ACP `max_model_turns`; it is distinct from `refused` and a successful `end_turn`.
+
+Agent message chunks include `_meta.fx.message_kind` as `assistant` or `operational`. Hosts can exclude operational notices when checking whether an answer was produced. Message IDs and root tool-call boundaries separate the final response from preceding commentary.
