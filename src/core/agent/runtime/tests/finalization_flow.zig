@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing_allocator = @import("../../../shared/testing_allocator.zig");
 const types = @import("../../../shared/types.zig");
+const agent_stream_provider = @import("../../stream_provider.zig");
 const debug_trace = @import("../../../shared/debug_trace.zig");
 const io_mod = @import("../../../shared/io.zig");
 const tool_result_errors = @import("../../../tooling/tool_result_errors.zig");
@@ -523,6 +524,85 @@ test "processQueuedPrompt step limit pushes configured notice and finish event" 
     try std.testing.expect(hooks.finalized_disposition == null);
 }
 
+test "final root iteration answers from retained evidence without tools" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{ .{ .tool_calls = &calls }, .{ .content = "Supported answer; coverage remains partial." } };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    const Observe = struct {
+        fn request(value: agent_stream_provider.ModelRequest) !void {
+            if (value.tool_choice == .none) {
+                try std.testing.expect(value.tools.advertised_names.len == 0);
+                try std.testing.expect(value.tools.selected_dynamic.len == 0);
+                var finishing = false;
+                for (value.instructions) |message| {
+                    if (message.content) |content| finishing = finishing or std.mem.find(u8, content, "final iteration of this root turn") != null;
+                }
+                try std.testing.expect(finishing);
+            }
+        }
+    };
+    gateway.observe_request = Observe.request;
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.agent_step_limit = 2;
+    config.finish_root_iteration = true;
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+    try std.testing.expectEqual(@as(usize, 2), gateway.admitted_requests);
+    try std.testing.expectEqual(types.ToolChoice.none, gateway.request_tool_choices.items[1]);
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("Supported answer; coverage remains partial.", hooks.history_assistant_text.?);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    try std.testing.expect(hooks.finalized_cause == null);
+}
+
+test "final root iteration rejects tool calls returned after tools are disabled" {
+    const alloc = std.testing.allocator;
+    const first = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const last = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    const completions = [_]FakeCompletion{ .{ .tool_calls = &first }, .{ .tool_calls = &last } };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.agent_step_limit = 2;
+    config.finish_root_iteration = true;
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(types.TurnTerminationCause.step_limit, hooks.finalized_cause.?);
+}
+
+test "final root iteration stays opt in and does not change child iterations" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |child| {
+        const calls = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+        const completions = [_]FakeCompletion{ .{ .tool_calls = &calls }, .{ .tool_calls = &calls } };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        const Observe = struct {
+            fn request(value: agent_stream_provider.ModelRequest) !void {
+                try std.testing.expectEqual(types.ToolChoice.auto, value.tool_choice);
+            }
+        };
+        gateway.observe_request = Observe.request;
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        var config = fixture.config();
+        config.agent_step_limit = 2;
+        config.finish_root_iteration = child;
+        config.origin = if (child) .subagent else .root;
+        try runFakePrompt(&gateway, &hooks, config, fixture.job());
+        try std.testing.expectEqual(types.TurnTerminationCause.step_limit, hooks.finalized_cause.?);
+    }
+}
+
 test "processQueuedPrompt step limit persists malformed argument failure execution" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{.{
@@ -574,7 +654,7 @@ test "finalization sink failure makes guard fatal and suppresses finish payload"
     try std.testing.expectEqual(@as(usize, 0), hooks.finish_event_count);
 }
 
-test "processQueuedPrompt terminal outcomes finalize exactly once before optional finish" {
+test "processQueuedPrompt terminal outcomes finalize exactly once including final root iteration" {
     const alloc = std.testing.allocator;
     const cases = [_]struct {
         completion: FakeCompletion,
@@ -587,29 +667,35 @@ test "processQueuedPrompt terminal outcomes finalize exactly once before optiona
         .{ .completion = .{ .status = .bad_request, .err_body = "bad" }, .outcome = .failed, .finish_count = 0 },
         .{ .completion = .{ .stream_error = error.TestProviderFailure }, .outcome = .failed, .finish_count = 0, .propagates_error = true },
     };
-    for (cases) |case| {
-        const completions = [_]FakeCompletion{case.completion};
-        var gateway = FakeGateway.init(alloc, &completions);
-        defer gateway.deinit();
-        var hooks = FakeAgentRuntimeDeps.init(alloc);
-        defer hooks.deinit();
-        var fixture = PromptFixture{};
-        if (case.propagates_error) {
-            try std.testing.expectError(
-                error.TestProviderFailure,
-                runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job()),
-            );
-        } else {
-            try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
-        }
-        try std.testing.expectEqual(@as(usize, 1), hooks.finalization_count);
-        try std.testing.expectEqual(case.outcome, hooks.finalized_outcome.?);
-        try std.testing.expectEqual(case.finish_count, hooks.finish_event_count);
-        if (case.finish_count > 0) {
-            try std.testing.expect(
-                logIndex(&hooks, "event:turn_finished").? <
-                    logIndex(&hooks, "event:finish_prompt").?,
-            );
+    for ([_]bool{ false, true }) |finishing| {
+        for (cases) |case| {
+            const completions = [_]FakeCompletion{case.completion};
+            var gateway = FakeGateway.init(alloc, &completions);
+            defer gateway.deinit();
+            var hooks = FakeAgentRuntimeDeps.init(alloc);
+            defer hooks.deinit();
+            var fixture = PromptFixture{};
+            var config = fixture.config();
+            config.finish_root_iteration = finishing;
+            if (finishing) config.agent_step_limit = 1;
+            if (case.propagates_error) {
+                try std.testing.expectError(
+                    error.TestProviderFailure,
+                    runFakePrompt(&gateway, &hooks, config, fixture.job()),
+                );
+            } else {
+                try runFakePrompt(&gateway, &hooks, config, fixture.job());
+            }
+            try std.testing.expectEqual(@as(usize, 1), hooks.finalization_count);
+            try std.testing.expectEqual(case.outcome, hooks.finalized_outcome.?);
+            try std.testing.expect(hooks.finalized_cause == null);
+            try std.testing.expectEqual(case.finish_count, hooks.finish_event_count);
+            if (case.finish_count > 0) {
+                try std.testing.expect(
+                    logIndex(&hooks, "event:turn_finished").? <
+                        logIndex(&hooks, "event:finish_prompt").?,
+                );
+            }
         }
     }
 }

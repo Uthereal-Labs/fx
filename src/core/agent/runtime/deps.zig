@@ -135,7 +135,7 @@ pub const ToolActivityRecorder = struct {
     }
 };
 
-fn acknowledgePromptFinalization(_: *anyopaque, _: u64, _: types.TurnPresentationOutcome, _: ?types.ProviderCompletionDisposition) !void {}
+fn acknowledgePromptFinalization(_: *anyopaque, _: u64, _: types.TurnPresentationOutcome, _: ?types.ProviderCompletionDisposition, _: ?types.TurnTerminationCause) !void {}
 fn discardToolLifecycle(_: *anyopaque, _: types.ToolLifecycleEvent) !void {}
 fn discardRouteRecoveryStatus(_: *anyopaque, _: types.RouteRecoveryStatus) !void {}
 fn localAvailableModelCapabilities(_: *anyopaque, model: []const u8) model_capabilities.Capabilities {
@@ -214,7 +214,7 @@ pub const AgentRuntimeDeps = struct {
     /// Samples host-owned root permission mode at an action boundary.
     snapshot_root_permission_mode: ?*const fn (ctx: *anyopaque) PermissionMode = null,
     tool_activity_recorder: ?ToolActivityRecorder = null,
-    finalize_turn: *const fn (ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, disposition: ?types.ProviderCompletionDisposition) anyerror!void = acknowledgePromptFinalization,
+    finalize_turn: *const fn (ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, disposition: ?types.ProviderCompletionDisposition, cause: ?types.TurnTerminationCause) anyerror!void = acknowledgePromptFinalization,
     /// Classifies one observed steering boundary. Continued text is arena-owned
     /// non-authoritative context; handoff leaves the prompt host-owned.
     take_steering_boundary: ?*const fn (

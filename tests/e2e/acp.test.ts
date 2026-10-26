@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { createConfiguredProviderFixture, completion as configuredCompletion } from "./fixtures/chat-completions";
+import { createConfiguredProviderFixture, completion as configuredCompletion, toolCompletion as configuredToolCompletion } from "./fixtures/chat-completions";
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
 import {
   chmodSync,
@@ -893,6 +893,55 @@ test("ACP load and resume negotiate hooks and clear them when omitted", async ()
       await runPrompt(client, "do not observe this prompt");
       expect(client.hookEvents.length).toBe(count);
     }
+    client.endStdin();
+    expect(await client.waitForExit()).toBe(0);
+    expect(client.stderr).toBe("");
+  } finally { await client.close(); fixture.close(); }
+}, 30000);
+
+test("configured provider ACP finishes the final root iteration without tools", async () => {
+  let calls = 0;
+  const fixture = createConfiguredProviderFixture(body => {
+    calls += 1;
+    if (calls === 1) return configuredToolCompletion(body.model, "read_file", { path: "evidence.txt" });
+    expect(body.tool_choice === undefined || body.tool_choice === "none").toBe(true);
+    expect(body.tools ?? []).toHaveLength(0);
+    expect(body.messages.some((message: any) => message.role === "system" && typeof message.content === "string" && message.content.includes("final iteration of this root turn"))).toBe(true);
+    return configuredCompletion(body.model, "The retained evidence supports the finding; remaining coverage is incomplete.");
+  });
+  Object.assign(fixture.settings, { max_agent_steps: 2, finish_root_iteration: true, session_titles: false, permission_mode: "yolo" });
+  fixture.save();
+  writeFileSync(join(fixture.workspace, "evidence.txt"), "Retained fixture evidence.");
+  const client = await AcpClient.create({ cwd: fixture.workspace, env: { ...fixture.env, FX_MAX_AGENT_STEPS: undefined } });
+  try {
+    await client.request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+    const created = await client.request("session/new", { cwd: fixture.workspace, mcpServers: [] }) as any;
+    expect(created.error).toBeUndefined();
+    const result = await client.request("session/prompt", { prompt: [{ type: "text", text: "Read the evidence, then explain the finding and remaining gaps." }] }) as any;
+    expect(result.error).toBeUndefined();
+    expect(result.result.stopReason).toBe("end_turn");
+    expect(calls).toBe(2);
+    expect(client.rawLines.join("\n")).toContain("remaining coverage is incomplete");
+    client.endStdin();
+    expect(await client.waitForExit()).toBe(0);
+    expect(client.stderr).toBe("");
+  } finally { await client.close(); fixture.close(); }
+}, 30000);
+
+test("configured provider ACP reports an exhausted step cap as max model turns", async () => {
+  const fixture = createConfiguredProviderFixture(body => configuredToolCompletion(body.model, "read_file", { path: "evidence.txt" }));
+  Object.assign(fixture.settings, { max_agent_steps: 1, session_titles: false, permission_mode: "yolo" });
+  fixture.save();
+  writeFileSync(join(fixture.workspace, "evidence.txt"), "Retained fixture evidence.");
+  const client = await AcpClient.create({ cwd: fixture.workspace, env: { ...fixture.env, FX_MAX_AGENT_STEPS: undefined } });
+  try {
+    await client.request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+    const created = await client.request("session/new", { cwd: fixture.workspace, mcpServers: [] }) as any;
+    expect(created.error).toBeUndefined();
+    const result = await client.request("session/prompt", { prompt: [{ type: "text", text: "Read the evidence." }] }) as any;
+    expect(result.error).toBeUndefined();
+    expect(result.result.stopReason).toBe("max_model_turns");
+    expect(fixture.requests).toHaveLength(1);
     client.endStdin();
     expect(await client.waitForExit()).toBe(0);
     expect(client.stderr).toBe("");

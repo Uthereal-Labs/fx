@@ -2527,7 +2527,7 @@ fn resolveModelOverride(raw_ctx: ?*anyopaque, alloc: Allocator, raw_model: []con
     return subagent_model_contract.matchCatalogModel(alloc, ids.items, raw_model);
 }
 
-fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, disposition: ?types.ProviderCompletionDisposition) !void {
+fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, disposition: ?types.ProviderCompletionDisposition, _: ?types.TurnTerminationCause) !void {
     std.debug.assert(turn_id != 0);
     _ = disposition;
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
@@ -5453,7 +5453,7 @@ test "fx ask deps validate malformed registered calls" {
     defer ctx.deinit();
 
     const deps = agentRuntimeDeps(&ctx);
-    try deps.finalize_turn(deps.ctx, 8, .completed, null);
+    try deps.finalize_turn(deps.ctx, 8, .completed, null, null);
     try std.testing.expectEqual(@as(usize, 0), ctx.worker.worker_events.items.len);
     const validate = deps.validate_tool_call orelse return error.TestExpectedEqual;
     const result = try validate(deps.ctx, alloc, .{
@@ -5634,7 +5634,7 @@ test "fx ask finalization fails every failed turn" {
         defer ctx.deinit();
         const deps = agentRuntimeDeps(&ctx);
 
-        try deps.finalize_turn(deps.ctx, 8, case.outcome, case.disposition);
+        try deps.finalize_turn(deps.ctx, 8, case.outcome, case.disposition, null);
 
         try std.testing.expectEqual(case.expected_failed, ctx.failed);
         try std.testing.expectEqual(@as(usize, 0), ctx.worker.worker_events.items.len);
@@ -9776,7 +9776,7 @@ test "CLI keeps an unreplaced preview on failure and discards it on completion" 
         try deps.push_text(deps.ctx, .{ .assistant_source = "Retained preview." });
         try deps.push_text(deps.ctx, .{ .assistant_restarted = "Restart\n" });
         try deps.push_text(deps.ctx, .{ .assistant_restarted = "Restart\n" });
-        try deps.finalize_turn(deps.ctx, 1, outcome, null);
+        try deps.finalize_turn(deps.ctx, 1, outcome, null, null);
         try std.testing.expectEqualStrings(
             if (outcome == .completed) "Completed commentary.\n\n" else "Completed commentary.\n\nRetained preview.",
             ctx.assistant_output.items,

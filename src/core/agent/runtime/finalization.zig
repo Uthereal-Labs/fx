@@ -40,6 +40,7 @@ pub const TurnFinalizationGuard = struct {
     lifecycle: LifecycleContext,
     state: State = .open,
     outcome: ?types.TurnPresentationOutcome = null,
+    termination_cause: ?types.TurnTerminationCause = null,
     compacted_execution: execution_memory.CompactedExecutionBoundary = .{},
     lease_allocator: Allocator = std.heap.c_allocator,
     agent_terminal_leases: std.ArrayList([]u8) = .empty,
@@ -124,7 +125,7 @@ pub const TurnFinalizationGuard = struct {
 
         self.cleanup_agent_terminal_leases();
 
-        self.deps.finalize_turn(self.deps.ctx, self.turn_id, outcome, disposition) catch |err| {
+        self.deps.finalize_turn(self.deps.ctx, self.turn_id, outcome, disposition, self.termination_cause) catch |err| {
             self.state = .fatal;
             if (finished_prompt) |finished| {
                 types.freeFinishedPrompt(std.heap.c_allocator, finished);

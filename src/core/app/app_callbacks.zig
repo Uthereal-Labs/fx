@@ -843,7 +843,7 @@ pub fn Bindings(comptime App: type) type {
             try app.cooperativeTransportPulse();
         }
 
-        fn agentFinalizeTurn(ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, _: ?types.ProviderCompletionDisposition) !void {
+        fn agentFinalizeTurn(ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, _: ?types.ProviderCompletionDisposition, _: ?types.TurnTerminationCause) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app.worker.pushTurnFinished(std.heap.c_allocator, .{
                 .turn_id = turn_id,
@@ -2425,7 +2425,7 @@ test "agent deps forward app callbacks through core types" {
     try std.testing.expect(deps.prepare_parent_turn_context == null);
     try std.testing.expect(deps.acknowledge_parent_turn_context == null);
     try deps.push_text(deps.ctx, .{ .assistant_rendered = "hello" });
-    try deps.finalize_turn(deps.ctx, 9, .completed, .length_limited);
+    try deps.finalize_turn(deps.ctx, 9, .completed, .length_limited, null);
     try deps.propagate_history_turn(deps.ctx, .{ .compacted_summary = .{
         .summary = @constCast("summary"),
         .removed_turn_count = 1,
