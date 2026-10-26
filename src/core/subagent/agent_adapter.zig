@@ -686,6 +686,7 @@ fn finalizeTurn(
     _: u64,
     outcome: types.TurnPresentationOutcome,
     _: ?types.ProviderCompletionDisposition,
+    _: ?types.TurnTerminationCause,
 ) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
     context.turn_outcome = outcome;

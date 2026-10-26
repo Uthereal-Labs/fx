@@ -193,10 +193,7 @@ test "ultrafastPromptAllowed requires a verified Gateway capability" {
     try std.testing.expect(!ultrafastCapabilityAllowed(.gateway, true, false));
 }
 
-const AgentMessageKind = enum {
-    assistant,
-    operational,
-};
+const AgentMessageKind = acp_types.AgentMessageKind;
 
 const AcpContext = struct {
     alloc: Allocator,
@@ -252,7 +249,7 @@ const AcpContext = struct {
         defer if (plain.ptr != text.ptr) self.alloc.free(plain);
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
-        try acp_types.writeAgentMessageChunk(&out.writer, message_id, plain);
+        try acp_types.writeClassifiedAgentMessageChunk(&out.writer, message_id, plain, self.message_kind orelse .assistant);
         try self.sendUpdate(out.writer.buffered());
     }
 
@@ -1439,6 +1436,7 @@ fn buildAgentConfig(
         .provider_capabilities = state.cfg.provider_set.select(session.provider).capabilities,
         .custom_tool_guidance = sections.custom_tool_guidance,
         .agent_step_limit = session.agent_step_limit,
+        .finish_root_iteration = session.finish_root_iteration,
         .max_tool_result_bytes = session.max_tool_result_bytes,
         .short_tool_result_handles = session.short_tool_result_handles,
         .auto_compact_percent = state.auto_compact_percent,
@@ -2300,10 +2298,12 @@ fn availableModelCapabilities(
     );
 }
 
-fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, disposition: ?types.ProviderCompletionDisposition) !void {
+fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, disposition: ?types.ProviderCompletionDisposition, cause: ?types.TurnTerminationCause) !void {
     std.debug.assert(turn_id != 0);
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    if (disposition == .length_limited) {
+    if (cause == .step_limit) {
+        ctx.stop_reason = .max_model_turns;
+    } else if (disposition == .length_limited) {
         ctx.stop_reason = .max_output_tokens;
     } else if (outcome == .failed or outcome == .paused) {
         ctx.stop_reason = .refused;
@@ -5338,7 +5338,7 @@ test "ACP deps validate malformed registered calls" {
     var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
 
     const deps = agentRuntimeDeps(&ctx);
-    try deps.finalize_turn(deps.ctx, 8, .completed, null);
+    try deps.finalize_turn(deps.ctx, 8, .completed, null, null);
     const validate = deps.validate_tool_call orelse return error.TestExpectedEqual;
     const result = try validate(deps.ctx, arena, .{
         .id = "fetch",
@@ -5352,8 +5352,10 @@ test "ACP finalization maps failed turns and provider length" {
     const cases = [_]struct {
         outcome: types.TurnPresentationOutcome,
         disposition: ?types.ProviderCompletionDisposition,
+        cause: ?types.TurnTerminationCause = null,
         expected: acp_types.StopReason,
     }{
+        .{ .outcome = .failed, .disposition = null, .cause = .step_limit, .expected = .max_model_turns },
         .{ .outcome = .completed, .disposition = .length_limited, .expected = .max_output_tokens },
         .{ .outcome = .failed, .disposition = .length_limited, .expected = .max_output_tokens },
         .{ .outcome = .failed, .disposition = null, .expected = .refused },
@@ -5366,7 +5368,7 @@ test "ACP finalization maps failed turns and provider length" {
         var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
         const deps = agentRuntimeDeps(&ctx);
 
-        try deps.finalize_turn(deps.ctx, 8, case.outcome, case.disposition);
+        try deps.finalize_turn(deps.ctx, 8, case.outcome, case.disposition, case.cause);
 
         try std.testing.expectEqual(case.expected, ctx.stop_reason);
     }

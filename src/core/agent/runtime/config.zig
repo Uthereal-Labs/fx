@@ -43,6 +43,7 @@ pub const Config = struct {
     },
     custom_tool_guidance: []const u8 = "",
     agent_step_limit: usize,
+    finish_root_iteration: bool = false,
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     short_tool_result_handles: bool = false,
     /// Share of the model's usable input at which automatic compaction starts.

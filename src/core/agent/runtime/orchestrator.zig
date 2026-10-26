@@ -7016,6 +7016,8 @@ fn processQueuedPromptLoop(
     var step: usize = 0;
     agent_steps_loop: while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
         current_step_index = step + 1;
+        const finishing_root = config.finish_root_iteration and config.origin == .root and
+            config.agent_step_limit > 0 and current_step_index == config.agent_step_limit;
         if (deps.observer) |observer| observer.beginStep(current_step_index);
         defer if (deps.observer) |observer| observer.endStep();
         const step_ctx: TraceContext = .{ .turn_id = turn_id, .step_id = debug_trace.nextStepId(), .subagent_id = config.subagent_id };
@@ -7065,6 +7067,10 @@ fn processQueuedPromptLoop(
             return;
         }
         var ephemeral_overlay: std.ArrayList(ChatMessage) = .empty;
+        if (finishing_root) try ephemeral_overlay.append(overlay_arena, .{
+            .role = .system,
+            .content = "This is the final iteration of this root turn. Tools and delegation are unavailable. Answer the user from evidence already retained in this conversation. Cite only observed authorized references. State unresolved questions, unavailable evidence and material coverage gaps explicitly; do not claim unfinished research is complete.",
+        });
         if (skills.explicit) |section| {
             if (section.text.len > 0) try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = section.text });
         }
@@ -7399,7 +7405,7 @@ fn processQueuedPromptLoop(
                 try deps.push_text(deps.ctx, .{ .operational = "Fast mode is unavailable for this model right now; continuing at standard speed." });
                 try deps.push_text(deps.ctx, .{ .operational = "\n" });
             }
-            const tool_choice: types.ToolChoice = if (recovery_strategy == .reconcile_tool)
+            const tool_choice: types.ToolChoice = if (finishing_root or recovery_strategy == .reconcile_tool)
                 .none
             else if (configured_first_tool_choice_pending and vision_mode != .required)
                 config.first_call_tool_choice
@@ -7409,7 +7415,7 @@ fn processQueuedPromptLoop(
                 .model = gateway_model,
                 .instructions = gateway_instructions.items,
                 .messages = request_messages,
-                .tools = .{
+                .tools = if (finishing_root) .{} else .{
                     .registry = deps.tool_registry,
                     .advertised_names = config.advertised_tool_names,
                     .advertised_functions = config.advertised_functions,
@@ -9617,6 +9623,12 @@ fn processQueuedPromptLoop(
                     continue;
                 },
             }
+        }
+
+        if (finishing_root and completion.tool_calls.len > 0) {
+            finalization.termination_cause = .step_limit;
+            try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, config.step_limit_notice, "step_limit");
+            return;
         }
 
         try advertiseUnselectedMcpCalls(
@@ -12413,6 +12425,7 @@ fn processQueuedPromptLoop(
         }
     }
 
+    finalization.termination_cause = .step_limit;
     runtime_telemetry.traceStepLimitReached(.{
         .ctx = last_step_ctx,
         .step_index = current_step_index,

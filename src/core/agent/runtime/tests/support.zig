@@ -242,6 +242,7 @@ pub const FakeGateway = struct {
     completions: []const FakeCompletion,
     index: usize = 0,
     request_bodies: std.ArrayList([]u8) = .empty,
+    request_tool_choices: std.ArrayList(types.ToolChoice) = .empty,
     request_models: std.ArrayList([]u8) = .empty,
     request_api_keys: std.ArrayList([]u8) = .empty,
     request_session_ids: std.ArrayList(?[]u8) = .empty,
@@ -259,6 +260,7 @@ pub const FakeGateway = struct {
     pub fn deinit(self: *FakeGateway) void {
         for (self.request_bodies.items) |body| self.alloc.free(body);
         self.request_bodies.deinit(self.alloc);
+        self.request_tool_choices.deinit(self.alloc);
         for (self.request_models.items) |model| self.alloc.free(model);
         self.request_models.deinit(self.alloc);
         for (self.request_api_keys.items) |api_key| self.alloc.free(api_key);
@@ -282,6 +284,7 @@ pub const FakeGateway = struct {
         request: agent_stream_provider.ModelRequest,
     ) !agent_stream_provider.Result {
         if (self.observe_request) |observe| try observe(request);
+        try self.request_tool_choices.append(self.alloc, request.tool_choice);
         const payload = request.prepared_request_body orelse
             try builtin_gateway.buildAgentRequest(alloc, request.data());
         defer if (request.prepared_request_body == null) alloc.free(payload);
@@ -600,6 +603,7 @@ pub const FakeAgentRuntimeDeps = struct {
     finalization_count: usize = 0,
     finalized_turn_id: u64 = 0,
     finalized_outcome: ?types.TurnPresentationOutcome = null,
+    finalized_cause: ?types.TurnTerminationCause = null,
     finalized_disposition: ?types.ProviderCompletionDisposition = null,
     finalization_error: ?anyerror = null,
     terminal_lease_cleanup_ids: std.ArrayList([]u8) = .empty,
@@ -965,12 +969,13 @@ pub const FakeAgentRuntimeDeps = struct {
         return .cancel;
     }
 
-    fn finalizeTurn(raw: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, disposition: ?types.ProviderCompletionDisposition) !void {
+    fn finalizeTurn(raw: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, disposition: ?types.ProviderCompletionDisposition, cause: ?types.TurnTerminationCause) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         self.finalization_count += 1;
         self.finalized_turn_id = turn_id;
         self.finalized_outcome = outcome;
         self.finalized_disposition = disposition;
+        self.finalized_cause = cause;
         try self.record("event:turn_finished", .{});
         if (self.finalization_error) |err| return err;
     }

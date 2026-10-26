@@ -196,6 +196,8 @@ test "host-managed authority is runtime-only and cannot be persisted" {
     );
 }
 
+pub const TurnTerminationCause = enum { step_limit };
+
 pub const TurnPresentationOutcome = enum {
     completed,
     interrupted,
