@@ -1965,8 +1965,11 @@ const RemovalTarget = struct {
             },
             else => return storage.ioFault(err),
         };
-        target.lock = s.openFile(target.dir.?, "lock", .read_write) catch |err| return storage.ioFault(err);
-        if (!(s.tryLock(target.lock.?) catch |err| return storage.ioFault(err))) return error.Busy;
+        target.lock = s.openFile(target.dir.?, "lock", .read_write) catch |err| switch (err) {
+            error.NotFound => if (target.trashed) null else return error.Io,
+            else => return storage.ioFault(err),
+        };
+        if (target.lock) |lock| if (!(s.tryLock(lock) catch |err| return storage.ioFault(err))) return error.Busy;
         target.summary = readSummaryAt(env, target.dir.?) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => storage.ioFault(err),
@@ -1977,8 +1980,14 @@ const RemovalTarget = struct {
 
     fn deinit(target: *RemovalTarget, env: *const Env) void {
         if (target.summary) |*summary| summary.deinit(env.gpa);
+        target.closeHandles(env);
+    }
+
+    fn closeHandles(target: *RemovalTarget, env: *const Env) void {
         if (target.lock) |lock| env.s.closeFile(lock);
+        target.lock = null;
         if (target.dir) |dir| env.s.closeDir(dir);
+        target.dir = null;
     }
 
     fn inWorkspace(target: *const RemovalTarget, env: *const Env, workspace: []const u8) DeleteError!bool {
@@ -1994,15 +2003,19 @@ const RemovalTarget = struct {
 
     fn remove(target: *RemovalTarget, env: *const Env, trash: storage.Dir, outside: Removal, index: Removal) DeleteError!void {
         const s = env.s;
+        const owned = target.dir != null;
         // A failed outside cleanup leaves live custody beyond the trash sweeper.
-        try outside.finish(outside.context, target.id, target.dir != null);
-        if (target.dir != null and !target.trashed) {
+        try outside.finish(outside.context, target.id, owned);
+        // The publication fence still excludes writers. NFS must see no open
+        // member files when the tree is unlinked, or it can retain .nfs files.
+        target.closeHandles(env);
+        if (owned and !target.trashed) {
             s.rename(env.root, target.id, trash, target.id) catch |err| return storage.ioFault(err);
             target.trashed = true;
         }
         s.syncDir(env.root) catch |err| return storage.ioFault(err);
         s.syncDir(trash) catch |err| return storage.ioFault(err);
-        try index.finish(index.context, target.id, target.dir != null);
+        try index.finish(index.context, target.id, owned);
         s.deleteTree(trash, target.id) catch |err| return storage.ioFault(err);
         s.syncDir(trash) catch |err| return storage.ioFault(err);
     }
