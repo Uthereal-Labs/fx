@@ -1472,6 +1472,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         .session_load => sessions.handleLoadSession(state, alloc, msg),
         .session_resume => sessions.handleResumeSession(state, alloc, msg),
         .session_close => handleCloseSession(state, alloc, msg),
+        .session_remove => sessions.handleRemoveSession(state, alloc, msg),
         .session_list => sessions.handleListSessions(state, alloc, msg),
         .session_prompt => startPrompt(state, alloc, msg),
         .session_set_config_option => handleSetConfigOption(state, alloc, msg),
@@ -1488,7 +1489,6 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         .initialize,
         .request_cancel,
         .session_cancel,
-        .session_remove,
         .mcp_message,
         .unknown,
         => state.writer.writeError(alloc, msg.id, .{
