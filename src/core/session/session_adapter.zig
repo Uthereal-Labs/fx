@@ -236,6 +236,29 @@ pub const Store = struct {
     /// and a side folder not yet moved (D47).
     const outside_folders = [_][]const u8{ terminal_dir_name, files_dir_name };
 
+    /// Remove only a root of this workspace and its verified direct children.
+    pub fn removeRoot(store: *Store, id: []const u8, workspace: []const u8) !void {
+        try store.manager.removeRoot(id, workspace, .{ .context = store, .finish = finishRemoval });
+    }
+
+    fn finishRemoval(context: *anyopaque, id: []const u8, owned: bool) sm.IoFault!void {
+        const store: *Store = @ptrCast(@alignCast(context));
+        if (v1_conversion.hasFolder(store.home, id) catch return error.Io) return error.Io;
+        for (outside_folders) |root_name| {
+            var root = (store.openProfileFolder(root_name) catch return error.Io) orelse continue;
+            defer root.close();
+            if (root.dir.statFile(io_mod.getIo(), id, .{ .follow_symlinks = false })) |stat| {
+                // An absent native record cannot authorize erasing orphaned files.
+                if (!owned or stat.kind != .directory) return error.Io;
+                root.dir.deleteTree(io_mod.getIo(), id) catch return error.Io;
+            } else |err| switch (err) {
+                error.FileNotFound => {},
+                else => return error.Io,
+            }
+            io_mod.syncVerifiedDir(root.dir) catch return error.Io;
+        }
+    }
+
     /// Removes the folders of `id` outside the manager; `why` names the
     /// caller in the trace.
     fn removeFiles(store: *Store, id: []const u8, why: []const u8) void {
