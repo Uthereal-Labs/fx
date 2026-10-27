@@ -832,6 +832,32 @@ pub fn handleListWasmSessions(state: *server.ServerState, alloc: Allocator, msg:
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }
 
+pub fn handleRemoveSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
+    const params = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing params" });
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, params, .{}) catch
+        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid params" });
+    defer parsed.deinit();
+    const value = if (parsed.value == .object) parsed.value.object.get("sessionId") else null;
+    const session_id = if (value) |id| if (id == .string) id.string else return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing sessionId" }) else return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing sessionId" });
+    session_store.validateSessionId(session_id) catch return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid session ID" });
+    if (server.sessionsBackend(state) != .v1) return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = "Session removal is unavailable for this store" });
+    if (state.active_session) |*active| {
+        if (sameSessionId(active.session_id, session_id)) try server.releaseActiveSession(state);
+    }
+    var store = (if (state.cfg.home_override) |home|
+        session_store.Store.initFromHome(alloc, home, state.workspace_root)
+    else
+        session_store.Store.init(alloc, state.workspace_root)) catch
+        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = "Session store not available" });
+    defer store.deinit(alloc);
+    const result = store.removeCommittedSession(alloc, session_id) catch |err| {
+        debug_trace.logf("session", "event=session_remove outcome=failed err={s}", .{@errorName(err)});
+        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = "Session could not be removed" });
+    };
+    if (result != .discarded) return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = "Session removal was not confirmed" });
+    try state.writer.writeResponse(alloc, msg.id, "{}");
+}
+
 pub fn handleRemoveWasmSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
     const params = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing params" });
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, params, .{}) catch

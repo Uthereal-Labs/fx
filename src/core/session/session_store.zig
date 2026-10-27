@@ -791,6 +791,34 @@ pub const Store = struct {
         );
     }
 
+    /// Removes an exact session without rebinding its workspace. A retry also
+    /// syncs the parent when the session was removed before its reply arrived.
+    pub fn removeCommittedSession(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+    ) !PristineDiscardDisposition {
+        var loaded = self.resumeExactForWrite(
+            alloc,
+            session_id,
+            self.workspace_root,
+            false,
+            .{},
+        ) catch |err| switch (err) {
+            error.SessionNotFound => {
+                const sessions = self.canonical_root.sessions orelse return error.SessionStoreUnavailable;
+                try io_mod.syncVerifiedDir(sessions.dir);
+                return .discarded;
+            },
+            else => return err,
+        };
+        if (loaded.state.subagent_child) {
+            loaded.deinit(alloc);
+            return error.OneOffSessionNotResumable;
+        }
+        return self.deleteCommittedSession(alloc, &loaded);
+    }
+
     fn deleteWriterOwnedSession(
         self: Store,
         alloc: Allocator,
