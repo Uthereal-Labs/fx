@@ -16,6 +16,7 @@ const HandleNormalization = struct {
 
 pub const Input = struct {
     handle: []u8,
+    full: bool = false,
     selector: union(enum) {
         range: struct {
             start_byte: usize = 1,
@@ -55,6 +56,13 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
         }
         break :blk request.object;
     } else parsed.value.object;
+    const full = if (args.get("full")) |value| blk: {
+        if (value != .bool or !value.bool) return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result full must be true") };
+        break :blk true;
+    } else false;
+    if (full and (args.contains("search") or args.contains("query") or args.contains("start_byte") or args.contains("byte_count"))) {
+        return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result full cannot be combined with a range, query or search") };
+    }
     if (args.get("search")) |value| return decodeSearch(ctx.allocator, value);
     const handle_value = args.get("handle") orelse {
         return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result requires string field \"handle\"") };
@@ -65,7 +73,7 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
 
     const input = try ctx.allocator.create(Input);
     errdefer ctx.allocator.destroy(input);
-    input.* = .{ .handle = try ctx.allocator.dupe(u8, handle_value.string) };
+    input.* = .{ .handle = try ctx.allocator.dupe(u8, handle_value.string), .full = full };
     errdefer input.deinit(ctx.allocator);
 
     if (args.get("start_byte")) |value| {
@@ -146,6 +154,9 @@ pub fn validate(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolIn
     if (input.selector == .search) return null;
     const normalization = classifyHandleNormalization(input.handle);
     if (normalization.trimmed.len == 0) return try ctx.allocator.dupe(u8, "read_tool_result field \"handle\" must not be empty");
+    if (input.full and !std.mem.startsWith(u8, normalization.trimmed, "result-") and !result_aliases.isAlias(normalization.trimmed) and !result_store.isImageHandle(normalization.trimmed)) {
+        return try ctx.allocator.dupe(u8, "Complete reads support saved tool-result handles and stored images only. For captured command output or compacted records, use the existing byte range or literal query without full.");
+    }
     var record_buffer: compactor.RecordFileBuffer = undefined;
     if (compactor.recordFile(&record_buffer, normalization.trimmed)) |file| {
         // A turn, tool call or earlier compaction saved by compaction, opened
@@ -200,12 +211,21 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
     }
 
     const output = readOutput(ctx, input) catch |err| {
+        if (err == error.CompleteResultTooLarge) return .{ .failure = try ctx.allocator.print(
+            "Complete saved result {s} exceeds the {d}-byte limit. Narrow the original tool request or split an exact-object batch and read each object again. A single oversized object remains unverified; partial ranges and queries do not establish its complete result.",
+            .{ input.handle, @min(ctx.max_tool_result_bytes, result_store.read_max_bytes) },
+        ) };
         return .{ .failure = try formatReadFailure(ctx.allocator, input.handle, err) };
     };
     return .{ .success = output };
 }
 
 fn readOutput(ctx: tool_dispatch.DispatchContext, input: *Input) ![]u8 {
+    if (input.full) {
+        if (ctx.session_child_capability) |capability| return result_store.readCompleteManaged(ctx.allocator, capability, input.handle, ctx.max_tool_result_bytes);
+        const dir = ctx.tool_result_dir orelse return error.CompleteResultUnavailable;
+        return result_store.readComplete(ctx.allocator, dir, input.handle, ctx.max_tool_result_bytes);
+    }
     if (ctx.session_child_capability) |capability| {
         const ordinary = switch (input.selector) {
             .query => |query| result_store.searchByQueryManaged(ctx.allocator, capability, input.handle, query),
@@ -580,7 +600,7 @@ test "large web_search result is previewed and available through read_tool_resul
     try output.appendSlice(alloc, "search preview\nneedle from full search result\n");
     try output.appendNTimes(alloc, 'x', result_store.large_result_threshold_bytes + 64);
 
-    const prepared = try result_store.prepare(alloc, dir, "call_search", "web_search", output.items.len, output.items, 1024);
+    const prepared = try result_store.prepare(alloc, dir, "call_search", "web_search", output.items.len, output.items, 1024, result_store.large_result_threshold_bytes);
     defer alloc.free(@constCast(prepared.model_output));
     defer alloc.free(@constCast(prepared.memory.output_handle.?));
     defer alloc.free(@constCast(prepared.memory.preview.?));
@@ -687,4 +707,63 @@ test "read_tool_result opens and searches turns and tool calls saved by compacti
             return error.TestExpectedDecodeFailure;
         },
     };
+}
+
+test "bounded evidence full reader rejects mixed selectors and fails atomically" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "\"full\":false", "\"full\":1", "\"full\":true,\"query\":\"x\"", "\"full\":true,\"start_byte\":1", "\"full\":true,\"byte_count\":65536", "\"full\":true,\"search\":[\"x\"]" }) |fields| {
+        const args = try alloc.print("{{\"request\":{{\"handle\":\"h\",{s}}}}}", .{fields});
+        defer alloc.free(args);
+        const decoded = try decode(.{ .allocator = alloc }, args);
+        switch (decoded) {
+            .failure => |failure| alloc.free(failure),
+            .input => |input| {
+                input.deinit(alloc);
+                return error.TestUnexpectedDecodeSuccess;
+            },
+        }
+    }
+    var memory = session_child_store.MemoryBlobsForTesting.init(alloc);
+    defer memory.deinit();
+    var capability = try session_child_store.SessionChildCapability.initBlobs(alloc, memory.blobs(), "", .writable);
+    defer capability.deinit();
+    const raw = try alloc.alloc(u8, result_store.read_max_bytes + 1);
+    defer alloc.free(raw);
+    @memset(raw, 'x');
+    const handle = try result_store.storeLargeResultManaged(alloc, &capability, "full", "fixture", raw);
+    defer alloc.free(handle);
+    const args = try alloc.print("{{\"request\":{{\"handle\":\"{s}\",\"full\":true}}}}", .{handle});
+    defer alloc.free(args);
+    const ctx: tool_dispatch.DispatchContext = .{ .allocator = alloc, .session_child_capability = &capability };
+    const decoded = try decode(ctx, args);
+    const input = decoded.input;
+    defer input.deinit(alloc);
+    const result = try call(ctx, input);
+    switch (result) {
+        .failure => |failure| {
+            defer alloc.free(failure);
+            try std.testing.expect(std.mem.find(u8, failure, "65536-byte limit") != null);
+            try std.testing.expect(std.mem.find(u8, failure, "Narrow the original tool request") != null);
+            try std.testing.expect(std.mem.find(u8, failure, "xxxx") == null);
+        },
+        else => return error.TestUnexpectedFullReadSuccess,
+    }
+}
+
+test "bounded evidence full mode explains unsupported handles without changing old readers" {
+    const alloc = std.testing.allocator;
+    const ctx: tool_dispatch.DispatchContext = .{ .allocator = alloc };
+    for ([_][]const u8{ "M12", "fx-command-replay-test.bin" }) |handle| {
+        for ([_]bool{ false, true }) |full| {
+            const args = try alloc.print("{{\"handle\":\"{s}\"{s}}}", .{ handle, if (full) ",\"full\":true" else "" });
+            defer alloc.free(args);
+            const decoded = try decode(ctx, args);
+            const input = decoded.input;
+            defer input.deinit(alloc);
+            const failure = try validate(ctx, input);
+            defer if (failure) |text| alloc.free(text);
+            try std.testing.expectEqual(full, failure != null);
+            if (failure) |text| try std.testing.expect(std.mem.find(u8, text, "without full") != null);
+        }
+    }
 }

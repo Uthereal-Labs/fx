@@ -1948,6 +1948,9 @@ fn validateKnownSettingsObject(
     if (object.get("finish_root_iteration")) |value| {
         if (value != .bool) return error.InvalidSettingsFormat;
     }
+    if (object.get("inline_tool_result_bytes")) |value| {
+        if (value != .integer or value.integer < 1 or value.integer > 64 * 1024) return error.InvalidSettingsFormat;
+    }
     if (object.get("short_tool_result_handles")) |value| {
         if (value != .bool) return error.InvalidSettingsFormat;
     }

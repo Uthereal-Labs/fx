@@ -144,6 +144,7 @@ pub const StartupState = struct {
     agent_step_limit: usize,
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     short_tool_result_handles: bool = false,
+    inline_tool_result_bytes: usize = 16 * 1024,
     finish_root_iteration: bool = false,
     auto_compact_percent: u8 = compactor.default_percent,
     context_limits: config_runtime.context_limits.Values = .{},
@@ -773,6 +774,7 @@ fn loadStartupStateWithKeychainRead(
     state.agent_step_limit = loadAgentStepLimit(default_agent_step_limit, settings.max_agent_steps);
     state.max_tool_result_bytes = tool_result_limits.resolveMaxToolResultBytes(settings.max_tool_result_bytes, tool_result_limits.default_max_tool_result_bytes);
     state.short_tool_result_handles = settings.short_tool_result_handles orelse false;
+    state.inline_tool_result_bytes = settings.inline_tool_result_bytes orelse 16 * 1024;
     state.finish_root_iteration = settings.finish_root_iteration orelse false;
     state.auto_compact_percent = compactor.resolvePercent(settings.auto_compact_percent, io_mod.getenv("FX_AUTO_COMPACT_PERCENT"));
     state.context_limits = config_runtime.resolveContextLimits(settings, &.{});

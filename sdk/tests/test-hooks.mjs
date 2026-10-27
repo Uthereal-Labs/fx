@@ -151,6 +151,7 @@ async function drain(turn) {
       const end = ends.find((value) => value.data.call.callId === event.data.call.callId);
       const result = results.find((value) => value.data.call.callId === event.data.call.callId);
       assert.ok(end && result);
+      assert.equal(result.outputTruncated, false);
       assert.ok(events.indexOf(event) < events.indexOf(end));
       assert.ok(events.indexOf(end) < events.indexOf(result));
       assert.deepEqual(JSON.parse(event.data.call.argumentsJson), {

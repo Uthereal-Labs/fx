@@ -28,7 +28,7 @@ test "short result previews retain physical blobs and echo exact aliases on read
     const raw = try alloc.alloc(u8, large_result_threshold_bytes + 1);
     defer alloc.free(raw);
     @memset(raw, 'x');
-    const prepared = try prepareManagedWithAliases(alloc, &capability, "call", "read_file", raw.len, raw, 1024, true);
+    const prepared = try prepareManagedWithAliases(alloc, &capability, "call", "read_file", raw.len, raw, 1024, true, large_result_threshold_bytes);
     defer alloc.free(@constCast(prepared.model_output));
     defer alloc.free(@constCast(prepared.memory.output_handle.?));
     defer alloc.free(@constCast(prepared.memory.preview.?));
@@ -49,7 +49,7 @@ test "short result previews retain physical blobs and echo exact aliases on read
     const historical = try readByRangeManaged(alloc, &capability, physical, 1, 32);
     defer alloc.free(historical);
     try std.testing.expect(std.mem.find(u8, historical, physical) != null);
-    const ordinary = try prepareManaged(alloc, &capability, "ordinary", "read_file", raw.len, raw, 1024);
+    const ordinary = try prepareManaged(alloc, &capability, "ordinary", "read_file", raw.len, raw, 1024, large_result_threshold_bytes);
     defer alloc.free(@constCast(ordinary.model_output));
     defer alloc.free(@constCast(ordinary.memory.output_handle.?));
     defer alloc.free(@constCast(ordinary.memory.preview.?));
@@ -109,10 +109,11 @@ pub fn prepare(
     output_bytes: usize,
     durable_output: []const u8,
     inline_cap: usize,
+    inline_allowance: usize,
 ) !PreparedResult {
     if (result_dir) |dir| {
-        if (output_bytes > large_result_threshold_bytes or
-            durable_output.len > inline_cap)
+        if (output_bytes > @min(inline_allowance, inline_cap) or
+            durable_output.len > @min(inline_allowance, inline_cap))
         {
             return prepareStoredResult(
                 alloc,
@@ -151,8 +152,9 @@ pub fn prepareManaged(
     output_bytes: usize,
     durable_output: []const u8,
     inline_cap: usize,
+    inline_allowance: usize,
 ) !PreparedResult {
-    return prepareManagedWithAliases(alloc, capability, tool_call_id, tool_name, output_bytes, durable_output, inline_cap, false);
+    return prepareManagedWithAliases(alloc, capability, tool_call_id, tool_name, output_bytes, durable_output, inline_cap, false, inline_allowance);
 }
 
 pub fn prepareManagedWithAliases(
@@ -164,10 +166,11 @@ pub fn prepareManagedWithAliases(
     durable_output: []const u8,
     inline_cap: usize,
     short_handles: bool,
+    inline_allowance: usize,
 ) !PreparedResult {
     if (capability) |managed| {
-        if (output_bytes > large_result_threshold_bytes or
-            durable_output.len > inline_cap)
+        if (output_bytes > @min(inline_allowance, inline_cap) or
+            durable_output.len > @min(inline_allowance, inline_cap))
         {
             var prepared = try prepareStoredResult(
                 alloc,
@@ -584,6 +587,24 @@ pub fn formatStoredResultOutput(alloc: Allocator, handle: []const u8, preview: [
     );
 }
 
+pub fn readComplete(alloc: Allocator, result_dir: []const u8, handle: []const u8, max_bytes: usize) ![]u8 {
+    var capability = try session_child_store.SessionChildCapability.initLegacyRoute(alloc, result_dir, .tool_results, .read_only);
+    defer capability.deinit();
+    return readCompleteManaged(alloc, &capability, handle, max_bytes);
+}
+
+pub fn readCompleteManaged(alloc: Allocator, capability: *session_child_store.SessionChildCapability, handle: []const u8, max_bytes: usize) ![]u8 {
+    const physical = if (result_aliases.isAlias(handle)) try result_aliases.resolve(alloc, capability, handle) else try alloc.dupe(u8, handle);
+    defer alloc.free(physical);
+    var reader = try openReaderManaged(alloc, capability, physical);
+    defer reader.deinit();
+    if (reader.size > @min(max_bytes, read_max_bytes)) return error.CompleteResultTooLarge;
+    const text = try reader.readPage(alloc, 0, read_max_bytes);
+    defer alloc.free(text);
+    if (text.len != reader.size) return error.ResultSizeMismatch;
+    return alloc.print("<tool_result handle=\"{s}\" start_byte=\"1\" end_byte=\"{d}\" total_bytes=\"{d}\">\n{s}\n</tool_result>", .{ handle, text.len, text.len, text });
+}
+
 pub fn readByRange(alloc: Allocator, result_dir: []const u8, handle: []const u8, start_byte: usize, byte_count: usize) ![]u8 {
     var capability = try session_child_store.SessionChildCapability.initLegacyRoute(
         alloc,
@@ -669,25 +690,41 @@ pub fn searchByQueryManaged(
     const text = try readStoredTextManaged(alloc, capability, physical);
     defer alloc.free(text);
 
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    try out.writer.print("<tool_result_query handle=\"{s}\">\nquery: ", .{handle});
-    try std.json.Stringify.value(trimmed_query, .{}, &out.writer);
-    try out.writer.writeAll("\n");
-
+    var body: std.Io.Writer.Allocating = .init(alloc);
+    defer body.deinit();
+    const header = try alloc.print("<tool_result_query handle=\"{s}\">\nquery: ", .{handle});
+    defer alloc.free(header);
+    var query_json: std.Io.Writer.Allocating = .init(alloc);
+    defer query_json.deinit();
+    try std.json.Stringify.value(trimmed_query, .{}, &query_json.writer);
+    const footer = "</tool_result_query>";
+    // Reserve the larger partial header before accepting any matching line.
+    const overhead = header.len + " partial=\"true\"".len + query_json.written().len + 1 + footer.len;
+    const budget = read_max_bytes -| overhead;
     var matches: usize = 0;
+    var partial = overhead > read_max_bytes;
     var line_number: usize = 1;
     var line_iter = std.mem.splitScalar(u8, text, '\n');
     while (line_iter.next()) |line| : (line_number += 1) {
         if (std.mem.find(u8, line, trimmed_query) == null) continue;
-        try out.writer.print("{d}|{s}\n", .{ line_number, line });
+        const number = try alloc.print("{d}|", .{line_number});
+        defer alloc.free(number);
+        if (matches == 50 or number.len + line.len + 1 > budget -| body.written().len) {
+            partial = true;
+            break;
+        }
+        try body.writer.writeAll(number);
+        try body.writer.writeAll(line);
+        try body.writer.writeByte('\n');
         matches += 1;
-        if (matches >= 50 or out.written().len >= read_max_bytes) break;
     }
-
-    if (matches == 0) try out.writer.writeAll("(no matches)\n");
-    try out.writer.writeAll("</tool_result_query>");
-    return try out.toOwnedSlice();
+    if (matches == 0 and !partial) {
+        if ("(no matches)\n".len <= budget) {
+            try body.writer.writeAll("(no matches)\n");
+        } else partial = true;
+    }
+    if (overhead > read_max_bytes) return alloc.dupe(u8, "<tool_result_query partial=\"true\">Query framing exceeds the bounded reader limit.</tool_result_query>");
+    return alloc.print("<tool_result_query handle=\"{s}\"{s}>\nquery: {s}\n{s}{s}", .{ handle, if (partial) " partial=\"true\"" else "", query_json.written(), body.written(), footer });
 }
 
 /// A stored file's size; a v2 session's blob is only read whole.
@@ -959,7 +996,7 @@ test "large result storage creates stable handle and bounded preview" {
     defer alloc.free(dir);
 
     var bytes: [large_result_threshold_bytes + 128]u8 = @splat('x');
-    const prepared = try prepare(alloc, dir, "call/1", "run_command", bytes.len, bytes[0..], 64 * 1024);
+    const prepared = try prepare(alloc, dir, "call/1", "run_command", bytes.len, bytes[0..], 64 * 1024, large_result_threshold_bytes);
     defer alloc.free(prepared.model_output);
     defer alloc.free(@constCast(prepared.memory.output_handle.?));
     defer alloc.free(@constCast(prepared.memory.preview.?));
@@ -968,7 +1005,7 @@ test "large result storage creates stable handle and bounded preview" {
     try std.testing.expect(prepared.memory.preview.?.len <= preview_bytes);
     try std.testing.expect(std.mem.find(u8, prepared.model_output, prepared.memory.output_handle.?) != null);
 
-    const again = try prepare(alloc, dir, "call/1", "run_command", bytes.len, bytes[0..], 64 * 1024);
+    const again = try prepare(alloc, dir, "call/1", "run_command", bytes.len, bytes[0..], 64 * 1024, large_result_threshold_bytes);
     defer alloc.free(again.model_output);
     defer alloc.free(@constCast(again.memory.output_handle.?));
     defer alloc.free(@constCast(again.memory.preview.?));
@@ -984,7 +1021,7 @@ test "a v2 session stores results and images as blobs named by their hash (D44)"
 
     var bytes: [large_result_threshold_bytes + 128]u8 = @splat('x');
     bytes[3] = '\n';
-    const prepared = try prepareManaged(alloc, &capability, "call/1", "run_command", bytes.len, bytes[0..], 64 * 1024);
+    const prepared = try prepareManaged(alloc, &capability, "call/1", "run_command", bytes.len, bytes[0..], 64 * 1024, large_result_threshold_bytes);
     defer alloc.free(prepared.model_output);
     defer alloc.free(@constCast(prepared.memory.output_handle.?));
     defer alloc.free(@constCast(prepared.memory.preview.?));
@@ -1226,6 +1263,7 @@ test "saved preparation externalizes small results" {
         4,
         "done",
         64 * 1024,
+        large_result_threshold_bytes,
     );
     defer alloc.free(prepared.model_output);
     defer if (prepared.memory.output_handle) |handle| alloc.free(@constCast(handle));
@@ -1249,7 +1287,7 @@ test "inline cap and stored preview keep complete codepoints" {
 
     const inline_text = "x" ++ text_utils.repeat("\xc3\xa9", 300);
     for ([_]usize{ 128, 129 }) |cap| {
-        const prepared = try prepare(alloc, null, "call/2", "grep_files", inline_text.len, inline_text, cap);
+        const prepared = try prepare(alloc, null, "call/2", "grep_files", inline_text.len, inline_text, cap, large_result_threshold_bytes);
         defer alloc.free(prepared.model_output);
         const marker_start = std.mem.find(u8, prepared.model_output, "\n... [tool result truncated").?;
         const prefix = prepared.model_output[0..marker_start];
@@ -1262,7 +1300,7 @@ test "inline cap and stored preview keep complete codepoints" {
     const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(dir);
     const stored_text = "x" ++ text_utils.repeat("\xc3\xa9", 8200);
-    const stored = try prepare(alloc, dir, "call/3", "run_command", stored_text.len, stored_text, 64 * 1024);
+    const stored = try prepare(alloc, dir, "call/3", "run_command", stored_text.len, stored_text, 64 * 1024, large_result_threshold_bytes);
     defer alloc.free(stored.model_output);
     defer alloc.free(@constCast(stored.memory.output_handle.?));
     defer alloc.free(@constCast(stored.memory.preview.?));
@@ -1288,6 +1326,7 @@ test "large result handles never expose token-shaped call ids" {
         bytes.len,
         bytes[0..],
         bytes.len,
+        large_result_threshold_bytes,
     );
     defer alloc.free(prepared.model_output);
     defer alloc.free(@constCast(prepared.memory.output_handle.?));
@@ -1339,6 +1378,7 @@ fn expectLargeResultPreparationLeavesNoOrphan(route: PrepareRoute) !void {
                 bytes.len,
                 bytes[0..],
                 bytes.len,
+                large_result_threshold_bytes,
             ),
             .managed => prepareManaged(
                 alloc,
@@ -1348,6 +1388,7 @@ fn expectLargeResultPreparationLeavesNoOrphan(route: PrepareRoute) !void {
                 bytes.len,
                 bytes[0..],
                 bytes.len,
+                large_result_threshold_bytes,
             ),
         };
         if (prepared_result) |prepared| {
@@ -1425,6 +1466,7 @@ fn expectExistingLargeResultSurvivesPreparationFailure(
                 bytes.len,
                 bytes[0..],
                 bytes.len,
+                large_result_threshold_bytes,
             ),
             .managed => prepareManaged(
                 alloc,
@@ -1434,6 +1476,7 @@ fn expectExistingLargeResultSurvivesPreparationFailure(
                 bytes.len,
                 bytes[0..],
                 bytes.len,
+                large_result_threshold_bytes,
             ),
         };
         if (prepared_result) |prepared| {
@@ -1798,4 +1841,69 @@ test "stored tool images round trip and reject changed artifacts" {
     entry.deinit(alloc);
     try std.testing.expectError(error.ImageArtifactChanged, loadToolImages(alloc, &capability, handle));
     try std.testing.expectError(error.InvalidHandle, loadToolImages(alloc, &capability, "image-result-../../elsewhere"));
+}
+
+test "bounded evidence inline delivery retains complete durable bytes and default previews" {
+    const alloc = std.testing.allocator;
+    var memory = session_child_store.MemoryBlobsForTesting.init(alloc);
+    defer memory.deinit();
+    var capability = try session_child_store.SessionChildCapability.initBlobs(alloc, memory.blobs(), "", .writable);
+    defer capability.deinit();
+    for ([_]usize{ 16384, 16414, 65536, 65537 }) |size| {
+        const raw = try alloc.alloc(u8, size);
+        defer alloc.free(raw);
+        @memset(raw, 'x');
+        raw[size - 2] = 0xc3;
+        raw[size - 1] = 0xa9;
+        for ([_]usize{ large_result_threshold_bytes, 65536 }) |allowance| {
+            const prepared = try prepareManagedWithAliases(alloc, &capability, "call", "mcp_fixture_exact", raw.len, raw, 1024 * 1024, true, allowance);
+            defer alloc.free(@constCast(prepared.model_output));
+            defer alloc.free(@constCast(prepared.memory.output_handle.?));
+            defer alloc.free(@constCast(prepared.memory.preview.?));
+            try std.testing.expectEqual(size > allowance, prepared.memory.truncated);
+            if (size <= allowance) try std.testing.expectEqualStrings(raw, prepared.model_output);
+            const replay = try readForReplayManaged(alloc, &capability, prepared.memory.output_handle.?, size);
+            defer alloc.free(replay);
+            try std.testing.expectEqualStrings(raw, replay);
+            if (size <= read_max_bytes) {
+                const complete = try readCompleteManaged(alloc, &capability, prepared.memory.output_handle.?, read_max_bytes);
+                defer alloc.free(complete);
+                try std.testing.expect(complete.len <= 65 * 1024);
+                try std.testing.expect(std.mem.find(u8, complete, raw) != null);
+                try std.testing.expect(std.unicode.utf8ValidateSlice(complete));
+            } else {
+                try std.testing.expectError(error.CompleteResultTooLarge, readCompleteManaged(alloc, &capability, prepared.memory.output_handle.?, read_max_bytes));
+            }
+        }
+        const expanded = try prepareManagedWithAliases(alloc, &capability, "expanded", "mcp_fixture_exact", 1, raw, 1024 * 1024, true, 65536);
+        defer alloc.free(@constCast(expanded.model_output));
+        defer alloc.free(@constCast(expanded.memory.output_handle.?));
+        defer alloc.free(@constCast(expanded.memory.preview.?));
+        try std.testing.expectEqual(size > 65536, expanded.memory.truncated);
+        const capped = try prepareManagedWithAliases(alloc, &capability, "cap", "mcp_fixture_exact", raw.len, raw, 1024, true, 65536);
+        defer alloc.free(@constCast(capped.model_output));
+        defer alloc.free(@constCast(capped.memory.output_handle.?));
+        defer alloc.free(@constCast(capped.memory.preview.?));
+        try std.testing.expect(capped.memory.truncated);
+    }
+}
+
+test "bounded evidence query output marks omitted oversized lines and excess matches" {
+    const alloc = std.testing.allocator;
+    var memory = session_child_store.MemoryBlobsForTesting.init(alloc);
+    defer memory.deinit();
+    var capability = try session_child_store.SessionChildCapability.initBlobs(alloc, memory.blobs(), "", .writable);
+    defer capability.deinit();
+    const huge = try alloc.alloc(u8, read_max_bytes + 1);
+    defer alloc.free(huge);
+    @memset(huge, 'x');
+    for ([_][]const u8{ huge, text_utils.repeat("x\n", 51), text_utils.repeat("x\n", 50), "small complete line" }) |raw| {
+        const handle = try storeLargeResultManaged(alloc, &capability, "query", "fixture", raw);
+        defer alloc.free(handle);
+        const query = try searchByQueryManaged(alloc, &capability, handle, if (raw.len == 19) "small" else "x");
+        defer alloc.free(query);
+        try std.testing.expect(query.len <= read_max_bytes);
+        try std.testing.expectEqual(raw.len > read_max_bytes or raw.len == 102, std.mem.find(u8, query, "partial=\"true\"") != null);
+        try std.testing.expect(std.mem.endsWith(u8, query, "</tool_result_query>"));
+    }
 }

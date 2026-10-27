@@ -84,6 +84,7 @@ pub const Bridge = struct {
 };
 
 const max_content_bytes = 64 * 1024;
+const max_tool_output_bytes = 65 * 1024;
 const max_entries = 128;
 
 const MessageAllotment = struct { content: usize, arguments: []const usize };
@@ -284,6 +285,7 @@ const WireEvent = struct {
         inline for (@typeInfo(observation.Event).@"union".field_names) |name| {
             if (self.event == @field(std.meta.Tag(observation.Event), name)) try field(writer, "type", @field(names, name));
         }
+        var output_truncated: ?bool = null;
         var content = Content{ .alloc = self.bridge.alloc, .enabled = self.bridge.config.capture_content };
         try writer.objectField("data");
         try writer.beginObject();
@@ -373,7 +375,10 @@ const WireEvent = struct {
             .tool_result => |value| {
                 try writer.objectField("call");
                 try content.call(writer, value.call);
-                try content.writeText(writer, "output", value.output);
+                var output_content: Content = .{ .alloc = self.bridge.alloc, .enabled = content.enabled, .remaining = max_tool_output_bytes };
+                try output_content.writeText(writer, "output", value.output);
+                output_truncated = output_content.truncated;
+                content.truncated = content.truncated or output_content.truncated;
                 try field(writer, "status", @tagName(value.status));
             },
             .permission_end => |value| {
@@ -452,6 +457,7 @@ const WireEvent = struct {
             },
         }
         try writer.endObject();
+        if (output_truncated) |truncated| try field(writer, "outputTruncated", truncated);
         try field(writer, "contentCaptured", content.enabled);
         try field(writer, "contentTruncated", content.truncated);
         try writer.endObject();
@@ -596,4 +602,40 @@ test "libfx hook encoding failure cannot fail the execution callback" {
     bridge.observer.beginTurn("input", false);
     bridge.observer.endTurn(.completed, null);
     try std.testing.expect(bridge.observer.turn_ended);
+}
+
+test "bounded evidence tool output capture is independent of argument truncation" {
+    const alloc = std.testing.allocator;
+    const Capture = struct {
+        fn write(_: ?*anyopaque, _: []const u8) !void {}
+    };
+    var writer = jsonrpc.Writer.initCallback(null, Capture.write);
+    var bridge: Bridge = undefined;
+    bridge.init(alloc, &writer, "fixture-session", "fixture-turn", .{ .capture_content = true });
+    const arguments = try alloc.alloc(u8, max_content_bytes + 1);
+    defer alloc.free(arguments);
+    @memset(arguments, 'a');
+    for ([_]usize{ 65536, max_tool_output_bytes, max_tool_output_bytes + 1 }) |size| {
+        const output = try alloc.alloc(u8, size);
+        defer alloc.free(output);
+        @memset(output, 'x');
+        output[size - 2] = 0xc3;
+        output[size - 1] = 0xa9;
+        const wire: WireEvent = .{ .bridge = &bridge, .step = 1, .event = .{ .tool_result = .{
+            .call = .{ .id = "call", .name = "read_tool_result", .arguments_json = arguments },
+            .output = output,
+            .status = .success,
+        } } };
+        const encoded = try std.json.Stringify.valueAlloc(alloc, wire, .{});
+        defer alloc.free(encoded);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+        defer parsed.deinit();
+        const root = parsed.value.object;
+        const captured = root.get("data").?.object.get("output").?.string;
+        try std.testing.expect(root.get("contentTruncated").?.bool);
+        try std.testing.expectEqual(size > max_tool_output_bytes, root.get("outputTruncated").?.bool);
+        try std.testing.expect(captured.len <= max_tool_output_bytes);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(captured));
+        if (size <= max_tool_output_bytes) try std.testing.expectEqualStrings(output, captured);
+    }
 }
