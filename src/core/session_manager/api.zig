@@ -68,6 +68,7 @@ pub const SessionReadError = error{ InvalidArgument, SessionClosed, OutOfMemory 
 pub const BlobError = error{ InvalidArgument, NotFound, Corrupt, OutOfMemory } || storage.IoFault;
 pub const ListError = error{ Busy, OutOfMemory } || storage.IoFault;
 pub const DeleteError = error{ InvalidArgument, NotFound, Busy, OutOfMemory } || storage.IoFault;
+pub const Removal = session_mod.Removal;
 pub const DiscardError = error{InvalidArgument} || storage.IoFault;
 pub const VerifyError = error{ InvalidArgument, NotFound, OutOfMemory } || storage.IoFault;
 pub const RebuildError = error{ Busy, OutOfMemory } || storage.IoFault;
@@ -453,6 +454,19 @@ pub const Manager = struct {
         try checkId(id);
         if (!try readyToRead(m)) return error.NotFound;
         return m.deleteDepth(id, 0);
+    }
+
+    /// Scoped host removal, including exact retries from trash and host-owned files.
+    pub fn removeRoot(m: *Manager, id: []const u8, workspace: []const u8, outside: Removal) DeleteError!void {
+        try checkId(id);
+        try checkText(workspace);
+        if (!try readyToRead(m)) return outside.finish(outside.context, id, false);
+        try session_mod.removeRoot(&m.env, id, workspace, outside, .{ .context = m, .finish = recordRemoval });
+    }
+
+    fn recordRemoval(context: *anyopaque, id: []const u8, _: bool) session_mod.DeleteError!void {
+        const m: *Manager = @ptrCast(@alignCast(context));
+        try m.catalog().del(id, m.nowMs());
     }
 
     fn deleteDepth(m: *Manager, id: []const u8, depth: usize) DeleteError!void {

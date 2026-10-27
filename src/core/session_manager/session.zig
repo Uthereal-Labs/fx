@@ -1900,6 +1900,114 @@ fn copyFolded(session: *Session, copied: []const u8, fork_seq: u64) AppendError!
 
 pub const DeleteError = error{ NotFound, Busy, OutOfMemory } || storage.IoFault;
 
+pub const Removal = struct {
+    context: *anyopaque,
+    /// `owned` is false only when neither a live nor a trashed record exists.
+    finish: *const fn (*anyopaque, []const u8, bool) DeleteError!void,
+};
+
+/// Remove a verified root and its direct children under the publication fence.
+/// Keep trashed logs until the caller confirms its index and outside cleanup.
+pub fn removeRoot(env: *const Env, id_: []const u8, workspace: []const u8, outside: Removal, index: Removal) DeleteError!void {
+    const s = env.s;
+    const publication = try acquirePublicationFence(env, 0);
+    defer s.closeFile(publication);
+    const trash = s.ensureDir(env.root, ".trash") catch |err| return storage.ioFault(err);
+    defer s.closeDir(trash);
+    var targets: std.ArrayList(RemovalTarget) = .empty;
+    defer {
+        for (targets.items) |*target| target.deinit(env);
+        targets.deinit(env.gpa);
+    }
+    {
+        var target = try RemovalTarget.open(env, trash, id_);
+        errdefer target.deinit(env);
+        try targets.append(env.gpa, target);
+    }
+    if (targets.items[0].summary) |root| {
+        if (root.identity.role != .root or !try targets.items[0].inWorkspace(env, workspace)) return error.NotFound;
+        for (root.state.children.items) |child| {
+            for (targets.items) |target| if (std.mem.eql(u8, target.id, child.id)) return error.Io;
+            var target = try RemovalTarget.open(env, trash, child.id);
+            errdefer target.deinit(env);
+            if (target.summary) |saved| {
+                if (saved.identity.role != .child or saved.identity.parent == null or
+                    !std.mem.eql(u8, saved.identity.parent.?, id_) or !try target.inWorkspace(env, workspace) or
+                    saved.state.children.items.len != 0) return error.Io;
+            }
+            try targets.append(env.gpa, target);
+        }
+    }
+    // Every identity and writer lock is checked before the first removal.
+    for (targets.items[1..]) |*target| try target.remove(env, trash, outside, index);
+    try targets.items[0].remove(env, trash, outside, index);
+}
+
+const RemovalTarget = struct {
+    id: []const u8,
+    dir: ?storage.Dir = null,
+    lock: ?storage.File = null,
+    summary: ?Summary = null,
+    trashed: bool = false,
+
+    fn open(env: *const Env, trash: storage.Dir, id_: []const u8) DeleteError!RemovalTarget {
+        if (!schema.validId(id_)) return error.Io;
+        const s = env.s;
+        var target: RemovalTarget = .{ .id = id_ };
+        errdefer target.deinit(env);
+        target.dir = s.openDir(env.root, id_) catch |err| switch (err) {
+            error.NotFound => blk: {
+                target.trashed = true;
+                break :blk s.openDir(trash, id_) catch |missing| switch (missing) {
+                    error.NotFound => return target,
+                    else => return storage.ioFault(missing),
+                };
+            },
+            else => return storage.ioFault(err),
+        };
+        target.lock = s.openFile(target.dir.?, "lock", .read_write) catch |err| return storage.ioFault(err);
+        if (!(s.tryLock(target.lock.?) catch |err| return storage.ioFault(err))) return error.Busy;
+        target.summary = readSummaryAt(env, target.dir.?) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => storage.ioFault(err),
+        };
+        if (!std.mem.eql(u8, target.summary.?.identity.id, id_)) return error.Io;
+        return target;
+    }
+
+    fn deinit(target: *RemovalTarget, env: *const Env) void {
+        if (target.summary) |*summary| summary.deinit(env.gpa);
+        if (target.lock) |lock| env.s.closeFile(lock);
+        if (target.dir) |dir| env.s.closeDir(dir);
+    }
+
+    fn inWorkspace(target: *const RemovalTarget, env: *const Env, workspace: []const u8) DeleteError!bool {
+        const summary = target.summary orelse return false;
+        const raw = summary.state.workspace orelse return std.mem.eql(u8, summary.identity.workspace, workspace);
+        const parsed = std.json.parseFromSlice([]const u8, env.gpa, raw, .{}) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.Io,
+        };
+        defer parsed.deinit();
+        return std.mem.eql(u8, parsed.value, workspace);
+    }
+
+    fn remove(target: *RemovalTarget, env: *const Env, trash: storage.Dir, outside: Removal, index: Removal) DeleteError!void {
+        const s = env.s;
+        // A failed outside cleanup leaves live custody beyond the trash sweeper.
+        try outside.finish(outside.context, target.id, target.dir != null);
+        if (target.dir != null and !target.trashed) {
+            s.rename(env.root, target.id, trash, target.id) catch |err| return storage.ioFault(err);
+            target.trashed = true;
+        }
+        s.syncDir(env.root) catch |err| return storage.ioFault(err);
+        s.syncDir(trash) catch |err| return storage.ioFault(err);
+        try index.finish(index.context, target.id, target.dir != null);
+        s.deleteTree(trash, target.id) catch |err| return storage.ioFault(err);
+        s.syncDir(trash) catch |err| return storage.ioFault(err);
+    }
+};
+
 /// The child ids a session owns, from its `child_spawned` lines. The
 /// caller frees each id and the list.
 pub fn childrenOf(env: *const Env, id_: []const u8) DeleteError![][]u8 {
@@ -2105,10 +2213,15 @@ pub const Summary = struct {
 /// Line 1, the newest snapshot and the tail of a session, read-only.
 pub fn readSummary(env: *const Env, id_: []const u8) OpenError!Summary {
     const s = env.s;
-    const gpa = env.gpa;
     if (!schema.validId(id_)) return error.NotFound;
     const dir = s.openDir(env.root, id_) catch |err| return notFoundOr(err);
     defer s.closeDir(dir);
+    return readSummaryAt(env, dir);
+}
+
+fn readSummaryAt(env: *const Env, dir: storage.Dir) OpenError!Summary {
+    const s = env.s;
+    const gpa = env.gpa;
     const file = s.openFile(dir, "log.jsonl", .read_only) catch |err| return notFoundOr(err);
     defer s.closeFile(file);
     const len = s.length(file) catch |io_err| return storage.ioFault(io_err);
