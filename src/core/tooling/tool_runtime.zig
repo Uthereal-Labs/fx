@@ -126,6 +126,7 @@ pub const Context = struct {
     max_command_output_bytes: usize,
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     short_tool_result_handles: bool = false,
+    inline_tool_result_bytes: usize = 16 * 1024,
     /// Passed to subagent turns. See `Config.auto_compact_percent`.
     auto_compact_percent: u8 = compactor.default_percent,
     api_key: []const u8,

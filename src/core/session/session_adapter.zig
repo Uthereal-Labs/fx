@@ -6330,7 +6330,7 @@ test "short result aliases survive durable resume and retained-turn compaction" 
     const raw = try alloc.alloc(u8, result_store.large_result_threshold_bytes + 1);
     defer alloc.free(raw);
     @memset(raw, 'x');
-    const prepared = try result_store.prepareManagedWithAliases(alloc, capability, "call-1", "shell", raw.len, raw, 1024, true);
+    const prepared = try result_store.prepareManagedWithAliases(alloc, capability, "call-1", "shell", raw.len, raw, 1024, true, result_store.large_result_threshold_bytes);
     defer alloc.free(@constCast(prepared.model_output));
     defer alloc.free(@constCast(prepared.memory.output_handle.?));
     defer alloc.free(@constCast(prepared.memory.preview.?));

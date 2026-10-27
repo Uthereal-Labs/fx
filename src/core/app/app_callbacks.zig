@@ -803,6 +803,7 @@ pub fn Bindings(comptime App: type) type {
                     result.body.len,
                     try tool_result_limits.prepareSanitizedOutput(arena, result.body),
                     result.max_result_bytes,
+                    app.worker.agent_turn_settings.inline_tool_result_bytes,
                 );
                 debug_trace.eventf("subagent", "steering_context_prepared", .{ .turn_id = app.worker.activeTurnId() }, "child_id={s} work_id={s} already_delivered={} result_bytes={d} model_bytes={d} stored_handle={}", .{ result.child_id, result.work_id, result.delivered, result.body.len, prepared.model_output.len, prepared.memory.output_handle != null });
                 try std.json.Stringify.value(.{

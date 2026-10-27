@@ -591,11 +591,21 @@ pub fn prepareCapturedToolModelOutput(
     capture: ?*command_replay_store.Capture,
 ) !result_store.PreparedResult {
     if (std.mem.eql(u8, tool_call.name, "read_tool_result")) {
+        const parsed = std.json.parseFromSlice(std.json.Value, arena, tool_call.arguments_json, .{}) catch null;
+        defer if (parsed) |value| value.deinit();
+        const full_read = if (parsed) |value| blk: {
+            if (value.value != .object) break :blk false;
+            const request = value.value.object.get("request") orelse value.value;
+            if (request != .object) break :blk false;
+            const full = request.object.get("full") orelse break :blk false;
+            break :blk full == .bool and full.bool;
+        } else false;
+        const model_cap = if (full_read) @min(config.max_tool_result_bytes, result_store.read_max_bytes) + 1024 else config.max_tool_result_bytes;
         const prepared = try tool_result_limits.prepareModelOutputWithTruncation(
             arena,
             tool_call.name,
             raw_output,
-            config.max_tool_result_bytes,
+            model_cap,
         );
         errdefer arena.free(prepared.model_output);
         var memory: types.ToolResultMemory = .{
@@ -640,6 +650,7 @@ pub fn prepareCapturedToolModelOutput(
                 sanitized_output,
                 config.max_tool_result_bytes,
                 config.short_tool_result_handles,
+                config.inline_tool_result_bytes,
             );
         }
         return result_store.prepare(
@@ -650,6 +661,7 @@ pub fn prepareCapturedToolModelOutput(
             raw_output.len,
             sanitized_output,
             config.max_tool_result_bytes,
+            config.inline_tool_result_bytes,
         );
     }
     const model_output_budget = if (required_command_replay)
@@ -1996,4 +2008,26 @@ test "transcript does not mark native web_search as provider resource placeholde
 
     try std.testing.expect(!records[0].provider_native);
     try std.testing.expectEqualStrings("bounded search output", records[0].output);
+}
+
+test "bounded evidence full reader keeps framing without reoffloading at the default cap" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel = std.atomic.Value(bool).init(false);
+    const body = try arena.alloc(u8, result_store.read_max_bytes);
+    @memset(body, 'x');
+    const raw = try arena.print("<tool_result handle=\"result-fixture.txt\" start_byte=\"1\" end_byte=\"65536\" total_bytes=\"65536\">\n{s}\n</tool_result>", .{body});
+    const prepared = try prepareToolModelOutput(arena, .{
+        .system_prompt = "",
+        .gateway_retry_count = 0,
+        .gateway_chat_url = "",
+        .agent_step_limit = 1,
+        .max_tool_result_bytes = 65536,
+        .cancel_flag = &cancel,
+    }, toolCall("full", "read_tool_result", "{\"request\":{\"handle\":\"result-fixture.txt\",\"full\":true}}"), raw);
+    try std.testing.expectEqualStrings(raw, prepared.model_output);
+    try std.testing.expect(!prepared.memory.truncated);
+    try std.testing.expect(prepared.memory.output_handle == null);
 }

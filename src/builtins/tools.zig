@@ -219,7 +219,7 @@ const subagent_model_request_properties = [_]model_tool_schema.Property{.{
 const vision_description =
     "Inspect authorized images attached by the user or local image paths supplied in the conversation, and return structured factual evidence. Pass exactly one source: image_ids for attached images, or paths for local images. When to use: read visible text, UI state, objects, layout, or other visual details needed for the task. When NOT to use: inspect paths the user did not supply, infer details not visible in an image, or repeat evidence already available in the conversation.";
 const read_tool_result_description =
-    "Read a stored tool result or captured command output by opaque handle from the active session or process. Pass request.query to find a known literal line; otherwise use the optional request byte range. Turns, tool calls and earlier compactions saved by compaction open by their ID as the handle, like M12, T12 or L2, and request.search finds them by text. When to use: inspect more after a tool-result preview or command-output handle says retained output is available, or recover details of a compacted turn, tool call or earlier compaction. When NOT to use: read arbitrary files, search the workspace, recover secrets, or inspect results from another session or process.";
+    "Read a stored tool result or captured command output by opaque handle from the active session or process. Pass request.full=true to read an entire saved tool-result artifact up to 65536 bytes; captured command output and compacted records require the existing range or query modes; oversized results fail and require a narrower original request. Full reads cannot be combined with range, query or search fields. Pass request.query to find a known literal line; otherwise use the optional request byte range. Turns, tool calls and earlier compactions saved by compaction open by their ID as the handle, like M12, T12 or L2, and request.search finds them by text. When to use: inspect more after a tool-result preview or command-output handle says retained output is available, or recover details of a compacted turn, tool call or earlier compaction. When NOT to use: read arbitrary files, search the workspace, recover secrets, or inspect results from another session or process.";
 
 pub const glob_files = ToolSpec{
     .name = "glob_files",
@@ -797,10 +797,16 @@ const read_tool_result_search_properties = [_]model_tool_schema.Property{.{
     .description = "One to three searches over turns, tool calls and earlier compactions saved by compaction. Words match in any order; rarer words and exact phrases rank higher.",
 }};
 
+const read_tool_result_full_properties = [_]model_tool_schema.Property{
+    .{ .name = "handle", .json_type = .string, .description = "Exact saved-result handle from this session." },
+    .{ .name = "full", .json_type = .boolean, .description = "Must be true. Return the complete result only when its saved size is at most 65536 bytes; otherwise fail without partial content." },
+};
+
 const read_tool_result_input_schemas = [_]model_tool_schema.ObjectSchema{
     .{ .properties = &read_tool_result_range_properties, .required = &.{"handle"}, .additional_properties = false },
     .{ .properties = &read_tool_result_query_properties, .required = &.{ "handle", "query" }, .additional_properties = false },
     .{ .properties = &read_tool_result_search_properties, .required = &.{"search"}, .additional_properties = false },
+    .{ .properties = &read_tool_result_full_properties, .required = &.{ "handle", "full" }, .additional_properties = false },
 };
 
 const read_tool_result_request_schema = model_tool_schema.ObjectSchema{
@@ -1687,7 +1693,7 @@ test "built-in read_tool_result owns product metadata schema and callbacks" {
     try std.testing.expect(!input_schema.get("additionalProperties").?.bool);
     const request = input_schema.get("properties").?.object.get("request").?.object;
     const alternatives = request.get("oneOf").?.array.items;
-    try std.testing.expectEqual(@as(usize, 3), alternatives.len);
+    try std.testing.expectEqual(@as(usize, 4), alternatives.len);
     const range = alternatives[0].object;
     const query = alternatives[1].object;
     const search = alternatives[2].object;

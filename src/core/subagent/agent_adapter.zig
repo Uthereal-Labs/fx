@@ -255,6 +255,7 @@ pub fn run(
         .agent_settings = .{
             .max_tool_result_bytes = config.tool_context.max_tool_result_bytes,
             .short_tool_result_handles = config.tool_context.short_tool_result_handles,
+            .inline_tool_result_bytes = config.tool_context.inline_tool_result_bytes,
             .auto_compact_percent = config.tool_context.auto_compact_percent,
             .first_call_tool_choice = config.tool_context.first_call_tool_choice,
             .fast_mode = config.tool_context.fast_mode,
@@ -320,6 +321,7 @@ pub fn run(
             .agent_step_limit = config.tool_context.agent_step_limit,
             .max_tool_result_bytes = config.tool_context.max_tool_result_bytes,
             .short_tool_result_handles = config.tool_context.short_tool_result_handles,
+            .inline_tool_result_bytes = config.tool_context.inline_tool_result_bytes,
             .auto_compact_percent = config.tool_context.auto_compact_percent,
             .cancel_flag = cancel,
             .fast_mode = config.tool_context.fast_mode,

@@ -415,7 +415,7 @@ export type FxHookEvent = FxHookEnvelope & (
     usage?: { inputTokens: number; outputTokens: number; webSearchRequests: number };
   } }
   /** Acceptance into conversation memory, not proof of durable storage. */
-  | { type: "tool.result"; data: { call: FxHookToolCall; output?: string | null; status: "success" | "failure" } }
+  | { type: "tool.result"; outputTruncated: boolean; data: { call: FxHookToolCall; output?: string | null; status: "success" | "failure" } }
   /** Permission evaluation can complete without a human prompt. */
   | { type: "permission.end"; data: { call: FxHookToolCall; decision: "once" | "always" | "deny" | "policy_denied" | "permission_required" | null; error: string | null } }
   | { type: "wait.start"; data: { requestId: number | string; kind: FxWaitRequest["kind"]; callId: string | null; externalId: string | number | null; server: string | null; prompt?: string | null; schemaJson?: string | null; questionCount: number; questions?: { question: string; submission?: "none" | "input" | "choice"; options: { label: string; description?: string | null }[] }[] } }

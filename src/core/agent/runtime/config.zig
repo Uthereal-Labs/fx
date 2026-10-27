@@ -46,6 +46,7 @@ pub const Config = struct {
     finish_root_iteration: bool = false,
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     short_tool_result_handles: bool = false,
+    inline_tool_result_bytes: usize = 16 * 1024,
     /// Share of the model's usable input at which automatic compaction starts.
     auto_compact_percent: u8 = compactor.default_percent,
     step_limit_notice: []const u8 = default_step_limit_notice,

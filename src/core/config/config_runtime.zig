@@ -48,6 +48,7 @@ pub const Settings = struct {
     max_agent_steps: ?usize = null,
     max_tool_result_bytes: ?usize = null,
     short_tool_result_handles: ?bool = null,
+    inline_tool_result_bytes: ?usize = null,
     finish_root_iteration: ?bool = null,
     /// Share of usable input, 10 to 80 percent, at which automatic
     /// compaction starts. Profile-only.
@@ -1648,6 +1649,10 @@ fn parseProfileOnlyFields(
         if (value != .bool) return error.InvalidFinishRootIterationType;
         settings.finish_root_iteration = value.bool;
     }
+    if (root.object.get("inline_tool_result_bytes")) |value| {
+        if (value != .integer or value.integer < 1 or value.integer > 64 * 1024) return error.InvalidInlineToolResultBytes;
+        settings.inline_tool_result_bytes = @intCast(value.integer);
+    }
     if (root.object.get("short_tool_result_handles")) |value| {
         if (value != .bool) return error.InvalidShortToolResultHandlesType;
         settings.short_tool_result_handles = value.bool;
@@ -1975,6 +1980,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.yolo_acknowledged) |value| target.yolo_acknowledged = value;
     if (incoming.max_agent_steps) |value| target.max_agent_steps = value;
     if (incoming.max_tool_result_bytes) |value| target.max_tool_result_bytes = value;
+    if (incoming.inline_tool_result_bytes) |value| target.inline_tool_result_bytes = value;
     if (incoming.short_tool_result_handles) |value| target.short_tool_result_handles = value;
     if (incoming.finish_root_iteration) |value| target.finish_root_iteration = value;
     if (incoming.auto_compact_percent) |value| target.auto_compact_percent = value;
@@ -4774,4 +4780,23 @@ test "FX_ULTRAFAST overrides the profile and diagnoses malformed values" {
         if (diagnostic.cause == .invalid_ultrafast_mode_override) diagnosed = true;
     }
     try std.testing.expect(diagnosed);
+}
+
+test "bounded evidence inline allowance is profile-only validated and merged" {
+    const alloc = std.testing.allocator;
+    var absent = try parseSettingsJson(alloc, "{}");
+    defer absent.deinit(alloc);
+    try std.testing.expect(absent.inline_tool_result_bytes == null);
+    var enabled = try parseSettingsJson(alloc, "{\"inline_tool_result_bytes\":65536}");
+    defer enabled.deinit(alloc);
+    try mergeSettings(&absent, &enabled, alloc);
+    try std.testing.expectEqual(@as(usize, 65536), absent.inline_tool_result_bytes.?);
+    var project = try parseSettingsJsonForLayer(alloc, "{\"inline_tool_result_bytes\":65536}", .project);
+    defer project.deinit(alloc);
+    try std.testing.expect(project.inline_tool_result_bytes == null);
+    for ([_][]const u8{ "0", "-1", "65537", "true", "\"65536\"" }) |value| {
+        const raw = try alloc.print("{{\"inline_tool_result_bytes\":{s}}}", .{value});
+        defer alloc.free(raw);
+        try std.testing.expectError(error.InvalidInlineToolResultBytes, parseSettingsJson(alloc, raw));
+    }
 }

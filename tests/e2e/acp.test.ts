@@ -3024,6 +3024,75 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP bounded evidence delivery preserves inline output and complete saved recovery",
+    async () => {
+      for (const allowance of [16384, 65536]) {
+        const root = createIsolatedRoot("fx-acp-bounded-evidence-");
+        const pidPath = join(root.root, "fixture.pid");
+        const raw = "evidence-start:" + "x".repeat(16414) + ":evidence-end";
+        writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({
+          inline_tool_result_bytes: allowance,
+          max_tool_result_bytes: 1048576,
+          short_tool_result_handles: true,
+        }));
+        let step = 0;
+        let original = "";
+        const gateway = startDynamicFakeGateway((body) => {
+          step += 1;
+          if (step === 1) return fakeGatewayToolCall("select_bounded", "mcp_select_tool", { name: MCP_TOOL_NAME });
+          if (step === 2) return fakeGatewayToolCall("read_bounded", MCP_TOOL_NAME, { text: "inspect" });
+          if (step === 3) {
+            original = acpToolResultText(body, "read_bounded");
+            if (allowance === 16384) {
+              const handle = original.match(/<tool_result_handle>([^<]+)<\/tool_result_handle>/)?.[1];
+              if (!handle) throw new Error("Missing saved result handle");
+              return fakeGatewayToolCall("recover_bounded", "read_tool_result", { request: { handle, full: true } });
+            }
+          }
+          return finalText("Complete evidence inspected");
+        });
+        try {
+          client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+          await client.request("initialize", { protocolVersion: 1 }, 1);
+          const created = await client.request("session/new", {
+            cwd: root.workspace,
+            _meta: { fx: { hooks: { captureContent: true } } },
+            mcpServers: [acpStdioServer(raw, pidPath)],
+          }, 2) as any;
+          expect(created.error).toBeUndefined();
+          await client.readLine();
+          await client.request("session/set_mode", { modeId: "auto" }, 3);
+          const prompt = await runPrompt(client, "Inspect complete bounded evidence.", TIMEOUT);
+          expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+          const originalHook = client.hookEvents.find(event => event.type === "tool.result" && event.data.call.callId === "read_bounded");
+          expect(originalHook.outputTruncated).toBe(false);
+          expect(originalHook.data.output).toBe(original);
+          if (allowance === 16384) {
+            expect(original).toContain("<tool_result_preview");
+            const recovered = acpToolResultText(gateway.requests[3]!.body, "recover_bounded");
+            expect(recovered).toContain(raw);
+            expect(recovered).toContain('start_byte="1"');
+            expect(recovered).not.toContain("<tool_result_preview");
+            const recoveredHook = client.hookEvents.find(event => event.type === "tool.result" && event.data.call.callId === "recover_bounded");
+            expect(recoveredHook.outputTruncated).toBe(false);
+            expect(recoveredHook.data.output).toBe(recovered);
+          } else {
+            expect(original).toContain(raw);
+            expect(original).not.toContain("<tool_result_preview");
+          }
+          expect(client.stderr).toBe("");
+        } finally {
+          await client?.close();
+          if (existsSync(pidPath)) await expectMcpProcessExited(pidPath);
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
     "ACP session/new calls a supplied modern HTTP MCP server",
     async () => {
       const root = createIsolatedRoot("fx-acp-mcp-http-");
