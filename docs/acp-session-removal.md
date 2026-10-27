@@ -15,9 +15,13 @@ another workspace are refused.
 With `FX_SESSIONS_V2=1`, removal verifies the root and every direct child's
 current workspace and parent identity before changing any of them. It removes
 their terminal state and session files while their native records still prove
-ownership, then uses the v2 trash, index, and purge sequence. Interrupted removal
-can be retried with the same session ID. Unverifiable ownership, orphaned outside
-files without a native record, and nested children are refused. The current
+ownership, then closes each member's file and directory handles under the
+publication fence before using the v2 trash, index, and purge sequence. This
+avoids retaining an open lock file during NFS unlink. Interrupted removal can
+be retried with the same session ID. An exact trashed record may lack its lock
+file, but its scoped session log must still validate. Unverifiable ownership,
+orphaned outside files without a native record, and nested children are refused.
+The current
 subagent tool creates only direct children. A v2 removal also refuses a retained
 v1 folder with the same ID.
 
