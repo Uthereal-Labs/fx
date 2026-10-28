@@ -72,6 +72,7 @@ pub const State = struct {
     workspace: ?[]u8 = null,
     language: ?[]u8 = null,
     client_prompt: ?[]u8 = null,
+    client_prompt_mode: ?[]u8 = null,
     tool_identities: ?[]u8 = null,
     moved_files: ?[]u8 = null,
     compaction_records: ?[]u8 = null,
@@ -198,7 +199,7 @@ pub const State = struct {
     }
 };
 
-const setting_fields = .{ "prefs", "title", "permissions", "usage", "workspace", "language", "client_prompt", "tool_identities", "moved_files", "compaction_records", "v1_source" };
+const setting_fields = .{ "prefs", "title", "permissions", "usage", "workspace", "language", "client_prompt", "client_prompt_mode", "tool_identities", "moved_files", "compaction_records", "v1_source" };
 
 fn optionalEql(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null or b == null) return a == null and b == null;

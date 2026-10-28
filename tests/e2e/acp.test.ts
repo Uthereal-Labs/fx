@@ -3613,6 +3613,104 @@ describe("acp: model-independent", () => {
 
   for (const backend of SESSION_BACKENDS) {
     test(
+      `ACP replacement policy survives load and resume with neutral children${backend.suffix}`,
+      async () => {
+        const root = createIsolatedRoot("fx-acp-replace-policy-");
+        const marker = "HOST_ROOT_IDENTITY_ONLY";
+        const policy = `You are the host's founder coach. ${marker}`;
+        const shared = "MANAGED_AUTHORITY_FOR_ROOT_AND_CHILD";
+        const childTask = "Investigate the bounded source and return an internal handoff.";
+        const childCall = "replace_child";
+        const deniedCall = "replace_denied_write";
+        const target = join(root.external, "must-not-exist.txt");
+        writeFileSync(join(root.workspace, "AGENTS.md"), shared);
+        writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({
+          permission: { subagent: "allow", edit: { [`${root.external}/**`]: "deny" } },
+        }));
+        const systems = (body: string) => acpGatewayRequest(body).prompt
+          .filter(message => message.role === "system")
+          .map(message => acpContentText(message.content));
+        const checkRoot = (body: string) => {
+          const messages = systems(body);
+          expect(messages[0]).toBe(policy);
+          expect(messages.join("\n").split(marker)).toHaveLength(2);
+          expect(messages.join("\n")).toContain(shared);
+          expect(messages.join("\n")).not.toContain("<client_instructions>");
+          expect(messages.join("\n")).not.toContain("You are fx,");
+          expect(messages.join("\n")).not.toContain("# Workspace behavior");
+        };
+        let rootTurns = 0;
+        let childRequests = 0;
+        const route = (body: string) => {
+          if (acpPromptText(body).includes(childTask)) {
+            const context = systems(body).join("\n");
+            expect(context).not.toContain(marker);
+            expect(context).not.toContain("You are fx,");
+            expect(context).not.toContain("# Workspace behavior");
+            expect(context).toContain(shared);
+            childRequests += 1;
+            if (childRequests === 1) return fileToolCall(deniedCall, target, "forbidden");
+            expect(acpToolResultText(body, deniedCall)).toMatch(/denied|permission|not allowed|not available|not executed/i);
+            return finalText("bounded child handoff");
+          }
+          checkRoot(body);
+          if (body.includes(`"toolCallId":"${childCall}"`)) {
+            expect(acpToolResultText(body, childCall)).toContain("bounded child handoff");
+            return finalText("replacement root complete");
+          }
+          rootTurns += 1;
+          if (rootTurns === 1) return fakeGatewayToolCall(childCall, "subagent", {
+            request: { action: "run", task: childTask },
+          });
+          return finalText("replacement continuity complete");
+        };
+        const gateway = startFakeGateway(Array(6).fill(route));
+        try {
+          const environment = { ...fakeGatewayEnv(root, gateway), ...backend.env };
+          client = await AcpClient.create({ cwd: root.workspace, env: environment });
+          await client.request("initialize", { protocolVersion: 1 }, 1);
+          const created = await client.request("session/new", {
+            cwd: root.workspace, mcpServers: [],
+            systemPrompt: [{ type: "text", text: policy }], systemPromptMode: "replace",
+          }, 2) as any;
+          expect(created.error).toBeUndefined();
+          const sessionId = created.result.sessionId;
+          await client.readLine();
+          await client.request("session/set_mode", { modeId: "auto" }, 3);
+          expect((await runPrompt(client, "Delegate the bounded investigation.", TIMEOUT)).promptResult.result.stopReason).toBe("end_turn");
+          expect(childRequests).toBe(2);
+          expect(existsSync(target)).toBe(false);
+          expect(client.stderr).toBe("");
+          await client.close();
+          for (const method of ["session/load", "session/resume"]) {
+            client = await AcpClient.create({ cwd: root.workspace, env: environment });
+            await client.request("initialize", { protocolVersion: 1 }, 1);
+            const restored = await client.request(method, { sessionId, cwd: root.workspace, mcpServers: [] }, 2) as any;
+            expect(restored.error).toBeUndefined();
+            expect((await runPrompt(client, "Continue the same host policy.", TIMEOUT)).promptResult.result.stopReason).toBe("end_turn");
+            expect(client.stderr).toBe("");
+            await client.close();
+          }
+          expect(gateway.requests).toHaveLength(6);
+          if (!backend.v2) {
+            const policyPath = join(root.home, ".fx", "sessions", sessionId, "client", "system-prompt.json");
+            expect(JSON.parse(readFileSync(policyPath, "utf8"))).toEqual({ mode: "replace", text: policy });
+            writeFileSync(policyPath, JSON.stringify({ mode: "unknown", text: policy }));
+            client = await AcpClient.create({ cwd: root.workspace, env: environment });
+            await client.request("initialize", { protocolVersion: 1 }, 1);
+            const corrupt = await client.request("session/resume", { sessionId, cwd: root.workspace, mcpServers: [] }, 2) as any;
+            expect(corrupt.error.message).toBe("Session client system prompt could not be restored");
+          }
+        } finally {
+          await client?.close(); gateway.stop(); rmSync(root.root, { recursive: true, force: true });
+        }
+      },
+      LIVE_TIMEOUT,
+    );
+  }
+
+  for (const backend of SESSION_BACKENDS) {
+    test(
       `ACP delivers a client system prompt in the system slot and restores it on load${backend.suffix}`,
       async () => {
         const root = createIsolatedRoot("fx-acp-system-prompt-");
@@ -3647,7 +3745,7 @@ describe("acp: model-independent", () => {
             [22, {
               systemPrompt: [{ type: "text", text: "x" }],
               systemPromptMode: "override",
-            }, 'systemPromptMode supports only "append"'],
+            }, 'systemPromptMode supports "append" or "replace"'],
             [23, { systemPrompt: [{ type: "image", data: "AA==", mimeType: "image/png" }] },
               "systemPrompt supports text content blocks only"],
           ] as const) {

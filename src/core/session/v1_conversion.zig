@@ -941,7 +941,7 @@ pub fn fingerprintOf(a: Allocator, dir: *io_mod.VerifiedDir) ![64]u8 {
         if (!skip) try names.append(a, try a.dupe(u8, entry.name));
     }
     std.mem.sort([]const u8, names.items, {}, lessThan);
-    for ([_][]const u8{ "subagent/children.json", "client/system-prompt.txt", "client/mcp-tool-identities.json" }) |name| try names.append(a, name);
+    for ([_][]const u8{ "subagent/children.json", "client/system-prompt.txt", "client/system-prompt.json", "client/mcp-tool-identities.json" }) |name| try names.append(a, name);
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     var buffer: [64 * 1024]u8 = undefined;
     for (names.items) |name| {
