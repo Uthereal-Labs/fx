@@ -101,14 +101,14 @@ pub const Reason = enum { cancel, failed, closed, crash };
 pub const Outcome = enum { ok, failed, cancelled, interrupted, lost };
 /// `language` is the conversation language fx keeps per session, a JSON
 /// string such as `"es"` or `"und-Latn"` (D18); the index lists it.
-/// `client_prompt` (a JSON string) and `tool_identities` are an ACP
+/// `client_prompt`, `client_prompt_mode` (JSON strings), and `tool_identities` are an ACP
 /// client's settings (D46). `moved_files` records a session moved off fx's
 /// side folder: its value names the blob that maps old handles to blobs,
 /// and its line lists every moved blob (D47). `compaction_records` names
 /// the blob that maps fx's compactor record names to blobs, and its line
 /// lists the map and the records it adds (D50). `v1_source` is fx's record
 /// of the v1 session a converted one was copied from (D60).
-pub const SetKey = enum { prefs, title, permissions, usage, workspace, language, client_prompt, tool_identities, moved_files, compaction_records, v1_source };
+pub const SetKey = enum { prefs, title, permissions, usage, workspace, language, client_prompt, client_prompt_mode, tool_identities, moved_files, compaction_records, v1_source };
 
 pub const ForkOrigin = struct { id: []const u8, seq: u64 };
 

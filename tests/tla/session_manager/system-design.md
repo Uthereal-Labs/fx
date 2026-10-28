@@ -1008,17 +1008,21 @@ Settled while moving off the side folder (2026-10-01):
   terminal folder whose session is gone and that is more than a day old
   (as D36). **Why:** live shell state is not history, and it no longer
   depends on the side folder. **Alternative:** keep it in the side folder.
-- **D46 Decision:** the manager gains two setting keys, `client_prompt` and
-  `tool_identities`, whose values are fx's JSON. fx writes each only when it
-  changes, at most 64 KiB and 1,024 entries, well under a line. This
-  replaces D43's side files. **Why:** both are small session settings, and
+- **D46 Decision:** the manager keeps `client_prompt`, `client_prompt_mode`,
+  and `tool_identities` as setting keys whose values are fx's JSON. The ACP
+  replacement policy writes prompt text and mode in one batch; missing mode
+  retains legacy append behavior. Replacement policy is initialized once;
+  legacy prompts and tool identities are written only when they change.
+  Prompts are at most 64 KiB and tool identities at most 1,024 entries,
+  well under a line. This replaces D43's side files. **Why:** these are
+  small session settings, and
   the side folder goes away. **Alternative:** one generic host key, where a
   new tool identity would rewrite the client prompt too.
 - **D47 Decision:** an older v2 session moves to this layout on its first
   writable open. fx puts each side body its log names as a blob, and the map
   from each old handle to its hash as one more blob, then writes one batch:
   `set moved_files`, whose value names the map blob and whose line lists
-  every moved blob, plus the two settings from the old files. The map stays
+  every moved blob, plus the client settings from the old files. The map stays
   out of snapshots, which repeat every setting's value. It then
   renames the terminal folder and removes the side folder. Each step can be
   repeated, so a crash at any point redoes the move on the next open, and an

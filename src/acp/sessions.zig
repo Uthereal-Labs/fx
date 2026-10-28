@@ -407,6 +407,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         }),
     };
     defer if (client_system_prompt) |text| alloc.free(text);
+    const client_system_prompt_mode = try client_instructions.requestMode(alloc, msg.params_raw);
     var workspace = workspace_binding.prepare(state, alloc, msg.params_raw) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return state.writer.writeError(alloc, msg.id, .{
@@ -472,6 +473,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
                 .mcp_host = session_host,
                 .workspace = if (workspace) |*binding| binding else null,
                 .client_system_prompt = &client_system_prompt,
+                .client_system_prompt_mode = client_system_prompt_mode,
             });
         },
         .v2_unavailable => return state.writer.writeError(alloc, msg.id, .{
@@ -502,7 +504,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
     var writable_owned = true;
     defer if (writable_owned) writable.deinit(alloc);
     if (client_system_prompt) |text| {
-        persistClientSystemPrompt(alloc, .{ .v1 = &writable }, text) catch |err| {
+        persistClientSystemPrompt(alloc, .{ .v1 = &writable }, text, client_system_prompt_mode) catch |err| {
             debug_trace.logf("acp", "failed to persist client system prompt err={s}", .{@errorName(err)});
             _ = store.discardPristineStartedSession(alloc, &writable);
             writable_owned = false;
@@ -539,6 +541,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         .mcp = session_mcp,
         .mcp_host = session_host,
         .client_system_prompt = client_system_prompt,
+        .client_system_prompt_mode = client_system_prompt_mode,
         .workspace = if (workspace) |*binding| binding else null,
     }) catch {
         _ = store.discardPristineStartedSession(alloc, &writable);
@@ -572,11 +575,12 @@ const V2Start = struct {
     /// Owned by the caller. The session takes the text over on success, and
     /// this is then set to null.
     client_system_prompt: *?[]u8,
+    client_system_prompt_mode: client_instructions.Mode = .append,
 };
 
 /// `session/new` on v2. The session stays in memory until its first prompt,
-/// so one that never gets a prompt leaves no session behind (D24). A client
-/// prompt goes to the side folder at once, as v1 saves it (D27).
+/// so one that never gets a prompt leaves no session behind (D24). The client
+/// policy stays in the session's settings, including replacement mode (D46).
 fn startV2Session(
     state: *server.ServerState,
     alloc: Allocator,
@@ -611,7 +615,7 @@ fn startV2Session(
     var v2_owned = true;
     defer if (v2_owned) v2.close();
     if (start.client_system_prompt.*) |text| {
-        persistClientSystemPrompt(alloc, .{ .v2 = v2 }, text) catch |err| {
+        persistClientSystemPrompt(alloc, .{ .v2 = v2 }, text, start.client_system_prompt_mode) catch |err| {
             debug_trace.logf("acp", "failed to persist client system prompt err={s}", .{@errorName(err)});
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.internal_error,
@@ -642,6 +646,7 @@ fn startV2Session(
         .mcp = session_mcp,
         .mcp_host = session_host,
         .client_system_prompt = start.client_system_prompt.*,
+        .client_system_prompt_mode = start.client_system_prompt_mode,
         .workspace = start.workspace,
     }) catch
         return state.writer.writeError(alloc, msg.id, .{
@@ -1148,6 +1153,16 @@ fn handleRestoreSession(
         }),
     };
     defer if (client_system_prompt) |text| state.alloc.free(text);
+    const client_system_prompt_mode = restoredClientSystemPromptMode(state.alloc, saved_files) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.internal_error,
+            .message = "Session client system prompt could not be restored",
+        }),
+    };
+    if (client_system_prompt_mode == .replace and (client_system_prompt == null or client_system_prompt.?.len == 0)) {
+        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = "Session client system prompt could not be restored" });
+    }
     if (writable) |*value| value.releaseHydrationHistory(alloc);
     if (v2) |value|
         session_rt.configureWebFetchArtifactBlobs(alloc, try value.childCapability(), value.id())
@@ -1168,6 +1183,7 @@ fn handleRestoreSession(
         .mcp = session_mcp,
         .mcp_host = session_host,
         .client_system_prompt = client_system_prompt,
+        .client_system_prompt_mode = client_system_prompt_mode,
         .workspace = if (workspace) |*binding| binding else null,
     }) catch
         return state.writer.writeError(alloc, msg.id, .{
@@ -1481,6 +1497,7 @@ const SessionActivation = struct {
     /// Owned client prompt. The session takes it over on success; the caller
     /// frees it when activation fails.
     client_system_prompt: ?[]u8 = null,
+    client_system_prompt_mode: client_instructions.Mode = .append,
     /// Workspace named by the request's `cwd`, installed once the previous
     /// session is released. Left empty after a successful activation.
     workspace: ?*workspace_binding.Binding = null,
@@ -1505,11 +1522,26 @@ fn persistClientSystemPrompt(
     alloc: Allocator,
     files: SavedFiles,
     text: []const u8,
+    mode: client_instructions.Mode,
 ) !void {
     switch (files) {
-        .v1 => |writable| try client_instructions.persist(alloc, try writable.childCapability(), text),
-        .v2 => |session| try session.setClientPrompt(text),
+        .v1 => |writable| {
+            const capability = try writable.childCapability();
+            try client_instructions.persistPolicy(alloc, capability, text, mode);
+        },
+        .v2 => |session| if (mode == .append) try session.setClientPrompt(text) else try session.initializeClientPromptWithMode(text, @tagName(mode)),
     }
+}
+
+fn restoredClientSystemPromptMode(alloc: Allocator, files: SavedFiles) !client_instructions.Mode {
+    return switch (files) {
+        .v1 => |writable| try client_instructions.loadMode(alloc, try writable.childCapability()),
+        .v2 => |session| blk: {
+            const text = try session.clientPromptMode(alloc);
+            defer if (text) |value| alloc.free(value);
+            break :blk try client_instructions.restoredMode(text);
+        },
+    };
 }
 
 /// Returns the owned persisted client prompt of a restored session, or an
@@ -1606,6 +1638,7 @@ fn activateSession(
         .writable = restored_writable,
         .v2 = activation.v2,
         .client_system_prompt = client_system_prompt,
+        .client_system_prompt_mode = activation.client_system_prompt_mode,
         .tool_identities = tool_identities,
         .model = activation.model,
         .provider = activation.provider,

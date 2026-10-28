@@ -709,7 +709,7 @@ fn checkEvents(gpa: std.mem.Allocator, events: []const Event, import: bool) Appe
         },
         .set => |s| {
             switch (s.key) {
-                .title, .workspace, .client_prompt => try checkJsonString(gpa, s.value),
+                .title, .workspace, .client_prompt, .client_prompt_mode => try checkJsonString(gpa, s.value),
                 .language => try checkLanguage(gpa, s.value),
                 .prefs, .permissions, .usage, .tool_identities, .moved_files, .compaction_records, .v1_source => try checkJson(gpa, s.value),
             }
@@ -2126,6 +2126,7 @@ const api_tests = struct {
         try testing.expectError(error.InvalidArgument, s.append(&.{.{ .set = .{ .key = .client_prompt, .value = "{\"text\":1}" } }}));
         _ = try s.append(&.{
             .{ .set = .{ .key = .client_prompt, .value = "\"You run inside Mini.\"" } },
+            .{ .set = .{ .key = .client_prompt_mode, .value = "\"replace\"" } },
             .{ .set = .{ .key = .tool_identities, .value = "{\"mcp_mini_read\":{\"server\":\"mini\",\"tool\":\"read\"}}" } },
         });
         _ = try s.append(&.{ .turn_started, piece, .turn_committed });
@@ -2138,6 +2139,7 @@ const api_tests = struct {
         var st = try r.state(gpa);
         defer st.deinit(gpa);
         try testing.expectEqualStrings("\"You run inside Mini.\"", st.client_prompt.?);
+        try testing.expectEqualStrings("\"replace\"", st.client_prompt_mode.?);
         try testing.expectEqualStrings("{\"mcp_mini_read\":{\"server\":\"mini\",\"tool\":\"read\"}}", st.tool_identities.?);
     }
 };

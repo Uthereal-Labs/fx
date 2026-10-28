@@ -1,4 +1,5 @@
 const std = @import("std");
+const client_instructions = @import("client_instructions.zig");
 const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const observations = @import("../core/agent/observations.zig");
 const managed_execution = @import("../core/execution/managed_execution.zig");
@@ -262,9 +263,10 @@ pub const ActiveSessionState = struct {
     mcp: ?*mcp_runtime.McpRuntime = null,
     /// MCP-v2's host when FX_MCP_ENGINE=v2 selects it; `mcp` then stays null.
     mcp_host: ?*mcp_host.Host = null,
-    /// Session-scoped client system prompt, appended after fx's instructions.
+    /// Session-scoped client policy, appended or used as the root base by mode.
     /// Owned by the server allocator; empty when the client supplied none.
     client_system_prompt: []u8 = &.{},
+    client_system_prompt_mode: client_instructions.Mode = .append,
     /// MCP identities shown for earlier tool calls, for session/load replay.
     tool_identities: tool_call_identities.Record = .{},
     cancel_flag: std.atomic.Value(bool),

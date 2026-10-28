@@ -1079,7 +1079,7 @@ pub fn handlePrompt(
     const host_instructions = try client_instructions.compose(
         alloc,
         state.host_instructions,
-        session.client_system_prompt,
+        if (session.client_system_prompt_mode == .append) session.client_system_prompt else "",
     );
     defer alloc.free(host_instructions);
     for (state.context_snapshot.notices) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
@@ -1327,8 +1327,8 @@ pub fn runSubagentChild(
         .host = subagent_host,
         .tool_context = ctx.toolContext(),
         .provider_set = state.cfg.provider_set,
-        .system_prompt = state.cfg.prompt_policy.systemPromptFor(state.terminal_ui),
-        .model_prompt_overlay = state.cfg.prompt_policy.modelPromptOverlay(admission.model),
+        .system_prompt = if (active.client_system_prompt_mode == .replace) "" else state.cfg.prompt_policy.systemPromptFor(state.terminal_ui),
+        .model_prompt_overlay = modelPromptOverlay(state, active.client_system_prompt_mode, admission.model),
         .skill_catalog = .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
         .advertised_tool_names = child_projection.advertised_names,
         .advertised_functions = child_projection.advertised_functions,
@@ -1409,6 +1409,11 @@ fn initialDynamicTools(
     return tools.items;
 }
 
+// The same host-owned replacement boundary applies to root and child requests.
+fn modelPromptOverlay(state: *server.ServerState, mode: client_instructions.Mode, model: []const u8) ?[]const u8 {
+    return if (mode == .replace) null else state.cfg.prompt_policy.modelPromptOverlay(model);
+}
+
 const AgentConfigSections = struct {
     host_instructions: []const u8 = "",
     initial_dynamic_tools: ?[]const agent_stream_provider.DynamicFunctionTool = null,
@@ -1425,9 +1430,9 @@ fn buildAgentConfig(
     current_prompt_is_external: bool,
 ) agent_runtime.Config {
     return .{
-        .system_prompt = state.cfg.prompt_policy.systemPromptFor(state.terminal_ui),
+        .system_prompt = if (session.client_system_prompt_mode == .replace) session.client_system_prompt else state.cfg.prompt_policy.systemPromptFor(state.terminal_ui),
         .host_instructions = sections.host_instructions,
-        .model_prompt_overlay = state.cfg.prompt_policy.modelPromptOverlay(session.model),
+        .model_prompt_overlay = modelPromptOverlay(state, session.client_system_prompt_mode, session.model),
         .skill_catalog = sections.skill_catalog,
         .gateway_retry_count = state.cfg.gateway_retry_count,
         .gateway_chat_url = state.cfg.gateway_chat_url,
@@ -5899,4 +5904,23 @@ test "ACP MCP live completion emits the complete catalog-resolved result" {
     const update = parsed.value.object.get("params").?.object.get("update").?.object;
     try std.testing.expectEqualStrings("completed", update.get("status").?.string);
     try std.testing.expectEqualStrings(payload, update.get("content").?.array.items[0].object.get("content").?.object.get("text").?.string);
+}
+
+test "ACP replacement root policy suppresses native base and model overlay" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    const session = &state.active_session.?;
+    session.client_system_prompt = try alloc.dupe(u8, "host root policy");
+    const sections = AgentConfigSections{ .host_instructions = "separate host authority", .custom_tool_guidance = "" };
+    const appended = buildAgentConfig(&state, session, sections, true);
+    try std.testing.expectEqualStrings("test", appended.system_prompt);
+    try std.testing.expectEqualStrings("ACP test model overlay", appended.model_prompt_overlay.?);
+    session.client_system_prompt_mode = .replace;
+    const replaced = buildAgentConfig(&state, session, sections, true);
+    try std.testing.expectEqualStrings("host root policy", replaced.system_prompt);
+    try std.testing.expectEqual(@as(?[]const u8, null), replaced.model_prompt_overlay);
+    try std.testing.expectEqualStrings("separate host authority", replaced.host_instructions);
 }

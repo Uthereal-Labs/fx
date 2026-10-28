@@ -309,7 +309,7 @@ pub const AgentCapabilities = struct {
     mcp_servers: bool = true,
     /// Accepts steering prompts through `session/prompt` during a turn.
     steering: bool = false,
-    /// Accepts a client system prompt on `session/new` in append mode.
+    /// Accepts a client system prompt on `session/new` in append or replace mode.
     system_prompt: bool = false,
     /// Serves `type: "acp"` MCP servers over this connection.
     mcp_over_acp: bool = false,

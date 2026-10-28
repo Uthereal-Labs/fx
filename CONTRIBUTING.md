@@ -69,6 +69,33 @@ bun test cli.test.ts
 
 Zig unit tests sit in `test` blocks inside the source file they cover, and `zig build test` runs all of them. CI checks formatting with `zig fmt --check src/`. The end-to-end tests run the binary at `zig-out/bin/fx`, so build before you run them. Run only the end-to-end files that cover your change, because CI runs the whole suite on every push. The `tui-*` files drive fx inside tmux.
 
+### ACP client policies
+
+`session/new` accepts text blocks in `systemPrompt` and an optional
+`systemPromptMode`. The default, `"append"`, adds them after fx's built-in
+instructions. Use `"replace"` when your application owns the root policy:
+
+```json
+{
+  "cwd": "/workspace",
+  "mcpServers": [],
+  "systemPrompt": [{ "type": "text", "text": "You help founders evaluate startup ideas." }],
+  "systemPromptMode": "replace"
+}
+```
+
+Replacement uses the supplied text as the root base prompt exactly once and
+omits fx's built-in base prompt and model overlay. Host instructions and
+managed project guidance remain separate. Subagent children use an empty base
+with the existing project guidance and their bounded delegated task; they do
+not inherit the root's policy or fx's coding identity. Tool permissions apply
+in both modes.
+
+The session retains its prompt and mode across load and resume. Invalid saved
+policies fail restoration. Existing sessions without a saved mode retain append
+behavior. Both modes accept at most 64 KiB of text; replacement requires a
+nonempty `systemPrompt`.
+
 ### Private observation checks
 
 After building the native binary, run `python3 scripts/test-acp-observations.py`. The check uses a local mock provider and the binary at `zig-out/bin/fx`; it makes no paid model calls.

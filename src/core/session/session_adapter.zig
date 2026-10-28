@@ -1891,6 +1891,29 @@ pub const Session = struct {
         try self.putSetting(scratch.allocator(), .client_prompt, try jsonString(scratch.allocator(), text));
     }
 
+    /// The ACP prompt mode, or null for legacy append sessions. Caller owns it.
+    pub fn clientPromptMode(self: *Session, alloc: Allocator) !?[]u8 {
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        const raw = (try self.handle.state(scratch.allocator())).client_prompt_mode orelse return null;
+        return try alloc.dupe(u8, try std.json.parseFromSliceLeaky([]const u8, scratch.allocator(), raw, .{}));
+    }
+
+    /// Saves a new client's prompt and mode in one durable batch.
+    pub fn initializeClientPromptWithMode(self: *Session, text: []const u8, mode: []const u8) !void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        const current = try self.handle.state(sa);
+        if (current.client_prompt != null or current.client_prompt_mode != null) return error.ClientPromptAlreadySet;
+        _ = try self.write(&.{
+            .{ .set = .{ .key = .client_prompt, .value = try jsonString(sa, text) } },
+            .{ .set = .{ .key = .client_prompt_mode, .value = try jsonString(sa, mode) } },
+        });
+    }
+
     /// The MCP tool identities this ACP session recorded for replay, as
     /// their JSON object, or null. Caller owns it.
     pub fn toolIdentities(self: *Session, alloc: Allocator) !?[]u8 {
@@ -2227,12 +2250,17 @@ fn sideFileLines(a: Allocator, handle: sm.Session, side: *io_mod.VerifiedDir, fo
         try events.append(a, .{ .set = .{ .key = .moved_files, .value = value, .blobs = rest[0..take] } });
         rest = rest[take..];
     }
-    if (try readSideFile(a, side, moved_client_prompt_file, moved_client_prompt_max)) |text| {
+    if (try readSideFile(a, side, moved_client_prompt_policy_file, moved_client_prompt_max * 6 + 128, .reject)) |json| {
+        const policy = try std.json.parseFromSliceLeaky(struct { mode: enum { append, replace }, text: []const u8 }, a, json, .{});
+        if (policy.text.len == 0 or policy.text.len > moved_client_prompt_max or !std.unicode.utf8ValidateSlice(policy.text) or std.mem.findScalar(u8, policy.text, 0) != null) return error.InvalidArgument;
+        try events.append(a, .{ .set = .{ .key = .client_prompt, .value = try jsonString(a, policy.text) } });
+        try events.append(a, .{ .set = .{ .key = .client_prompt_mode, .value = try jsonString(a, @tagName(policy.mode)) } });
+    } else if (try readSideFile(a, side, moved_client_prompt_file, moved_client_prompt_max, .omit)) |text| {
         if (std.unicode.utf8ValidateSlice(text)) {
             try events.append(a, .{ .set = .{ .key = .client_prompt, .value = try jsonString(a, text) } });
         } else debug_trace.logf("session", "event=sessions_v2_move_dropped session={s} file={s} reason=not_utf8", .{ handle.id(), moved_client_prompt_file });
     }
-    if (try readSideFile(a, side, moved_tool_identities_file, moved_tool_identities_max)) |record| {
+    if (try readSideFile(a, side, moved_tool_identities_file, moved_tool_identities_max, .omit)) |record| {
         if (isJsonObject(a, record)) {
             try events.append(a, .{ .set = .{ .key = .tool_identities, .value = record } });
         } else debug_trace.logf("session", "event=sessions_v2_move_dropped session={s} file={s} reason=not_a_json_object", .{ handle.id(), moved_tool_identities_file });
@@ -2318,6 +2346,7 @@ fn putBodies(handle: sm.Session, bodies: []Body) PutBodyError!void {
 /// `client_instructions.file_name` and `tool_call_identities.file_name`
 /// name them under the `client` folder (D46).
 pub const moved_client_prompt_file = "client/system-prompt.txt";
+pub const moved_client_prompt_policy_file = "client/system-prompt.json";
 pub const moved_tool_identities_file = "client/mcp-tool-identities.json";
 const moved_client_prompt_max = 64 * 1024;
 const moved_tool_identities_max = 256 * 1024;
@@ -2325,7 +2354,7 @@ const moved_tool_identities_max = 256 * 1024;
 const moved_refs_per_line = 4096;
 
 /// A side file's bytes, or null when it is missing; at most `max_bytes`.
-fn readSideFile(a: Allocator, side: *io_mod.VerifiedDir, name: []const u8, max_bytes: usize) !?[]u8 {
+fn readSideFile(a: Allocator, side: *io_mod.VerifiedDir, name: []const u8, max_bytes: usize, oversized: enum { omit, reject }) !?[]u8 {
     var file = side.dir.openFile(io_mod.getIo(), name, .{ .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
@@ -2333,6 +2362,7 @@ fn readSideFile(a: Allocator, side: *io_mod.VerifiedDir, name: []const u8, max_b
     defer file.close(io_mod.getIo());
     return io_mod.readFileToEnd(a, &file, max_bytes + 1) catch |err| switch (err) {
         error.StreamTooLong => {
+            if (oversized == .reject) return error.StreamTooLong;
             debug_trace.logf("session", "event=sessions_v2_move_dropped file={s} reason=too_large", .{name});
             return null;
         },
@@ -6692,4 +6722,94 @@ test "only the adapter imports the session manager" {
         checked += 1;
     }
     try testing.expect(checked > 100);
+}
+
+test "ACP replacement policy migrates atomically and invalid mode never falls back to append" {
+    for ([_]enum { valid, invalid, oversized }{ .valid, .invalid, .oversized }) |kind| {
+        var t: TestHome = undefined;
+        try t.init();
+        defer t.deinit();
+        var model = "m".*;
+        const s = try Session.create(testing.allocator, &t.store, "/w", .acp, testSeed(&model));
+        const id = try testing.allocator.dupe(u8, s.id());
+        defer testing.allocator.free(id);
+        try OldSideFolder.commitTurn(&t, s);
+        try OldSideFolder.write(&t, id);
+        {
+            var files = (try t.store.openProfileFolder(files_dir_name)).?;
+            defer files.close();
+            var side = (try io_mod.openVerifiedPrivateDirIfPresent(&files, id)).?;
+            defer side.close();
+            const large = try testing.allocator.alloc(u8, moved_client_prompt_max * 6 + 130);
+            defer testing.allocator.free(large);
+            @memset(large, 'x');
+            if (kind == .oversized) {
+                try side.dir.writeFile(io_mod.getIo(), .{ .sub_path = moved_client_prompt_policy_file, .data = large });
+            } else try side.dir.writeFile(io_mod.getIo(), .{ .sub_path = moved_client_prompt_policy_file, .data = if (kind == .invalid) "{\"mode\":\"invalid\",\"text\":\"host policy\"}" else "{\"mode\":\"replace\",\"text\":\"host policy\"}" });
+        }
+        s.close();
+        if (kind != .valid) {
+            try testing.expectError(if (kind == .invalid) error.InvalidEnumTag else error.StreamTooLong, Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .acp));
+            try testing.expect(pathExists(&t, &.{ ".fx", files_dir_name, id }));
+        } else {
+            const restored = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .acp);
+            defer restored.close();
+            const prompt = (try restored.clientPrompt(testing.allocator)).?;
+            defer testing.allocator.free(prompt);
+            const mode = (try restored.clientPromptMode(testing.allocator)).?;
+            defer testing.allocator.free(mode);
+            try testing.expectEqualStrings("host policy", prompt);
+            try testing.expectEqualStrings("replace", mode);
+            try testing.expectEqual(@as(usize, 1), try countSettings(t.store.manager, id, .client_prompt));
+            try testing.expectEqual(@as(usize, 1), try countSettings(t.store.manager, id, .client_prompt_mode));
+        }
+    }
+}
+
+test "ACP replacement prompt and mode survive a v2 resume as one batch" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .acp, testSeed(&model));
+    try s.initializeClientPromptWithMode("host policy", "replace");
+    try testing.expectError(error.ClientPromptAlreadySet, s.initializeClientPromptWithMode("different policy", "append"));
+    try s.commitTurn(assistantTurn("q", "a"), types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+    const restored = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .acp);
+    defer restored.close();
+    const prompt = (try restored.clientPrompt(testing.allocator)).?;
+    defer testing.allocator.free(prompt);
+    const mode = (try restored.clientPromptMode(testing.allocator)).?;
+    defer testing.allocator.free(mode);
+    try testing.expectEqualStrings("host policy", prompt);
+    try testing.expectEqualStrings("replace", mode);
+}
+
+test "ACP replacement converted v1 policy keeps mode and rejects corrupt mode" {
+    for ([_]bool{ false, true }) |corrupt| {
+        const alloc = testing.allocator;
+        var t: TestHome = undefined;
+        try t.init();
+        defer t.deinit();
+        var v1 = try V1Home.init(&t);
+        defer v1.deinit();
+        try v1.session("v1-replace", &.{assistantTurn("q", "a")});
+        try v1.put("v1-replace", "client", "system-prompt.json", if (corrupt) "{\"mode\":\"invalid\",\"text\":\"host policy\"}" else "{\"mode\":\"replace\",\"text\":\"host policy\"}");
+        if (corrupt) {
+            try testing.expectError(error.InvalidEnumTag, openConverted(&t, "v1-replace"));
+            try testing.expect(V1Home.exists(&t, "v1-replace"));
+        } else {
+            const converted = try openConverted(&t, "v1-replace");
+            defer converted.close();
+            const text = (try converted.clientPrompt(alloc)).?;
+            defer alloc.free(text);
+            const mode = (try converted.clientPromptMode(alloc)).?;
+            defer alloc.free(mode);
+            try testing.expectEqualStrings("host policy", text);
+            try testing.expectEqualStrings("replace", mode);
+        }
+    }
 }
