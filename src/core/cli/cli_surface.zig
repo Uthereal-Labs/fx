@@ -343,6 +343,7 @@ const SessionRecoveryOptions = struct {
 };
 
 const AcpOptions = struct {
+    settings_file: ?[]const u8 = null,
     model: ?[]const u8 = null,
     ultrafast_override: ?bool = null,
     log_file: ?[]const u8 = null,
@@ -1137,10 +1138,16 @@ fn runNonInteractiveWithDeps(
         },
         .acp => |rest| {
             const acp_opts = parseAcpArgs(rest) catch {
-                try writeStderr(deps, "usage: fx acp [--model <id>] [--ultrafast|--no-ultrafast] [--log-file <path>]\n");
+                try writeStderr(deps, "usage: fx acp [--settings-file <path>] [--model <id>] [--ultrafast|--no-ultrafast] [--log-file <path>]\n");
                 return .handled_failure;
             };
+            const settings_json = if (acp_opts.settings_file) |path| config_runtime.readRunSettings(alloc, path) catch {
+                try writeStderr(deps, "Could not read a valid ACP settings file.\n");
+                return .handled_failure;
+            } else null;
+            defer if (settings_json) |bytes| alloc.free(bytes);
             try cfg.acp_runner.run(alloc, .{
+                .settings_json = settings_json,
                 .auth_mode = cfg.auth_mode,
                 .default_model = cfg.default_model,
                 .default_agent_step_limit = cfg.default_agent_step_limit,
@@ -3879,7 +3886,11 @@ fn parseAcpArgs(args: []const [:0]const u8) !AcpOptions {
     var opts = AcpOptions{};
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--model")) {
+        if (std.mem.eql(u8, args[i], "--settings-file")) {
+            if (opts.settings_file != null or i + 1 >= args.len) return error.InvalidAcpArgs;
+            i += 1;
+            opts.settings_file = args[i];
+        } else if (std.mem.eql(u8, args[i], "--model")) {
             if (opts.model != null or i + 1 >= args.len) return error.InvalidAcpArgs;
             i += 1;
             opts.model = args[i];
@@ -6700,4 +6711,11 @@ const CreditsProviderProbe = struct {
 
 fn ownedCreditsErrorSnapshot(alloc: Allocator, message: []const u8) output_contracts.CreditsSnapshot {
     return .{ .err_message = alloc.dupe(u8, message) catch null };
+}
+
+test "ACP explicit settings file rejects missing or duplicate values" {
+    const parsed = try parseAcpArgs(&.{ @constCast("--settings-file"), @constCast("/tmp/run.json") });
+    try std.testing.expectEqualStrings("/tmp/run.json", parsed.settings_file.?);
+    try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(&.{@constCast("--settings-file")}));
+    try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(&.{ @constCast("--settings-file"), @constCast("a.json"), @constCast("--settings-file"), @constCast("b.json") }));
 }

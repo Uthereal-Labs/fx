@@ -428,17 +428,33 @@ pub fn loadMergedSettingsDetailedFromHome(
     home_dir: []const u8,
     workspace_root: []const u8,
 ) !DetailedSettings {
-    return loadMergedSettingsDetailedWithOptionalHome(alloc, home_dir, workspace_root);
+    return loadMergedSettingsDetailedWithOptionalHome(alloc, home_dir, workspace_root, null);
 }
 
 pub fn loadMergedSettingsDetailed(alloc: Allocator, workspace_root: []const u8) !DetailedSettings {
-    return loadMergedSettingsDetailedWithOptionalHome(alloc, io_mod.homeDir(), workspace_root);
+    return loadMergedSettingsDetailedWithOptionalHome(alloc, io_mod.homeDir(), workspace_root, null);
+}
+
+/// Read and validate an explicit run profile once. The caller owns the bytes.
+/// HOME continues to own credentials, sessions, and other durable state.
+pub fn readRunSettings(alloc: Allocator, path: []const u8) ![]u8 {
+    const bytes = try readOptionalFile(alloc, path) orelse return error.FileNotFound;
+    errdefer alloc.free(bytes);
+    var parsed = try parseSettingsJsonForLayer(alloc, bytes, .profile);
+    parsed.deinit(alloc);
+    return bytes;
+}
+
+/// Resolve only captured profile bytes, never the mutable HOME profile.
+pub fn loadRunSettingsDetailed(alloc: Allocator, bytes: []const u8, workspace_root: []const u8) !DetailedSettings {
+    return loadMergedSettingsDetailedWithOptionalHome(alloc, null, workspace_root, bytes);
 }
 
 fn loadMergedSettingsDetailedWithOptionalHome(
     alloc: Allocator,
     home_dir: ?[]const u8,
     workspace_root: []const u8,
+    profile_json: ?[]const u8,
 ) !DetailedSettings {
     var settings = Settings{};
     errdefer settings.deinit(alloc);
@@ -466,7 +482,10 @@ fn loadMergedSettingsDetailedWithOptionalHome(
     var user_root: ?std.json.Parsed(std.json.Value) = null;
     defer if (user_root) |*parsed| parsed.deinit();
 
-    if (home_dir) |home| {
+    if (profile_json) |bytes| {
+        user_root = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{ .allocate = .alloc_always });
+        if (user_root.?.value != .object) return error.InvalidSettingsFormat;
+    } else if (home_dir) |home| {
         var store: ?settings_store.Store = settings_store.Store.initFromHome(alloc, home, .read_only) catch |err| blk: {
             prompt_history_store_allowed = false;
             try diagnostics.append(alloc, .{
@@ -4799,4 +4818,26 @@ test "bounded evidence inline allowance is profile-only validated and merged" {
         defer alloc.free(raw);
         try std.testing.expectError(error.InvalidInlineToolResultBytes, parseSettingsJson(alloc, raw));
     }
+}
+
+test "run settings snapshot stays immutable and does not read HOME profile" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeFixtureFile(tmp.dir, "run.json", "{\"provider\":\"codex\",\"models\":{\"codex\":\"owned-model\"},\"permission\":{\"*\":\"deny\"},\"max_agent_steps\":7}");
+    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "run.json");
+    defer alloc.free(path);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const captured = try readRunSettings(alloc, path);
+    defer alloc.free(captured);
+    try writeFixtureFile(tmp.dir, "run.json", "{\"models\":{\"codex\":\"foreign-model\"}}");
+    var detailed = try loadRunSettingsDetailed(alloc, captured, workspace);
+    defer detailed.deinit(alloc);
+    try std.testing.expectEqualStrings("owned-model", detailed.settings.models.get(.codex).?);
+    try std.testing.expectEqual(@as(?usize, 7), detailed.settings.max_agent_steps);
+    try std.testing.expect(detailed.settings.has_permission_rules);
+    try writeFixtureFile(tmp.dir, "run.json", "{broken");
+    try std.testing.expectError(error.SyntaxError, readRunSettings(alloc, path));
 }

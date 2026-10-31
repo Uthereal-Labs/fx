@@ -372,6 +372,19 @@ pub fn resolve(
     return resolvePreferring(alloc, transport, secret_store, mode, null);
 }
 
+/// Resolve the captured connection definition, never a newer HOME profile.
+pub fn resolveConfiguredDefinition(alloc: std.mem.Allocator, definition: @import("../config/configured_provider.zig").Definition) !Resolution {
+    return switch (definition.auth) {
+        .none => .{ .credential = .{ .token = try alloc.dupe(u8, ""), .source = .configured } },
+        .bearer => |env| .{ .credential = try loadEnvCredential(alloc, env, .configured) },
+    };
+}
+
+/// Resolve a captured connection credential with an ordinary error union.
+pub fn resolveConfiguredCredential(alloc: std.mem.Allocator, definition: @import("../config/configured_provider.zig").Definition) !?Credential {
+    return (try resolveConfiguredDefinition(alloc, definition)).credential;
+}
+
 pub fn resolveForProvider(
     alloc: std.mem.Allocator,
     transport: oauth_transport.Provider,
@@ -385,10 +398,7 @@ pub fn resolveForProvider(
         defer registry.deinit(alloc);
         const bound = try provider.bind(registry);
         const definition = registry.get(bound.label()).?;
-        return switch (definition.auth) {
-            .none => .{ .credential = .{ .token = try alloc.dupe(u8, ""), .source = .configured } },
-            .bearer => |env| .{ .credential = try loadEnvCredential(alloc, env, .configured) },
-        };
+        return resolveConfiguredDefinition(alloc, definition.*);
     }
     if (provider != .gateway) {
         const source = provider_catalog.find(provider).login_source;

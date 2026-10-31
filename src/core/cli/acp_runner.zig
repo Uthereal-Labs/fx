@@ -56,6 +56,8 @@ pub const Config = struct {
     /// providers the run may use. Borrowed for the server's lifetime.
     configured_providers_json: ?[]const u8 = null,
     credential_override: ?[]const u8 = null,
+    /// Caller-owned validated profile snapshot, immutable for this connection.
+    settings_json: ?[]const u8 = null,
     home_override: ?[]const u8 = null,
     workspace_root_override: ?[]const u8 = null,
     log_file: ?[]const u8 = null,

@@ -162,13 +162,18 @@ pub fn run(
         admission.provider,
         config.tool_context.credential_source,
     )) {
-        routed_credential = auth_runtime.prepareCredential(
+        routed_credential = (if (admission.provider == .configured) configured: {
+            for (config.provider_set.definitions) |definition| {
+                if (std.mem.eql(u8, definition.id, admission.provider.label())) break :configured credentials.resolveConfiguredCredential(turn.alloc, definition);
+            }
+            break :configured null;
+        } else auth_runtime.prepareCredential(
             turn.alloc,
             config.tool_context.oauth_transport,
             config.tool_context.secret_store,
             admission.provider,
             config.tool_context.credential_source,
-        ) catch |err| {
+        )) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             turn.setFailureDiagnostic("model_credential_resolution_failed", @errorName(err));
             return error.ProviderFailed;

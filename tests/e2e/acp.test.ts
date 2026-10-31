@@ -11307,3 +11307,72 @@ test.skipIf(!tmuxAvailable())(
   },
   TIMEOUT * 2,
 );
+
+test("ACP immutable settings files isolate shared-HOME roots, resumed turns, and children", async () => {
+  const requests: Array<{ model: string; body: string }> = [];
+  const fixture = createConfiguredProviderFixture(body => {
+    const encoded = JSON.stringify(body);
+    requests.push({ model: body.model, body: encoded });
+    if (body.messages.some((message: any) => message.role === "tool")) {
+      return configuredCompletion(body.model, "ROOT_COMPLETE");
+    }
+    if (body.messages.some((message: any) => message.role === "user" && JSON.stringify(message.content).includes("CHILD_TASK_MARKER"))) {
+      return configuredCompletion(body.model, "CHILD_COMPLETE");
+    }
+    if (encoded.includes("DELEGATE_MARKER")) {
+      return configuredToolCompletion(body.model, "subagent", { request: { action: "run", task: "CHILD_TASK_MARKER" } }, "run-child");
+    }
+    return configuredCompletion(body.model, "DIRECT_COMPLETE");
+  });
+  const originalHome = readFileSync(fixture.settingsPath, "utf8");
+  const profile = (model: string) => ({
+    ...fixture.settings,
+    session_titles: false,
+    models: { local: model },
+    providers: { local: { ...fixture.settings.providers.local, model_metadata: { [model]: { context_window: 128000, supports_tool_use: true } } } },
+    permission: { "*": "deny", subagent: "allow" },
+    max_agent_steps: 6,
+  });
+  const firstPath = join(fixture.home, "first-run.json");
+  const secondPath = join(fixture.home, "second-run.json");
+  writeFileSync(firstPath, JSON.stringify(profile("first-model")), { mode: 0o600 });
+  writeFileSync(secondPath, JSON.stringify(profile("second-model")), { mode: 0o600 });
+  const clients: AcpClient[] = [];
+  const launch = async (path: string) => {
+    const value = await AcpClient.create({ cwd: fixture.workspace, args: ["acp", "--settings-file", path], env: fixture.env });
+    clients.push(value);
+    await value.request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+    return value;
+  };
+  try {
+    const [first, second] = await Promise.all([launch(firstPath), launch(secondPath)]);
+    writeFileSync(firstPath, JSON.stringify(profile("must-not-reload")));
+    const created = await first.request("session/new", { cwd: fixture.workspace, mcpServers: [], _meta: { fx: { hooks: { captureContent: true } } } }) as any;
+    const other = await second.request("session/new", { cwd: fixture.workspace, mcpServers: [] }) as any;
+    expect(created.result.sessionId).not.toBe(other.result.sessionId);
+    const [answer, parallel] = await Promise.all([runPrompt(first, "DELEGATE_MARKER", TIMEOUT), runPrompt(second, "direct", TIMEOUT)]);
+    expect(answer.promptResult.result.stopReason).toBe("end_turn");
+    expect(parallel.promptResult.result.stopReason).toBe("end_turn");
+    expect(requests.filter(item => item.model === "first-model")).toHaveLength(3);
+    expect(requests.filter(item => item.model === "second-model")).toHaveLength(1);
+    expect(first.hookEvents.some(event => event.type === "delegation" && event.data.phase === "completed")).toBe(true);
+    await first.request("session/close", { sessionId: created.result.sessionId });
+    await first.close();
+    writeFileSync(firstPath, JSON.stringify(profile("first-model")));
+    const resumed = await launch(firstPath);
+    const loaded = await resumed.request("session/resume", { sessionId: created.result.sessionId, cwd: fixture.workspace, mcpServers: [] }) as any;
+    expect(loaded.error).toBeUndefined();
+    expect((await runPrompt(resumed, "continue", TIMEOUT)).promptResult.result.stopReason).toBe("end_turn");
+    expect(requests.at(-1)!.model).toBe("first-model");
+    await resumed.request("session/close", { sessionId: created.result.sessionId });
+    await resumed.close();
+    const control = await launch(firstPath);
+    expect((await control.request("session/remove", { sessionId: created.result.sessionId }) as any).error).toBeUndefined();
+    expect((await runPrompt(second, "still independent", TIMEOUT)).promptResult.result.stopReason).toBe("end_turn");
+    expect(readFileSync(fixture.settingsPath, "utf8")).toBe(originalHome);
+    for (const value of clients) expect(value.stderr).toBe("");
+  } finally {
+    for (const value of clients) await value.close();
+    fixture.close();
+  }
+}, 60000);
