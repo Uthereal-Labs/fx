@@ -435,6 +435,21 @@ pub fn loadStartupStateForRun(
     return loadStartupStateFromOwnedWorkspace(alloc, transport, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .refresh_if_needed, null, model_override);
 }
 
+/// Start from a caller-owned immutable profile without moving native history.
+pub fn loadStartupStateForRunSettings(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    secret_store: host.SecretStore,
+    default_model: []const u8,
+    default_agent_step_limit: usize,
+    auth_mode: credentials.AuthMode,
+    model_override: ?[]const u8,
+    profile_json: []const u8,
+) !StartupState {
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    return loadStartupStateWithKeychainRead(alloc, transport, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .refresh_if_needed, null, model_override, .blocking, profile_json);
+}
+
 pub fn loadStartupStateWithoutCredentials(alloc: Allocator, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
     return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, workspace_root, default_model, default_agent_step_limit, .local, null, null, null, null);
@@ -514,7 +529,7 @@ pub fn loadInteractiveStartupState(
     model_override: ?[]const u8,
 ) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateWithKeychainRead(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .stored, provider_override, model_override, .deferred);
+    return loadStartupStateWithKeychainRead(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .stored, provider_override, model_override, .deferred, null);
 }
 
 pub fn loadStartupStatus(
@@ -651,7 +666,7 @@ fn loadStartupStateFromOwnedWorkspace(
     provider_override: ?model_provider.ProviderId,
     model_override: ?[]const u8,
 ) !StartupState {
-    return loadStartupStateWithKeychainRead(alloc, transport, secret_store, owned_workspace_root, default_model, default_agent_step_limit, auth_mode, profile_home, credential_mode, provider_override, model_override, .blocking);
+    return loadStartupStateWithKeychainRead(alloc, transport, secret_store, owned_workspace_root, default_model, default_agent_step_limit, auth_mode, profile_home, credential_mode, provider_override, model_override, .blocking, null);
 }
 
 fn loadStartupStateWithKeychainRead(
@@ -667,6 +682,7 @@ fn loadStartupStateWithKeychainRead(
     provider_override: ?model_provider.ProviderId,
     model_override: ?[]const u8,
     keychain_read: KeychainRead,
+    profile_json: ?[]const u8,
 ) !StartupState {
     var state = StartupState{
         .agent_step_limit = default_agent_step_limit,
@@ -676,7 +692,9 @@ fn loadStartupStateWithKeychainRead(
 
     state.workspace_root = owned_workspace_root;
     debug_trace.configureFromEnv(alloc, state.workspace_root);
-    var detailed = if (profile_home) |home_dir|
+    var detailed = if (profile_json) |bytes|
+        try config_runtime.loadRunSettingsDetailed(alloc, bytes, state.workspace_root)
+    else if (profile_home) |home_dir|
         try config_runtime.loadMergedSettingsDetailedFromHome(alloc, home_dir, state.workspace_root)
     else
         try config_runtime.loadMergedSettingsDetailed(alloc, state.workspace_root);
@@ -754,14 +772,17 @@ fn loadStartupStateWithKeychainRead(
                 };
                 break :defer_or_resolve;
             }
-            const resolution = try credentials.resolveForProvider(
-                alloc,
-                transport,
-                secret_store,
-                mode,
-                state.provider,
-                settings.credential_source,
-            );
+            const resolution = if (state.provider == .configured)
+                try credentials.resolveConfiguredDefinition(alloc, state.configured_providers.get(state.provider.label()).?.*)
+            else
+                try credentials.resolveForProvider(
+                    alloc,
+                    transport,
+                    secret_store,
+                    mode,
+                    state.provider,
+                    settings.credential_source,
+                );
             state.credential = resolution.credential;
             state.credential_load_failure = resolution.failure;
             state.stored_key_status = resolution.stored_key_status;
@@ -2900,7 +2921,7 @@ test "interactive launch leaves a Keychain credential unresolved for the caller"
     var keychain_store = host.unavailable_secret_store;
     keychain_store.is_disabled_fn = keychainEnabledForTest;
     for ([_]KeychainRead{ .blocking, .deferred }) |keychain_read| {
-        var state = try loadStartupStateWithKeychainRead(alloc, oauth_transport.unavailable_provider, keychain_store, try alloc.dupe(u8, workspace_root), "default/model", 25, .local, null, .stored, null, null, keychain_read);
+        var state = try loadStartupStateWithKeychainRead(alloc, oauth_transport.unavailable_provider, keychain_store, try alloc.dupe(u8, workspace_root), "default/model", 25, .local, null, .stored, null, null, keychain_read, null);
         defer state.deinit(alloc);
         try std.testing.expect(state.credential == null);
         if (keychain_read == .deferred and builtin.target.os.tag == .macos) {

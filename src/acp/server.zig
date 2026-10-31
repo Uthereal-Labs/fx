@@ -528,6 +528,10 @@ fn hostManagedCredential() credentials.Credential {
 pub fn prepareCredentialForProvider(state: *ServerState, provider: model_provider.ProviderId) !?credentials.Credential {
     if (state.cfg.auth_mode == .host_managed) return null;
     if (hostManagesRoute(state.cfg, provider)) return hostManagedCredential();
+    if (provider == .configured and state.cfg.settings_json != null) {
+        const definition = state.configured_providers.get(provider.label()) orelse return error.ProviderCredentialUnavailable;
+        return (try credentials.resolveConfiguredDefinition(state.alloc, definition.*)).credential orelse return error.ProviderCredentialUnavailable;
+    }
     const now_ms = io_mod.milliTimestamp();
     if (state.active_session) |active| {
         if (provider != .configured and credentialMatchesProvider(active.credential_source, provider) and
@@ -2570,6 +2574,7 @@ test "ordinary ACP ignores private libfx capabilities" {
 }
 
 fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_lifecycle.StartupState {
+    if (state.cfg.settings_json) |bytes| return app_lifecycle.loadStartupStateForRunSettings(alloc, state.cfg.gateway_provider.oauth_transport, state.cfg.secret_store, state.cfg.default_model, state.cfg.default_agent_step_limit, state.cfg.auth_mode, state.cfg.model_override, bytes);
     if (state.cfg.minimal_kernel) {
         var startup = try app_lifecycle.loadLibfxStartupState(
             alloc,
@@ -2722,13 +2727,16 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         } else if (startup_credential_is_final)
             &startup_credential.?
         else routed: {
-            routed_credential = try auth_runtime.prepareCredential(
-                alloc,
-                state.cfg.gateway_provider.oauth_transport,
-                state.cfg.secret_store,
-                state.provider,
-                if (state.provider == .gateway) startup.credential_source_preference else null,
-            );
+            routed_credential = if (state.provider == .configured)
+                (try credentials.resolveConfiguredDefinition(alloc, state.configured_providers.get(state.provider.label()).?.*)).credential
+            else
+                try auth_runtime.prepareCredential(
+                    alloc,
+                    state.cfg.gateway_provider.oauth_transport,
+                    state.cfg.secret_store,
+                    state.provider,
+                    if (state.provider == .gateway) startup.credential_source_preference else null,
+                );
             if (routed_credential == null) {
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.invalid_request,
@@ -3348,6 +3356,8 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     .token = try alloc.dupe(u8, state.cfg.credential_override.?),
                     .source = .ai_gateway_api_key,
                 }
+            else if (target == .configured)
+                (try credentials.resolveConfiguredDefinition(alloc, state.configured_providers.get(target.label()).?.*)).credential
             else credential: {
                 break :credential (try auth_runtime.prepareCredential(
                     alloc,
@@ -3409,7 +3419,13 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     .message = "Provider returned no supported models",
                 });
             }
-            var settings = if (state.cfg.home_override) |home|
+            var settings = if (state.cfg.settings_json) |bytes| blk: {
+                var detailed = try config_runtime.loadRunSettingsDetailed(alloc, bytes, state.workspace_root);
+                const settings = detailed.settings;
+                detailed.settings = .{};
+                detailed.deinit(alloc);
+                break :blk settings;
+            } else if (state.cfg.home_override) |home|
                 try config_runtime.loadMergedSettingsFromHome(alloc, home, state.workspace_root)
             else
                 try config_runtime.loadMergedSettings(alloc, state.workspace_root);
@@ -4026,7 +4042,7 @@ fn selectSessionMode(
 fn saveSessionPermissionMode(state: *ServerState, alloc: Allocator, mode: types.PermissionMode) void {
     state.permission_mode = mode;
     if (comptime !host_target.is_wasm) {
-        if (state.cfg.minimal_kernel) return;
+        if (state.cfg.minimal_kernel or state.cfg.settings_json != null) return;
         const label = permissions.permissionModeLabel(mode);
         const home = state.cfg.home_override orelse io_mod.homeDir() orelse {
             debug_trace.logf("acp", "permission_mode_save_failed mode={s} err=HomeNotSet", .{label});
@@ -4052,7 +4068,7 @@ pub const StartingMode = struct {
 /// that applies it, or the default mode when none does.
 pub fn loadStartingMode(state: *ServerState, alloc: Allocator) StartingMode {
     if (comptime !host_target.is_wasm) {
-        if (!state.cfg.minimal_kernel and state.workspace_root.len > 0) {
+        if (!state.cfg.minimal_kernel and state.cfg.settings_json == null and state.workspace_root.len > 0) {
             if (app_lifecycle.loadSavedPermissionMode(alloc, state.cfg.home_override, state.workspace_root)) |saved| {
                 state.permission_mode = saved;
             } else |err| {

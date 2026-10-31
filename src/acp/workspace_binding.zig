@@ -92,7 +92,9 @@ pub fn prepare(state: *const server.ServerState, alloc: Allocator, params_raw: ?
 /// Saved directories come from the profile entry for the new root; command
 /// line directories and suppression apply to every session.
 fn loadAccess(state: *const server.ServerState, alloc: Allocator, root: []const u8) PrepareError!workspace_access.WorkspaceAccess {
-    var detailed = (if (state.cfg.home_override) |home|
+    var detailed = (if (state.cfg.settings_json) |bytes|
+        config_runtime.loadRunSettingsDetailed(alloc, bytes, root)
+    else if (state.cfg.home_override) |home|
         config_runtime.loadMergedSettingsDetailedFromHome(alloc, home, root)
     else
         config_runtime.loadMergedSettingsDetailed(alloc, root)) catch |err| switch (err) {

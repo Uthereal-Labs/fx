@@ -69,9 +69,10 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .acp,
         .token = "acp",
-        .usage = "acp [--model <id>] [--ultrafast|--no-ultrafast] [--log-file <path>]",
+        .usage = "acp [--settings-file <path>] [--model <id>] [--ultrafast|--no-ultrafast] [--log-file <path>]",
         .summary = "Start an ACP server over stdio",
         .options = &.{
+            .{ .flag = "--settings-file <path>", .description = "Use an immutable run profile without changing HOME" },
             .{ .flag = "--model <id>", .description = "Override the default model" },
             .{ .flag = "--ultrafast", .description = "Request Ultra mode when the model supports it" },
             .{ .flag = "--no-ultrafast", .description = "Disable Ultra mode" },
