@@ -417,7 +417,7 @@ fn contextProvenanceHeader(alloc: Allocator, request: streams.ModelRequest, payl
         const text = message.content orelse continue;
         const matches = message.context_provenance.matches(text);
         if (!matches and message.context_origin != .handoff) {
-            if (message.context_provenance.count > 0 or message.role == .user) omitted += 1;
+            if (message.context_provenance.data != null or message.role == .user) omitted += 1;
             continue;
         }
         if (out.writer.end > 4096) {
@@ -452,7 +452,7 @@ fn contextProvenanceHeader(alloc: Allocator, request: streams.ModelRequest, payl
         try out.writer.print("{{\"message_index\":{d},\"content_sha256\":\"{s}\",\"spans\":", .{ wire_index.?, &content_sha256 });
         if (matches) {
             try out.writer.writeByte('[');
-            for (message.context_provenance.spans[0..message.context_provenance.count], 0..) |span, span_index| {
+            for (message.context_provenance.spans(), 0..) |span, span_index| {
                 if (span_index > 0) try out.writer.writeByte(',');
                 const category = if (span.category == .current_user and current_user != index) "conversation" else @tagName(span.category);
                 try std.json.Stringify.value(.{ .category = category, .start = span.start, .end = span.end }, .{}, &out.writer);

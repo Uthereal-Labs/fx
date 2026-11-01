@@ -2114,10 +2114,11 @@ fn parseUserTurn(alloc: Allocator, value: std.json.Value, image_blobs: ?*ImageBl
     errdefer if (work_id) |id| mem_utils.free(alloc, id);
     if (work_id) |id| session.validateWorkId(id) catch return error.InvalidSessionFormat;
     const provenance = if (object.get("context_provenance")) |v| blk: {
-        const parsed_provenance = std.json.parseFromValue(types.ContextProvenance, alloc, v, .{}) catch return error.InvalidSessionFormat;
+        const parsed_provenance = std.json.parseFromValue(types.ContextProvenance, alloc, v, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidSessionFormat;
         defer parsed_provenance.deinit();
-        break :blk parsed_provenance.value;
+        break :blk try parsed_provenance.value.dupe(alloc);
     } else types.ContextProvenance{};
+    errdefer provenance.deinit(alloc);
     const images_value = object.get("images") orelse return error.InvalidSessionFormat;
     if (images_value != .array) return error.InvalidSessionFormat;
     if (images_value.array.items.len == 0) return .{ .text = text, .work_id = work_id, .context_provenance = provenance };

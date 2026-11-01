@@ -2891,6 +2891,7 @@ fn appendHistoryTurnProjection(
 }
 
 pub fn freeQueuedPrompt(alloc: std.mem.Allocator, prompt: QueuedPrompt) void {
+    prompt.context_provenance.deinit(alloc);
     if (prompt.steering_receipt) |receipt| {
         if (receipt.state.cmpxchgStrong(.queued, .not_applied, .seq_cst, .seq_cst) == null) {
             debug_trace.eventf("subagent", "feedback_not_applied", .{}, "operation={s} reason=queue_discarded", .{receipt.operation_id});

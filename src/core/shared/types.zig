@@ -1501,25 +1501,68 @@ pub const ImageAttachment = struct {
 /// Host-supplied attribution only. Never used for permissions or prompt authority.
 pub const ContextProvenance = struct {
     pub const Span = struct { category: enum { memory, current_user, summary }, start: usize, end: usize };
-    spans: [16]Span = @splat(.{ .category = .current_user, .start = 0, .end = 0 }),
-    count: u8 = 0,
-    sha256: [32]u8 = @splat(0),
+    const Data = struct {
+        spans: [16]Span = @splat(.{ .category = .current_user, .start = 0, .end = 0 }),
+        count: u8 = 0,
+        sha256: [32]u8 = @splat(0),
+    };
+    /// Borrowed in ChatMessage projections; UserTurn and parsed prompt inputs own it.
+    data: ?*const Data = null,
+
+    pub fn spans(self: ContextProvenance) []const Span {
+        const data = self.data orelse return &.{};
+        return data.spans[0..@min(data.count, data.spans.len)];
+    }
+
+    pub fn retainedBytes(self: ContextProvenance) usize {
+        return if (self.data != null) @sizeOf(Data) else 0;
+    }
+
+    pub fn deinit(self: ContextProvenance, alloc: std.mem.Allocator) void {
+        if (self.data) |data| alloc.destroy(data);
+    }
+
+    pub fn dupe(self: ContextProvenance, alloc: std.mem.Allocator) !ContextProvenance {
+        const source = self.data orelse return .{};
+        const data = try alloc.create(Data);
+        data.* = source.*;
+        return .{ .data = data };
+    }
+
+    pub fn jsonStringify(self: ContextProvenance, writer: *std.json.Stringify) !void {
+        try writer.write(if (self.data) |data| data.* else Data{});
+    }
+
+    pub fn jsonParse(alloc: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !ContextProvenance {
+        const value = try std.json.innerParse(Data, alloc, source, options);
+        const data = try alloc.create(Data);
+        data.* = value;
+        return .{ .data = data };
+    }
+
+    pub fn jsonParseFromValue(alloc: std.mem.Allocator, value: std.json.Value, options: std.json.ParseOptions) !ContextProvenance {
+        const decoded = try std.json.innerParseFromValue(Data, alloc, value, options);
+        const data = try alloc.create(Data);
+        data.* = decoded;
+        return .{ .data = data };
+    }
 
     pub fn matches(self: ContextProvenance, text: []const u8) bool {
-        if (self.count == 0 or self.count > self.spans.len) return false;
+        const data = self.data orelse return false;
+        if (data.count == 0 or data.count > data.spans.len) return false;
         var previous: usize = 0;
-        for (self.spans[0..self.count]) |span| {
+        for (data.spans[0..data.count]) |span| {
             if (span.start < previous or span.end <= span.start or span.end > text.len or !std.unicode.utf8ValidateSlice(text[span.start..span.end])) return false;
             previous = span.end;
         }
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(text, &hash, .{});
-        return std.mem.eql(u8, &hash, &self.sha256);
+        return std.mem.eql(u8, &hash, &data.sha256);
     }
 
-    pub fn parse(value: std.json.Value, text: []const u8) !ContextProvenance {
+    pub fn parse(alloc: std.mem.Allocator, value: std.json.Value, text: []const u8) !ContextProvenance {
         if (value != .array or value.array.items.len > 16) return error.InvalidContextProvenance;
-        var result: ContextProvenance = .{};
+        var result: Data = .{};
         var previous: usize = 0;
         for (value.array.items) |item| {
             if (item != .object) return error.InvalidContextProvenance;
@@ -1535,7 +1578,9 @@ pub const ContextProvenance = struct {
             previous = b;
         }
         std.crypto.hash.sha2.Sha256.hash(text, &result.sha256, .{});
-        return result;
+        const data = try alloc.create(Data);
+        data.* = result;
+        return .{ .data = data };
     }
 };
 
@@ -3272,6 +3317,7 @@ test "fuzz tool argument diagnostic" {
 }
 
 pub fn freeUserTurn(alloc: std.mem.Allocator, user: UserTurn) void {
+    user.context_provenance.deinit(alloc);
     alloc.free(user.text);
     freeImageAttachmentSlice(alloc, user.images);
     if (user.work_id) |work_id| alloc.free(work_id);
@@ -3285,12 +3331,14 @@ pub fn dupeUserTurn(alloc: std.mem.Allocator, user: UserTurn) !UserTurn {
     errdefer freeImageAttachmentSlice(alloc, images);
 
     const work_id = if (user.work_id) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (work_id) |value| alloc.free(value);
+    const provenance = try user.context_provenance.dupe(alloc);
 
     return .{
         .text = text,
         .images = images,
         .work_id = work_id,
-        .context_provenance = user.context_provenance,
+        .context_provenance = provenance,
     };
 }
 

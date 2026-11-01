@@ -1610,6 +1610,7 @@ const ParsedPromptInput = struct {
     }
 
     fn deinit(self: *ParsedPromptInput, alloc: Allocator) void {
+        self.context_provenance.deinit(alloc);
         alloc.free(self.text);
         if (self.input_id) |id| alloc.free(id);
         if (self.turn_id) |id| alloc.free(id);
@@ -1864,7 +1865,7 @@ fn parsePromptInputWithFirstImageId(
     errdefer result.deinit(alloc);
     if (parsed.value.object.get("_meta")) |meta| {
         if (meta == .object) if (meta.object.get("fx_context_spans")) |spans| {
-            result.context_provenance = try types.ContextProvenance.parse(spans, result.text);
+            result.context_provenance = try types.ContextProvenance.parse(alloc, spans, result.text);
         };
     }
     if (input_id) |id| result.input_id = try alloc.dupe(u8, id);
