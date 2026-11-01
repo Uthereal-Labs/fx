@@ -147,7 +147,7 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
     defer client.deinit();
     var uri = try std.Uri.parse(url);
     uri.scheme = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) "https" else if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) "http" else return error.UnsupportedUriScheme;
-    var request_headers: [3]std.http.Header = undefined;
+    var request_headers: [11]std.http.Header = undefined;
     request_headers[0] = .{ .name = "accept", .value = "text/event-stream" };
     var header_count: usize = 1;
     var traceparent: [55]u8 = undefined;
@@ -159,6 +159,31 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
             request_headers[header_count] = .{ .name = "tracestate", .value = state };
             header_count += 1;
         }
+    }
+    var turn_buf: [20]u8 = undefined;
+    var step_buf: [20]u8 = undefined;
+    var attempt_buf: [20]u8 = undefined;
+    var provenance: ?[]u8 = null;
+    defer if (provenance) |value| alloc.free(value);
+    if (request.observation_sink.options.enabled and request.observation_sink.options.version >= 5) {
+        const identity = [_]struct { name: []const u8, value: ?[]const u8 }{
+            .{ .name = "x-fx-session-id", .value = request.observation_sink.session_id orelse request.session_id },
+            .{ .name = "x-fx-work-id", .value = request.observation_sink.work_id },
+            .{ .name = "x-fx-request-id", .value = request.observation_request_id },
+            .{ .name = "x-fx-purpose", .value = @tagName(request.purpose) },
+            .{ .name = "x-fx-turn-id", .value = try std.mem.print(&turn_buf, "{d}", .{request.trace_ctx.turn_id}) },
+            .{ .name = "x-fx-step-id", .value = try std.mem.print(&step_buf, "{d}", .{request.trace_ctx.step_id}) },
+            .{ .name = "x-fx-attempt", .value = try std.mem.print(&attempt_buf, "{d}", .{request.observation_attempt}) },
+        };
+        for (identity) |header| if (header.value) |value| {
+            if (value.len > 256) return error.InvalidObservationIdentity;
+            for (value) |byte| if (byte < 0x20 or byte > 0x7e) return error.InvalidObservationIdentity;
+            request_headers[header_count] = .{ .name = header.name, .value = value };
+            header_count += 1;
+        };
+        provenance = try contextProvenanceHeader(alloc, request, payload);
+        request_headers[header_count] = .{ .name = "x-fx-context-provenance", .value = provenance.? };
+        header_count += 1;
     }
     var operation = client_mod.PostOperation{
         .client = &client,
@@ -367,4 +392,92 @@ fn send_review(raw: *anyopaque, alloc: Allocator, model: []const u8, payload: []
     const owned = try alloc.create(streams.Result);
     owned.* = result;
     return .{ .completion = .{ .completion = owned.completed.completion, .context = owned, .deinit_fn = free_result } };
+}
+
+/// Caller owns the bounded base64 sidecar. No prompt text leaves in this header.
+fn contextProvenanceHeader(alloc: Allocator, request: streams.ModelRequest, payload: []const u8) ![]u8 {
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena, payload, .{});
+    const wire_messages = parsed.value.object.get("messages").?.array.items;
+    var out = std.Io.Writer.Allocating.init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll("{\"version\":1,\"messages\":[");
+    var current_user: ?usize = null;
+    for (request.messages, 0..) |message, index| {
+        if (message.role == .user and message.context_origin == .user_turn and !message.restored_steering) current_user = index;
+    }
+    var count: usize = 0;
+    var omitted: usize = 0;
+    for (request.messages, 0..) |message, index| {
+        const text = message.content orelse continue;
+        const matches = message.context_provenance.matches(text);
+        if (!matches and message.context_origin != .handoff) {
+            if (message.context_provenance.count > 0 or message.role == .user) omitted += 1;
+            continue;
+        }
+        if (out.writer.end > 4096) {
+            omitted += 1;
+            continue;
+        }
+        // Bind to the actual serialized request: replay projection can remove
+        // messages, and tool images can insert additional messages.
+        var wire_index: ?usize = null;
+        var ambiguous = false;
+        for (wire_messages, 0..) |wire_message, wi| {
+            const role = wire_message.object.get("role") orelse continue;
+            const content = wire_message.object.get("content") orelse continue;
+            if (role != .string or !std.mem.eql(u8, role.string, @tagName(message.role))) continue;
+            if (!wireTextMatches(content, text)) continue;
+            if (wire_index != null) ambiguous = true;
+            wire_index = wi;
+        }
+        if (wire_index == null or ambiguous) {
+            omitted += 1;
+            continue;
+        }
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(text, &digest, .{});
+        const content_sha256 = std.fmt.bytesToHex(digest, .lower);
+        // Bound total HTTP headers even for a long resumed conversation.
+        if (out.writer.end > 4096) {
+            omitted += 1;
+            continue;
+        }
+        if (count > 0) try out.writer.writeByte(',');
+        try out.writer.print("{{\"message_index\":{d},\"content_sha256\":\"{s}\",\"spans\":", .{ wire_index.?, &content_sha256 });
+        if (matches) {
+            try out.writer.writeByte('[');
+            for (message.context_provenance.spans[0..message.context_provenance.count], 0..) |span, span_index| {
+                if (span_index > 0) try out.writer.writeByte(',');
+                const category = if (span.category == .current_user and current_user != index) "conversation" else @tagName(span.category);
+                try std.json.Stringify.value(.{ .category = category, .start = span.start, .end = span.end }, .{}, &out.writer);
+            }
+            try out.writer.writeByte(']');
+        } else {
+            try std.json.Stringify.value([_]struct { category: []const u8, start: usize, end: usize }{.{ .category = "summary", .start = 0, .end = text.len }}, .{}, &out.writer);
+        }
+        try out.writer.writeByte('}');
+        count += 1;
+    }
+    try out.writer.print("],\"omitted_messages\":{d}}}", .{omitted});
+    const value = out.writer.buffered();
+    const encoded = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(value.len));
+    _ = std.base64.standard.Encoder.encode(encoded, value);
+    return encoded;
+}
+
+fn wireTextMatches(content: std.json.Value, text: []const u8) bool {
+    if (content == .string) return std.mem.eql(u8, content.string, text);
+    if (content != .array) return false;
+    var offset: usize = 0;
+    for (content.array.items) |part| {
+        if (part != .object) continue;
+        const value = part.object.get("text") orelse continue;
+        if (value != .string) continue;
+        if (value.string.len > text.len - offset or !std.mem.eql(u8, value.string, text[offset..][0..value.string.len])) return false;
+        offset += value.string.len;
+    }
+    return offset == text.len;
 }

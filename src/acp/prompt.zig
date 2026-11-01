@@ -118,6 +118,7 @@ pub const TerminalOutcome = union(enum) {
 fn promptInputFailure(err: anyerror) anyerror!TerminalOutcome {
     return switch (err) {
         error.OutOfMemory => err,
+        error.InvalidContextProvenance => .{ .rpc_error = .{ .code = ErrorCode.invalid_params, .message = "Invalid context provenance spans" } },
         error.UnsupportedPromptImage => .{ .rpc_error = .{
             .code = ErrorCode.invalid_params,
             .message = "Image prompt blocks are not supported in this runtime",
@@ -1106,6 +1107,7 @@ pub fn handlePrompt(
     const job: worker_runtime.QueuedPrompt = .{
         .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else 0,
         .prompt = @constCast(owned_prompt),
+        .context_provenance = if (recovery_checkpoint) |checkpoint| checkpoint.user.context_provenance else prompt_input.context_provenance,
         .images = @constCast(current_images),
         .authorized_image_catalog = authorized_image_catalog,
         .model = session.model,
@@ -1518,6 +1520,7 @@ const PendingPromptImage = struct {
 const max_host_time_ms: i64 = (1 << 53) - 1;
 
 const ParsedPromptInput = struct {
+    context_provenance: types.ContextProvenance = .{},
     text: []u8,
     continue_recovery: bool = false,
     /// The follow-up this prompt runs, which its first progress places.
@@ -1857,6 +1860,11 @@ fn parsePromptInputWithFirstImageId(
         .yield_at_ms = yield_at_ms,
     };
     errdefer result.deinit(alloc);
+    if (parsed.value.object.get("_meta")) |meta| {
+        if (meta == .object) if (meta.object.get("fx_context_spans")) |spans| {
+            result.context_provenance = try types.ContextProvenance.parse(spans, result.text);
+        };
+    }
     if (input_id) |id| result.input_id = try alloc.dupe(u8, id);
     if (turn_id) |id| result.turn_id = try alloc.dupe(u8, id);
     if (rerun_value) |value| result.rerun_call_ids = try ownedCallIds(alloc, value);
@@ -1930,7 +1938,7 @@ fn emitObservationJson(state: *server.ServerState, context: observations.Context
     // Parallel tools allocate sequence numbers and write their frames under one lock.
     state.observation_mutex.lockUncancelable(io_mod.getIo());
     defer state.observation_mutex.unlock(io_mod.getIo());
-    if (state.observation_options.version >= 2 and context.span == null) return;
+    if (state.observation_options.version >= 2 and state.observation_options.version < 5 and context.span == null) return;
     var out = std.Io.Writer.Allocating.init(state.alloc);
     defer out.deinit();
     state.observation_sequence += 1;
@@ -1941,8 +1949,12 @@ fn emitObservationJson(state: *server.ServerState, context: observations.Context
         try out.writer.writeAll(",\"work_id\":");
         try std.json.Stringify.value(context.work_id, .{}, &out.writer);
     }
-    if (state.observation_options.version >= 2) {
-        const span = context.span orelse return;
+    if (state.observation_options.version >= 5) {
+        try out.writer.writeAll(",\"request_id\":");
+        try std.json.Stringify.value(context.request_id, .{}, &out.writer);
+    }
+    if (state.observation_options.version >= 2 and context.span != null) {
+        const span = context.span.?;
         try out.writer.writeAll(",\"trace\":");
         try std.json.Stringify.value(span.wire(), .{}, &out.writer);
     }

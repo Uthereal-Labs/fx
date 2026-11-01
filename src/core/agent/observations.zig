@@ -22,9 +22,9 @@ pub const Options = struct {
             if (!std.mem.eql(u8, key, "version") and !std.mem.eql(u8, key, "capture_content") and !std.mem.eql(u8, key, "max_content_bytes") and !std.mem.eql(u8, key, "traceparent") and !std.mem.eql(u8, key, "tracestate")) return error.InvalidObservationOptions;
         }
         const version = root.object.get("version") orelse return error.InvalidObservationOptions;
-        if (version != .integer or version.integer < 1 or version.integer > 4) return error.InvalidObservationOptions;
+        if (version != .integer or version.integer < 1 or version.integer > 5) return error.InvalidObservationOptions;
         var result = Options{ .enabled = true, .version = @intCast(version.integer) };
-        if (result.version >= 2) {
+        if (result.version >= 2 and (result.version < 5 or root.object.get("traceparent") != null)) {
             const parent = root.object.get("traceparent") orelse return error.InvalidObservationOptions;
             const state = root.object.get("tracestate");
             if (parent != .string or state != null and state.? != .string) return error.InvalidObservationOptions;
@@ -66,7 +66,7 @@ pub const ModelFinished = struct {
     output_omitted: bool,
     output_sha256: ?[]const u8,
     output_byte_count: ?usize,
-    usage: ?struct { input_tokens: ?u64, output_tokens: ?u64 } = null,
+    usage: ?types.Usage = null,
     error_type: ?[]const u8 = null,
     response: ?AssistantResponse = null,
 };
@@ -128,7 +128,22 @@ pub const Event = union(enum) {
 pub fn writeEventData(writer: *std.Io.Writer, event: Event, version: u8) !void {
     switch (event) {
         .model_finished => |value| {
-            if (version >= 4) return std.json.Stringify.value(value, .{}, writer);
+            if (version >= 5) return std.json.Stringify.value(value, .{}, writer);
+            const usage = if (value.usage) |u| .{ .input_tokens = u.input_tokens, .output_tokens = u.output_tokens } else null;
+            if (version == 4) return std.json.Stringify.value(.{
+                .model = value.model,
+                .tool_call_ids = value.tool_call_ids,
+                .outcome = value.outcome,
+                .delivery = value.delivery,
+                .admitted = value.admitted,
+                .output_text = value.output_text,
+                .output_omitted = value.output_omitted,
+                .output_sha256 = value.output_sha256,
+                .output_byte_count = value.output_byte_count,
+                .usage = usage,
+                .error_type = value.error_type,
+                .response = value.response,
+            }, .{}, writer);
             try std.json.Stringify.value(.{
                 .model = value.model,
                 .tool_call_ids = value.tool_call_ids,
@@ -139,7 +154,7 @@ pub fn writeEventData(writer: *std.Io.Writer, event: Event, version: u8) !void {
                 .output_omitted = value.output_omitted,
                 .output_sha256 = value.output_sha256,
                 .output_byte_count = value.output_byte_count,
-                .usage = value.usage,
+                .usage = usage,
                 .error_type = value.error_type,
             }, .{}, writer);
         },
@@ -154,6 +169,7 @@ pub const RequestDetails = struct {
 };
 pub const Context = struct {
     trace: trace.TraceContext,
+    request_id: ?[]const u8 = null,
     attempt: ?u32 = null,
     span: ?TraceContext = null,
     session_id: ?[]const u8 = null,
@@ -179,12 +195,13 @@ pub const Sink = struct {
     /// The caller owns the child and work IDs until finishChild returns.
     pub fn beginChild(self: Sink, child_id: []const u8, work_id: []const u8, call_id: []const u8) Sink {
         if (!self.enabled() or self.options.version < 3) return .{};
-        const parent = self.options.parent orelse return .{};
+        const parent = self.options.parent;
+        if (parent == null and self.options.version < 5) return .{};
         const root_id = self.session_id orelse return .{};
         var child = self;
         child.session_id = child_id;
         child.work_id = work_id;
-        child.options.parent = parent.child();
+        child.options.parent = if (parent) |value| value.child() else null;
         child.emit(.{ .trace = .{}, .span = child.options.parent }, .{ .child_started = .{
             .root_session_id = root_id,
             .parent_session_id = root_id,
@@ -201,7 +218,8 @@ pub const Sink = struct {
     pub fn beginTool(self: Sink, context: Context, call: types.ToolCall) Context {
         var current = context;
         if (!self.enabled() or self.options.version < 2) return current;
-        current.span = if (context.span) |parent| parent.child() else if (self.options.parent) |parent| parent.child() else return current;
+        current.span = if (context.span) |parent| parent.child() else if (self.options.parent) |parent| parent.child() else null;
+        if (current.span == null and self.options.version < 5) return current;
         const omitted = !self.options.capture_content or call.arguments_json.len > self.options.max_content_bytes;
         var hash = hashText(call.arguments_json);
         self.emit(current, .{ .tool_started = .{
@@ -216,7 +234,7 @@ pub const Sink = struct {
     }
 
     pub fn finishTool(self: Sink, context: Context, call: types.ToolCall, output: ?[]const u8, failed: bool, cancelled: bool, error_type: ?[]const u8) void {
-        if (context.span == null or self.options.version < 2) return;
+        if ((context.span == null and self.options.version < 5) or self.options.version < 2) return;
         var hash: [64]u8 = undefined;
         if (output) |text| hash = hashText(text);
         const omitted = !self.options.capture_content or output == null or output.?.len > self.options.max_content_bytes;

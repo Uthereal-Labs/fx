@@ -105,6 +105,7 @@ pub const SteeringBoundaryResult = union(enum) {
 };
 
 pub const QueuedPrompt = struct {
+    context_provenance: types.ContextProvenance = .{},
     turn_id: u64 = 0,
     steering_receipt: ?*SteeringReceipt = null,
     /// Runtime-derived delivery state. The worker retains ownership in every state.
@@ -1498,7 +1499,7 @@ pub const WorkerRuntime = struct {
                 .begin_presented_prompt = queued.turn_id,
             });
         } else if (queued.recovery_checkpoint == null) {
-            const begin_prompt = try types.dupeUserTurn(alloc, .{ .text = queued.prompt, .images = queued.images });
+            const begin_prompt = try types.dupeUserTurn(alloc, .{ .text = queued.prompt, .images = queued.images, .context_provenance = queued.context_provenance });
             errdefer types.freeUserTurn(alloc, begin_prompt);
             if (queued.skill_bindings.len > 0 or queued.skill_display_spans.len > 0) {
                 const skill_bindings = try dupeSkillBindings(alloc, queued.skill_bindings);

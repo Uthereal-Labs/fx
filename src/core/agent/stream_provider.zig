@@ -225,6 +225,7 @@ pub const ModelRequest = struct {
     purpose: observation.ModelPurpose = .agent,
     observation_sink: observations.Sink = .{},
     observation_attempt: u32 = 0,
+    observation_request_id: ?[]const u8 = null,
     credential: types.CredentialLease,
     session_id: ?[]const u8 = null,
     model: []const u8,
@@ -480,13 +481,19 @@ pub const Provider = struct {
     pub fn stream(self: Provider, alloc: Allocator, request: ModelRequest) !Result {
         try request.data().validatePrompt();
         const parent = request.trace_context orelse request.observation_sink.options.parent;
+        var request_id_bytes: [16]u8 = undefined;
+        const identify = request.observation_sink.options.enabled and request.observation_sink.options.version >= 5;
+        if (identify) @import("../shared/io.zig").getIo().random(&request_id_bytes) else request_id_bytes = @splat(0);
+        const request_id = std.fmt.bytesToHex(request_id_bytes, .lower);
         const context = observations.Context{
+            .request_id = if (identify) &request_id else null,
             .trace = request.trace_ctx,
             .attempt = request.observation_attempt,
             .span = if (request.observation_sink.enabled() and parent != null) parent.?.child() else null,
         };
         var observed_request = request;
         observed_request.trace_context = context.span;
+        observed_request.observation_request_id = if (identify) &request_id else null;
         var names: std.ArrayList([]const u8) = .empty;
         defer names.deinit(alloc);
         if (request.observation_sink.enabled()) {
@@ -504,7 +511,7 @@ pub const Provider = struct {
         if (request.observation_sink.enabled() and result == .completed) {
             for (result.completed.completion.tool_calls) |call| ids.append(alloc, call.id) catch {};
         }
-        request.observation_sink.finished(alloc, context, .{ .model = request.model, .tool_call_ids = ids.items, .outcome = if (result == .completed) .completed else .failed, .delivery = if (request.delivery.load() == .possibly_sent) .possibly_sent else .definitely_unsent, .admitted = request.attempt_evidence.provider_admitted, .output_text = if (result == .completed) result.completed.completion.content else null, .output_omitted = true, .output_sha256 = null, .output_byte_count = null, .usage = if (result == .completed) .{ .input_tokens = result.completed.completion.usage.input_tokens, .output_tokens = result.completed.completion.usage.output_tokens } else null, .error_type = if (result == .failed) @tagName(result.failed.kind) else null }, if (result == .completed) result.completed.completion.tool_calls else &.{});
+        request.observation_sink.finished(alloc, context, .{ .model = request.model, .tool_call_ids = ids.items, .outcome = if (result == .completed) .completed else .failed, .delivery = if (request.delivery.load() == .possibly_sent) .possibly_sent else .definitely_unsent, .admitted = request.attempt_evidence.provider_admitted, .output_text = if (result == .completed) result.completed.completion.content else null, .output_omitted = true, .output_sha256 = null, .output_byte_count = null, .usage = if (result == .completed) result.completed.completion.usage else null, .error_type = if (result == .failed) @tagName(result.failed.kind) else null }, if (result == .completed) result.completed.completion.tool_calls else &.{});
         return result;
     }
 

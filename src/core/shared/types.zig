@@ -1498,7 +1498,49 @@ pub const ImageAttachment = struct {
     source_ref: ?[]u8 = null,
 };
 
+/// Host-supplied attribution only. Never used for permissions or prompt authority.
+pub const ContextProvenance = struct {
+    pub const Span = struct { category: enum { memory, current_user, summary }, start: usize, end: usize };
+    spans: [16]Span = @splat(.{ .category = .current_user, .start = 0, .end = 0 }),
+    count: u8 = 0,
+    sha256: [32]u8 = @splat(0),
+
+    pub fn matches(self: ContextProvenance, text: []const u8) bool {
+        if (self.count == 0 or self.count > self.spans.len) return false;
+        var previous: usize = 0;
+        for (self.spans[0..self.count]) |span| {
+            if (span.start < previous or span.end <= span.start or span.end > text.len or !std.unicode.utf8ValidateSlice(text[span.start..span.end])) return false;
+            previous = span.end;
+        }
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(text, &hash, .{});
+        return std.mem.eql(u8, &hash, &self.sha256);
+    }
+
+    pub fn parse(value: std.json.Value, text: []const u8) !ContextProvenance {
+        if (value != .array or value.array.items.len > 16) return error.InvalidContextProvenance;
+        var result: ContextProvenance = .{};
+        var previous: usize = 0;
+        for (value.array.items) |item| {
+            if (item != .object) return error.InvalidContextProvenance;
+            const category = item.object.get("category") orelse return error.InvalidContextProvenance;
+            const start = item.object.get("start") orelse return error.InvalidContextProvenance;
+            const end = item.object.get("end") orelse return error.InvalidContextProvenance;
+            if (category != .string or start != .integer or end != .integer or start.integer < 0 or end.integer <= start.integer) return error.InvalidContextProvenance;
+            const a = std.math.cast(usize, start.integer) orelse return error.InvalidContextProvenance;
+            const b = std.math.cast(usize, end.integer) orelse return error.InvalidContextProvenance;
+            if (a < previous or b > text.len or !std.unicode.utf8ValidateSlice(text[a..b])) return error.InvalidContextProvenance;
+            result.spans[result.count] = .{ .category = std.meta.stringToEnum(@FieldType(Span, "category"), category.string) orelse return error.InvalidContextProvenance, .start = a, .end = b };
+            result.count += 1;
+            previous = b;
+        }
+        std.crypto.hash.sha2.Sha256.hash(text, &result.sha256, .{});
+        return result;
+    }
+};
+
 pub const UserTurn = struct {
+    context_provenance: ContextProvenance = .{},
     text: []u8,
     images: []ImageAttachment = &.{},
     /// Durable join key for manager-owned child work. This is metadata only;
@@ -1533,6 +1575,7 @@ pub fn freeProviderReplay(alloc: std.mem.Allocator, value: ProviderReplay) void 
 }
 
 pub const ChatMessage = struct {
+    context_provenance: ContextProvenance = .{},
     role: ChatRole,
     content: ?[]const u8 = null,
     images: []const ImageAttachment = &.{},
@@ -3247,6 +3290,7 @@ pub fn dupeUserTurn(alloc: std.mem.Allocator, user: UserTurn) !UserTurn {
         .text = text,
         .images = images,
         .work_id = work_id,
+        .context_provenance = user.context_provenance,
     };
 }
 

@@ -3930,7 +3930,7 @@ fn appendRunningToolCalls(
     const issuing = current_turn_messages[current_turn_messages.len - 1];
     std.debug.assert(issuing.role == .assistant and issuing.tool_calls.len == calls.len);
     try append(deps.ctx, .{
-        .user = .{ .text = @constCast(job.prompt), .images = job.images },
+        .user = .{ .text = @constCast(job.prompt), .images = job.images, .context_provenance = job.context_provenance },
         .execution = try finalization.compacted_execution.project(arena, execution),
         .running_calls = running,
         .running_assistant = issuing.content,
@@ -3991,7 +3991,7 @@ fn persistRecoveryCheckpoint(
         current_turn_messages,
     );
     const projected = try finalization.compacted_execution.project(arena, execution);
-    const user: types.UserTurn = .{ .text = @constCast(job.prompt), .images = job.images };
+    const user: types.UserTurn = .{ .text = @constCast(job.prompt), .images = job.images, .context_provenance = job.context_provenance };
     // Every completed piece reaches the session before the next request.
     if (deps.append_turn_piece) |append| try append(deps.ctx, .{ .user = user, .execution = projected });
     const effect = deps.recovery_checkpoint orelse return;
@@ -4066,7 +4066,7 @@ const CompactionSource = struct {
         const execution = try runtime_execution_memory.buildExecutionMemory(self.arena, self.current_turn_messages);
         try effect.set(deps.ctx, .{
             .turn_id = job.turn_id,
-            .user = .{ .text = @constCast(job.prompt), .images = job.images },
+            .user = .{ .text = @constCast(job.prompt), .images = job.images, .context_provenance = job.context_provenance },
             .assistant_source = @constCast(""),
             .execution = try self.finalization.compacted_execution.project(self.arena, execution),
             .cause = .compaction_prepared,
@@ -5846,6 +5846,8 @@ fn processQueuedPromptInner(
     }
 
     const current_user_message: ChatMessage = .{
+        .context_origin = .user_turn,
+        .context_provenance = if (job.delivery.isContinuation()) .{} else job.context_provenance,
         .role = .user,
         .content = if (job.delivery.isContinuation())
             try runtime_execution_memory.steeringMessage(arena, job.prompt)
@@ -7508,7 +7510,7 @@ fn processQueuedPromptLoop(
                 } else {
                     // The pending user is source too, even before the first tool.
                     const active_prefix: types.AssistantHistoryTurn = .{
-                        .user = .{ .text = job.prompt, .images = job.images },
+                        .user = .{ .text = job.prompt, .images = job.images, .context_provenance = job.context_provenance },
                         .assistant = @constCast(""),
                         .execution = try runtime_execution_memory.buildExecutionMemory(arena, within_turn_suffix.items[compacted_suffix_len..]),
                     };
@@ -9432,7 +9434,7 @@ fn processQueuedPromptLoop(
             const finish_execution = try runtime_execution_memory.buildExecutionMemory(arena, within_turn_suffix.items);
             const completed_summary = summary_accumulator.finish();
             var turn: HistoryTurn = .{ .assistant = .{
-                .user = .{ .text = job.prompt, .images = job.images },
+                .user = .{ .text = job.prompt, .images = job.images, .context_provenance = job.context_provenance },
                 .assistant = @constCast(assistant_text),
                 .execution = try finalization.compacted_execution.project(arena, finish_execution),
             } };
@@ -12492,7 +12494,7 @@ fn finishFailedTurnWithNotice(
     );
     const completed_summary = summary_accumulator.finish();
     var turn: HistoryTurn = .{ .assistant = .{
-        .user = .{ .text = job.prompt, .images = job.images },
+        .user = .{ .text = job.prompt, .images = job.images, .context_provenance = job.context_provenance },
         .assistant = @constCast(notice),
         .execution = try finalization.compacted_execution.project(arena, execution_memory),
     } };

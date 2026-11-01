@@ -2725,14 +2725,14 @@ fn appendHistoryChatMessagesImpl(
                 });
             },
             .assistant => |entry| {
-                try messages.append(alloc, .{ .role = .user, .content = entry.user.text, .images = entry.user.images, .context_origin = .user_turn });
+                try messages.append(alloc, .{ .role = .user, .content = entry.user.text, .context_provenance = entry.user.context_provenance, .images = entry.user.images, .context_origin = .user_turn });
                 try appendExecutionMemoryChatMessages(alloc, messages, entry.execution);
                 if (entry.assistant.len > 0 or entry.provider_replay != null) {
                     try messages.append(alloc, .{ .role = .assistant, .content = entry.assistant, .provider_replay = entry.provider_replay });
                 }
             },
             .interrupted => |entry| {
-                try messages.append(alloc, .{ .role = .user, .content = entry.user.text, .images = entry.user.images, .context_origin = .user_turn });
+                try messages.append(alloc, .{ .role = .user, .content = entry.user.text, .context_provenance = entry.user.context_provenance, .images = entry.user.images, .context_origin = .user_turn });
                 try appendExecutionMemoryChatMessages(alloc, messages, entry.execution);
                 if (entry.tool_call) |tool_call| {
                     const assistant_content = try formatInterruptedAssistantToolContent(alloc, entry);
