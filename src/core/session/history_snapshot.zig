@@ -38,8 +38,8 @@ const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
 pub const file_name = "history-cache.bin";
 
 const magic = "fx-history-cache\x1a\n"; // 18 bytes; all offsets use magic.len
-// Image source references extend the binary payload without changing the log schema.
-const format_version: u16 = 3;
+// Optional provenance extends user payloads without changing the log schema.
+const format_version: u16 = 4;
 /// Frames carry 32-bit lengths; a single log line can be large (embedded tool
 /// output), so the cap stays generous. Anything larger is a corrupt cache.
 const max_frame_bytes: u32 = 1024 * 1024 * 1024;
@@ -94,6 +94,7 @@ fn encodeAny(out: *std.ArrayList(u8), alloc: Allocator, value: anytype) EncodeEr
                     for (value) |item| try encodeAny(out, alloc, item);
                 }
             },
+            .one => try encodeAny(out, alloc, value.*),
             else => @compileError("snapshot codec: unsupported pointer: " ++ @typeName(T)),
         },
         .array => |info| {
@@ -192,6 +193,12 @@ fn decodeAny(comptime T: type, alloc: Allocator, cur: *ByteCursor) DecodeError!T
                 }
                 return items;
             },
+            .one => {
+                const value = try alloc.create(info.child);
+                errdefer alloc.destroy(value);
+                value.* = try decodeAny(info.child, alloc, cur);
+                return value;
+            },
             else => @compileError("snapshot codec: unsupported pointer: " ++ @typeName(T)),
         },
         .array => |info| {
@@ -205,8 +212,13 @@ fn decodeAny(comptime T: type, alloc: Allocator, cur: *ByteCursor) DecodeError!T
         },
         .@"struct" => |info| {
             var value: T = undefined;
+            var initialized: usize = 0;
+            errdefer inline for (info.field_names, info.field_types, 0..) |field_name, field_type, index| {
+                if (index < initialized) freeAny(alloc, field_type, @field(value, field_name));
+            };
             inline for (info.field_names, info.field_types) |field_name, field_type| {
                 @field(value, field_name) = try decodeAny(field_type, alloc, cur);
+                initialized += 1;
             }
             return value;
         },
@@ -245,6 +257,10 @@ fn freeAny(alloc: Allocator, comptime T: type, value: T) void {
                     for (value) |item| freeAny(alloc, info.child, item);
                 }
                 alloc.free(value);
+            },
+            .one => {
+                freeAny(alloc, info.child, value.*);
+                alloc.destroy(value);
             },
             else => unreachable,
         },

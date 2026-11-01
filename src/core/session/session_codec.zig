@@ -1581,6 +1581,10 @@ fn writeUserTurn(writer: *std.Io.Writer, user: session.UserTurn, image_blobs: an
         try writer.writeByte('}');
     }
     try writer.writeByte(']');
+    if (user.context_provenance.matches(user.text)) {
+        try writer.writeAll(",\"context_provenance\":");
+        try std.json.Stringify.value(user.context_provenance, .{}, writer);
+    }
     if (user.work_id) |work_id| {
         try writer.writeAll(",\"work_id\":");
         try writeJsonString(writer, work_id);
@@ -2097,10 +2101,10 @@ fn writeExecutionFileEvidence(
 
 fn parseUserTurn(alloc: Allocator, value: std.json.Value, image_blobs: ?*ImageBlobReader) !session.UserTurn {
     const source = try requireObject(value);
-    const object = if (source.count() == 2)
-        try exactObject(value, &.{ "text", "images" })
-    else
-        try exactObject(value, &.{ "text", "images", "work_id" });
+    for (source.keys()) |key| {
+        if (!std.mem.eql(u8, key, "text") and !std.mem.eql(u8, key, "images") and !std.mem.eql(u8, key, "work_id") and !std.mem.eql(u8, key, "context_provenance")) return error.InvalidSessionFormat;
+    }
+    const object = source;
     const text = try parseRequiredDurableBytes(alloc, object, "text");
     errdefer mem_utils.free(alloc, text);
     const work_id = if (object.get("work_id")) |_|
@@ -2109,9 +2113,15 @@ fn parseUserTurn(alloc: Allocator, value: std.json.Value, image_blobs: ?*ImageBl
         null;
     errdefer if (work_id) |id| mem_utils.free(alloc, id);
     if (work_id) |id| session.validateWorkId(id) catch return error.InvalidSessionFormat;
+    const provenance = if (object.get("context_provenance")) |v| blk: {
+        const parsed_provenance = std.json.parseFromValue(types.ContextProvenance, alloc, v, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidSessionFormat;
+        defer parsed_provenance.deinit();
+        break :blk try parsed_provenance.value.dupe(alloc);
+    } else types.ContextProvenance{};
+    errdefer provenance.deinit(alloc);
     const images_value = object.get("images") orelse return error.InvalidSessionFormat;
     if (images_value != .array) return error.InvalidSessionFormat;
-    if (images_value.array.items.len == 0) return .{ .text = text, .work_id = work_id };
+    if (images_value.array.items.len == 0) return .{ .text = text, .work_id = work_id, .context_provenance = provenance };
 
     const images = try alloc.alloc(session.ImageAttachment, images_value.array.items.len);
     errdefer mem_utils.free(alloc, images);
@@ -2162,7 +2172,7 @@ fn parseUserTurn(alloc: Allocator, value: std.json.Value, image_blobs: ?*ImageBl
         };
         parsed_count += 1;
     }
-    return .{ .text = text, .images = images, .work_id = work_id };
+    return .{ .text = text, .images = images, .work_id = work_id, .context_provenance = provenance };
 }
 
 /// Reads an inline image's bytes from `inline_data` or, inside a libfx kernel

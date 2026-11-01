@@ -18,6 +18,7 @@ const Allocator = std.mem.Allocator;
 
 pub const Request = struct {
     observer: ?*observation.Observer = null,
+    observation_sink: @import("../observations.zig").Sink = .{},
     purpose: observation.ModelPurpose = .auxiliary,
     stream_provider: agent_stream_provider.Provider,
     cooperative_pulse: ?agent_stream_provider.CooperativePulse = null,
@@ -87,6 +88,7 @@ pub fn complete(alloc: Allocator, request: Request) Error!Outcome {
         alloc,
         .{
             .observer = request.observer,
+            .observation_sink = request.observation_sink,
             .purpose = request.purpose,
             .credential = request.credential,
             .session_id = request.session_id,
@@ -185,6 +187,7 @@ fn onEvent(raw: *anyopaque, event: agent_stream_provider.Event) void {
 /// conversation's options except Ultrafast, which is reserved for agent turns.
 pub const CompactorCaller = struct {
     observer: ?*observation.Observer = null,
+    observation_sink: @import("../observations.zig").Sink = .{},
     stream_provider: agent_stream_provider.Provider,
     cooperative_transport_pulse: ?agent_stream_provider.CooperativePulse = null,
     provider: model_provider.ProviderId,
@@ -246,6 +249,7 @@ pub const CompactorCaller = struct {
         var usage: types.Usage = .{};
         const outcome = try complete(alloc, .{
             .observer = self.observer,
+            .observation_sink = self.observation_sink,
             .purpose = .compaction,
             .stream_provider = self.stream_provider,
             .cooperative_pulse = self.cooperative_transport_pulse,

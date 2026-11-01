@@ -226,6 +226,8 @@ const ReviewView = enum {
 /// Borrowed view of the successful model turn. Every referenced slice must
 /// remain valid until `Reviewer.review` returns.
 pub const ReviewTurnContext = struct {
+    observation_sink: @import("../agent/observations.zig").Sink = .{},
+    trace_ctx: @import("../shared/debug_trace.zig").TraceContext = .{},
     observer: ?*observation.Observer = null,
     model: []const u8,
     pending_assistant: types.ChatMessage,

@@ -177,7 +177,7 @@ fn entryRetainedBytes(entry: TranscriptEntry) usize {
         .raw_bytes => |e| e.bytes.len,
         .semantic_notice => |e| e.topic.len + e.body.len,
         .user_turn => |e| blk: {
-            var total = e.turn.text.len;
+            var total = e.turn.text.len + e.turn.context_provenance.retainedBytes();
             for (e.turn.images) |img| {
                 total += img.path.len;
                 total += img.media_type.len;

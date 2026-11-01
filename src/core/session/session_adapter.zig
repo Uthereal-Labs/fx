@@ -1551,7 +1551,7 @@ pub const Session = struct {
         defer arena.deinit();
         const a = arena.allocator();
         var events: std.ArrayList(Event) = .empty;
-        try events.append(a, .{ .user = .{ .text = user.text, .images = user.images, .work_id = user.work_id } });
+        try events.append(a, .{ .user = .{ .text = user.text, .images = user.images, .work_id = user.work_id, .context_provenance = user.context_provenance } });
         // A result's blob needs the turn on disk first (D44).
         if (storesBodies(execution)) try self.openTurnLocked();
         // On a missing handle the list keeps the pieces before it.
@@ -2431,7 +2431,7 @@ const Source = struct {
             images.?[index].inline_data = bytes;
         }
         const list = images orelse return user;
-        return .{ .text = user.text, .images = list, .work_id = user.work_id };
+        return .{ .text = user.text, .images = list, .work_id = user.work_id, .context_provenance = user.context_provenance };
     }
 
     /// A piece's bytes, from its blob when the line holds a reference. The
@@ -3874,6 +3874,18 @@ fn decodePiece(arena: Allocator, kind: PieceKind, data: []const u8, allocate: st
 /// image's inline bytes, which a v2 session keeps inside the turn (D44),
 /// are base64 text, since a JSON string cannot hold raw bytes.
 const WireUser = struct {
+    pub fn jsonStringify(self: @This(), writer: *std.json.Stringify) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |name| {
+            if (!std.mem.eql(u8, name, "context_provenance") or self.context_provenance.matches(self.text)) {
+                try writer.objectField(name);
+                try writer.write(@field(self, name));
+            }
+        }
+        try writer.endObject();
+    }
+
+    context_provenance: types.ContextProvenance = .{},
     text: []const u8,
     images: []const WireImage = &.{},
     work_id: ?[]const u8 = null,
@@ -3921,7 +3933,7 @@ const WireUser = struct {
                 .source_ref = image.source_ref,
             };
         }
-        return .{ .text = user.text, .images = images, .work_id = user.work_id };
+        return .{ .text = user.text, .images = images, .work_id = user.work_id, .context_provenance = user.context_provenance };
     }
 
     fn toUser(wire: WireUser, a: Allocator) !session_event.ConversationUser {
@@ -3945,7 +3957,7 @@ const WireUser = struct {
                 .source_ref = if (image.source_ref) |value| try a.dupe(u8, value) else null,
             };
         }
-        return .{ .text = wire.text, .images = images, .work_id = wire.work_id };
+        return .{ .text = wire.text, .images = images, .work_id = wire.work_id, .context_provenance = wire.context_provenance };
     }
 };
 

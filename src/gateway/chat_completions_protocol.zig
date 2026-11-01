@@ -655,10 +655,13 @@ pub const Reducer = struct {
     response_model: ?[]u8 = null,
     usage: types.Usage = .{},
     usage_total: ?u64 = null,
-    usage_final_fields: packed struct(u3) {
+    usage_final_fields: packed struct(u6) {
         input: bool = false,
         output: bool = false,
         total: bool = false,
+        cache_read: bool = false,
+        cache_write: bool = false,
+        reasoning: bool = false,
     } = .{},
     reasoning: [2]ReasoningPart = @splat(.{}),
     reasoning_details: ReasoningPart = .{},
@@ -964,11 +967,17 @@ pub const Reducer = struct {
         const incoming = types.Usage{
             .input_tokens = try token_count(fields, "prompt_tokens"),
             .output_tokens = try token_count(fields, "completion_tokens"),
+            .cache_read_tokens = try token_detail(fields, "prompt_tokens_details", "cached_tokens"),
+            .cache_write_tokens = try token_detail(fields, "prompt_tokens_details", "cache_write_tokens"),
+            .reasoning_tokens = try token_detail(fields, "completion_tokens_details", "reasoning_tokens"),
         };
         const incoming_total = try token_count(fields, "total_tokens");
         const usage = types.Usage{
             .input_tokens = incoming.input_tokens orelse self.usage.input_tokens,
             .output_tokens = incoming.output_tokens orelse self.usage.output_tokens,
+            .cache_read_tokens = incoming.cache_read_tokens orelse self.usage.cache_read_tokens,
+            .cache_write_tokens = incoming.cache_write_tokens orelse self.usage.cache_write_tokens,
+            .reasoning_tokens = incoming.reasoning_tokens orelse self.usage.reasoning_tokens,
         };
         const total = incoming_total orelse self.usage_total;
         var final_fields = self.usage_final_fields;
@@ -976,6 +985,9 @@ pub const Reducer = struct {
             final_fields.input = final_fields.input or incoming.input_tokens != null;
             final_fields.output = final_fields.output or incoming.output_tokens != null;
             final_fields.total = final_fields.total or incoming_total != null;
+            final_fields.cache_read = final_fields.cache_read or incoming.cache_read_tokens != null;
+            final_fields.cache_write = final_fields.cache_write or incoming.cache_write_tokens != null;
+            final_fields.reasoning = final_fields.reasoning or incoming.reasoning_tokens != null;
         }
         // Carried progress values are lower bounds, not current or final assertions.
         if (total) |tokens| {
@@ -986,9 +998,9 @@ pub const Reducer = struct {
             } else if (exact and sum < tokens) return error.InvalidChunk;
         }
         for (
-            [_]?u64{ self.usage.input_tokens, self.usage.output_tokens, self.usage_total },
-            [_]?u64{ usage.input_tokens, usage.output_tokens, total },
-            [_]bool{ self.usage_final_fields.input, self.usage_final_fields.output, self.usage_final_fields.total },
+            [_]?u64{ self.usage.input_tokens, self.usage.output_tokens, self.usage_total, self.usage.cache_read_tokens, self.usage.cache_write_tokens, self.usage.reasoning_tokens },
+            [_]?u64{ usage.input_tokens, usage.output_tokens, total, usage.cache_read_tokens, usage.cache_write_tokens, usage.reasoning_tokens },
+            [_]bool{ self.usage_final_fields.input, self.usage_final_fields.output, self.usage_final_fields.total, self.usage_final_fields.cache_read, self.usage_final_fields.cache_write, self.usage_final_fields.reasoning },
         ) |previous, current, was_final| {
             if (previous) |prior| {
                 if (current.? < prior or (was_final and current.? != prior)) return error.ConflictingIdentity;
@@ -1087,6 +1099,11 @@ fn integer(value: std.json.Value) Error!i64 {
 
 fn index_value(value: std.json.Value) Error!usize {
     return std.math.cast(usize, try integer(value)) orelse error.InvalidChunk;
+}
+
+fn token_detail(fields: std.json.ObjectMap, section: []const u8, key: []const u8) Error!?u64 {
+    const value = non_null(fields, section) orelse return null;
+    return token_count(try object(value), key);
 }
 
 fn token_count(fields: std.json.ObjectMap, key: []const u8) Error!?u64 {

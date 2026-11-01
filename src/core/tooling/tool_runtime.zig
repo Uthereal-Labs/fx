@@ -1349,6 +1349,7 @@ fn executeVisionRequest(
 ) !ToolExecutionResult {
     const config: vision_executor.Config = .{
         .observer = state.runtime.observer,
+        .observation_sink = state.runtime.observation_sink,
         .parent_call_id = if (state.runtime.output_chunk_lifecycle_id) |id| id.call_id else null,
         .stream_provider = state.runtime.agent_stream_provider,
         .api_key = state.runtime.api_key,

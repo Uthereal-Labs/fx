@@ -50,6 +50,18 @@ pub const ConversationAssistant = struct {
 };
 
 pub const ConversationUser = struct {
+    pub fn jsonStringify(self: @This(), writer: *std.json.Stringify) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |name| {
+            if (!std.mem.eql(u8, name, "context_provenance") or self.context_provenance.matches(self.text)) {
+                try writer.objectField(name);
+                try writer.write(@field(self, name));
+            }
+        }
+        try writer.endObject();
+    }
+
+    context_provenance: types.ContextProvenance = .{},
     text: []const u8,
     images: []const types.ImageAttachment = &.{},
     work_id: ?[]const u8 = null,
@@ -512,6 +524,7 @@ pub fn appendHistoryTurnConversationEvents(
                 .text = entry.user.text,
                 .images = entry.user.images,
                 .work_id = entry.user.work_id,
+                .context_provenance = entry.user.context_provenance,
             } });
             try appendExecutionConversationEvents(alloc, events, entry.execution);
             const follows_standalone = entry.execution.tool_steps.len > 0 and
@@ -529,6 +542,7 @@ pub fn appendHistoryTurnConversationEvents(
                 .text = entry.user.text,
                 .images = entry.user.images,
                 .work_id = entry.user.work_id,
+                .context_provenance = entry.user.context_provenance,
             } });
             try appendExecutionConversationEvents(alloc, events, entry.execution);
             if (entry.tool_call) |call| {
