@@ -167,8 +167,8 @@ test("resume writes a replay cache and replays identically with it corrupt or mi
 
     const versionOffset = Buffer.byteLength("fx-history-cache\x1a\n");
     const outdatedCache = readFileSync(cachePath);
-    expect(outdatedCache.readBigUInt64LE(versionOffset)).toBe(3n);
-    outdatedCache.writeBigUInt64LE(2n, versionOffset);
+    expect(outdatedCache.readBigUInt64LE(versionOffset)).toBe(4n);
+    outdatedCache.writeBigUInt64LE(3n, versionOffset);
     writeFileSync(cachePath, outdatedCache, { mode: 0o600 });
     const upgraded = await continueSession(fixture, gateway, id);
     expect(upgraded.code).toBe(0);
@@ -176,7 +176,7 @@ test("resume writes a replay cache and replays identically with it corrupt or mi
     expect(JSON.parse(upgraded.stdout).output).toBe("CACHE_UPGRADED_TURN");
     expect(gateway.requests[4]!.body).toContain("CACHE_REBUILT_TURN");
     expect(gateway.requests[4]!.body).toContain("CACHE_BASELINE_TURN");
-    expect(readFileSync(cachePath).readBigUInt64LE(versionOffset)).toBe(3n);
+    expect(readFileSync(cachePath).readBigUInt64LE(versionOffset)).toBe(4n);
   } finally {
     gateway.stop();
     rmSync(fixture.root, { recursive: true, force: true });

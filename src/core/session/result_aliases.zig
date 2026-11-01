@@ -223,7 +223,7 @@ test "short result aliases inherited by a fork never become the new owner's alia
 
 test "short result aliases survive reopening a legacy owner and reject changed ownership" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     try tmp.dir.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o700));
     const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
