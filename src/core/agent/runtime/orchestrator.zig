@@ -7530,6 +7530,7 @@ fn processQueuedPromptLoop(
                     };
                     var summary_model: runtime_text_completion.CompactorCaller = .{
                         .observer = deps.observer,
+                        .observation_sink = deps.observation_sink,
                         .stream_provider = deps.agent_stream_provider,
                         .cooperative_transport_pulse = deps.cooperative_transport_pulse,
                         .provider = job.provider,
@@ -10219,7 +10220,7 @@ fn processQueuedPromptLoop(
                         null;
                     const parallel_review_attempt_available = root_action_permission_mode != .auto or
                         turn_review_cache.reviewAttemptAvailable(parallel_call);
-                    const parallel_review_context = buildReviewTurnContext(
+                    var parallel_review_context = buildReviewTurnContext(
                         config,
                         successful_gateway_model,
                         root_user_intent_context,
@@ -10229,6 +10230,8 @@ fn processQueuedPromptLoop(
                         parallel_call.id,
                         parallel_review_attempt_available,
                     );
+                    parallel_review_context.observation_sink = deps.observation_sink;
+                    parallel_review_context.trace_ctx = step_ctx;
                     if (parallel_preserved_review_hold != null) {
                         debug_trace.eventf(
                             "permission",
@@ -11218,7 +11221,7 @@ fn processQueuedPromptLoop(
                 tool_call;
             const review_attempt_available = action_permission_mode != .auto or
                 turn_review_cache.reviewAttemptAvailable(execution_call);
-            const review_context = buildReviewTurnContext(
+            var review_context = buildReviewTurnContext(
                 config,
                 successful_gateway_model,
                 root_user_intent_context,
@@ -11228,6 +11231,8 @@ fn processQueuedPromptLoop(
                 execution_call.id,
                 review_attempt_available,
             );
+            review_context.observation_sink = deps.observation_sink;
+            review_context.trace_ctx = step_ctx;
             const tool_execution_root_user_context = try buildToolExecutionRootUserContext(
                 call_allocator,
                 root_user_intent_context,

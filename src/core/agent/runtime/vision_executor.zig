@@ -27,6 +27,7 @@ const system_prompt =
 
 pub const Config = struct {
     observer: ?*observation.Observer = null,
+    observation_sink: @import("../observations.zig").Sink = .{},
     parent_call_id: ?[]const u8 = null,
     stream_provider: agent_stream_provider.Provider,
     api_key: []const u8,
@@ -291,6 +292,7 @@ fn runBatchAttempt(
         .{
             .stream_provider = config.stream_provider,
             .observer = config.observer,
+            .observation_sink = config.observation_sink,
             .parent_call_id = config.parent_call_id,
             .api_key = config.api_key,
             .credential_source = config.credential_source,

@@ -96,6 +96,7 @@ fn capUtf8(text: []const u8, max_bytes: usize) []const u8 {
 
 pub const Request = struct {
     observer: ?*observation.Observer = null,
+    observation_sink: @import("../agent/observations.zig").Sink = .{},
     stream_provider: stream_provider.Provider,
     model: []const u8,
     api_key: []const u8,
@@ -166,6 +167,7 @@ pub fn run(alloc: Allocator, request: Request) !Outcome {
         alloc,
         .{
             .observer = request.observer,
+            .observation_sink = request.observation_sink,
             .purpose = .title,
             .credential = credential,
             .session_id = request.session_id,
@@ -226,6 +228,7 @@ pub const Task = struct {
 
     /// Borrowed; a caller installing this must join the task before releasing it.
     observer: ?*observation.Observer = null,
+    observation_sink: @import("../agent/observations.zig").Sink = .{},
     thread: ?std.Thread = null,
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -248,6 +251,7 @@ pub const Task = struct {
 
     pub const Init = struct {
         observer: ?*observation.Observer = null,
+        observation_sink: @import("../agent/observations.zig").Sink = .{},
         session_id: []const u8,
         model: []const u8,
         prompt_excerpt: []const u8,
@@ -275,9 +279,15 @@ pub const Task = struct {
         const account_id: ?[]u8 = if (init.account_id) |value| try alloc.dupe(u8, value) else null;
         errdefer if (account_id) |value| alloc.free(value);
 
+        var observation_sink = init.observation_sink;
+        observation_sink.session_id = session_id;
+        observation_sink.work_id = if (init.observation_sink.work_id) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (observation_sink.work_id) |value| alloc.free(value);
+
         const task = try alloc.create(Task);
         task.* = .{
             .observer = init.observer,
+            .observation_sink = observation_sink,
             .session_id = session_id,
             .model = model,
             .prompt_excerpt = prompt_excerpt,
@@ -317,6 +327,7 @@ pub const Task = struct {
         self.cancel();
         if (self.thread) |thread| thread.join();
         const alloc = std.heap.c_allocator;
+        if (self.observation_sink.work_id) |value| alloc.free(value);
         alloc.free(self.session_id);
         alloc.free(self.model);
         alloc.free(self.prompt_excerpt);
@@ -342,6 +353,7 @@ pub const Task = struct {
         const alloc = std.heap.c_allocator;
         const outcome = run(alloc, .{
             .observer = self.observer,
+            .observation_sink = self.observation_sink,
             .stream_provider = self.stream_provider,
             .model = self.model,
             .api_key = self.api_key orelse "",

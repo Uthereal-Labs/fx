@@ -1146,7 +1146,7 @@ pub fn handlePrompt(
         .custom_tool_guidance = tool_projection.custom_guidance,
     }, current_prompt_is_root_authority);
     agent_config.session_child_capability = sessionChildCapability(session);
-    maybeStartAcpTitleTask(state, session, owned_prompt, recovery_checkpoint != null, ctx.observer);
+    maybeStartAcpTitleTask(state, session, owned_prompt, recovery_checkpoint != null, ctx.observer, ctx.observationSink());
     defer if (session.title_task != null) completeAcpTitleTask(state, session, alloc);
     agent_runtime.processAgentPrompt(&session.session_rt.agent, &deps, null, .{
         .view = state.lifecycle_view,
@@ -1206,6 +1206,7 @@ fn maybeStartAcpTitleTask(
     prompt_text: []const u8,
     recovery: bool,
     observer: ?*observation.Observer,
+    observation_sink: observations.Sink,
 ) void {
     // Unit tests share the real provider bundles; never spawn network side
     // calls from a test process. Wiring is covered by e2e mock servers.
@@ -1222,6 +1223,7 @@ fn maybeStartAcpTitleTask(
     if (session.credential_source != .host_managed and session.api_key.len == 0) return;
     const task = session_title_generation.Task.create(.{
         .observer = observer,
+        .observation_sink = observation_sink,
         .session_id = session_id,
         .model = title_model,
         .prompt_excerpt = excerpt,

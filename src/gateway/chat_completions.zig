@@ -338,9 +338,9 @@ fn fetch_cli_catalog(raw: ?*anyopaque, alloc: Allocator, input: gateway_provider
     }
 }
 
-const Review = struct { definition: *const definitions.Definition, input: classifier.ProviderInput };
+const Review = struct { definition: *const definitions.Definition, input: classifier.ProviderInput, review_turn: classifier.ReviewTurnContext };
 fn review(raw: ?*anyopaque, alloc: Allocator, input: classifier.ProviderInput, request: classifier.ReviewRequest) !classifier.ParseOutcome {
-    var state = Review{ .definition = definition_at(raw), .input = input };
+    var state = Review{ .definition = definition_at(raw), .input = input, .review_turn = request.review_turn };
     return classifier.Reviewer.withTransportModel(.{ .context = &state, .build_fn = build_review, .send_fn = send_review }, input.cancel_flag, classifier.Reviewer.default_timeout_ms, state.definition.reviewer_model orelse request.review_turn.model).review(alloc, request);
 }
 fn build_review(raw: *anyopaque, alloc: Allocator, model: []const u8, _: []const u8, instructions: []const types.ChatMessage, messages: []const types.ChatMessage, target_id: []const u8, deadline: std.Io.Clock.Timestamp, cancel: *std.atomic.Value(bool)) ![]u8 {
@@ -362,6 +362,9 @@ fn send_review(raw: *anyopaque, alloc: Allocator, model: []const u8, payload: []
     var evidence: streams.AttemptEvidence = .{};
     var event_context: u8 = 0;
     var result = gateway_step.streamModelCompletion(bundle(state.definition).agent_stream.?, alloc, .{
+        .observation_sink = state.review_turn.observation_sink,
+        .purpose = .permission_review,
+        .session_id = state.review_turn.observation_sink.session_id,
         .credential = .{ .direct = .{ .secret_bytes = state.input.credential, .source = state.input.credential_source } },
         .model = model,
         .retry_count = 1,
@@ -370,7 +373,7 @@ fn send_review(raw: *anyopaque, alloc: Allocator, model: []const u8, payload: []
         .tool_choice = .required,
         .provider_options = .{},
         .prepared_request_body = payload,
-        .trace_ctx = .{},
+        .trace_ctx = state.review_turn.trace_ctx,
         .content_capture_limit = 16 * 1024,
         .deadline = deadline,
         .delivery = &delivery,
