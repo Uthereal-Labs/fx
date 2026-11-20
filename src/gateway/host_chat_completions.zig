@@ -48,7 +48,7 @@ pub fn bundle(raw: ?*anyopaque, definition: *const definitions.Definition) provi
             .context = context,
             .stream_fn = stream,
             .build_request_fn = buildRequest,
-            .project_replay_fn = chat_completions.project_replay,
+            .project_replay_fn = chat_completions.replay_projection(own),
         },
         .model_catalog = chat_completions.model_catalog_provider(own),
     };
@@ -72,7 +72,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
     const payload = request.prepared_request_body orelse
         try chat_completions.build_for(definition, alloc, request.data());
     defer if (request.prepared_request_body == null) alloc.free(payload);
-    const endpoint = try definition.chat_url(alloc);
+    const endpoint = try definition.endpoint_url(alloc);
     defer alloc.free(endpoint);
     const headers = [_]std.http.Header{
         .{ .name = "content-type", .value = "application/json" },
@@ -89,7 +89,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
 
     var reader: host_stream.HostStreamReader = undefined;
     reader.init(transport, opened.handle, request.cancel_flag, request.deadline, request.cooperative_pulse);
-    const result = chat_completions.consume(alloc, &reader.interface, request) catch |err| switch (err) {
+    const result = chat_completions.consume(alloc, definition, &reader.interface, request) catch |err| switch (err) {
         error.ReadFailed => return host_stream.readFailure(&reader, request.cancel_flag),
         else => return err,
     };

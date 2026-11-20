@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
-import { completion, toolCompletion, createConfiguredProviderFixture as fixture } from "./fixtures/chat-completions";
+import { completion, responsesCompletion, toolCompletion, createConfiguredProviderFixture as fixture } from "./fixtures/chat-completions";
 
 async function withReasoning(response: Response, ...deltas: Record<string, unknown>[]) {
   const prefix = deltas.map(delta => `data: ${JSON.stringify({ choices: [{ index: 0, delta }] })}\n\n`).join("");
@@ -96,6 +96,64 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 65000);
 
+  test("Responses connection sends the effort, replays encrypted reasoning, and sums cached usage", async () => {
+    let calls = 0;
+    const f = fixture((body, path) => {
+      calls++;
+      if (path !== "/v1/responses") return new Response("wrong protocol", { status: 500 });
+      const usage = { input_tokens: 1000 * calls, output_tokens: 10, input_tokens_details: { cached_tokens: 512 * calls }, output_tokens_details: { reasoning_tokens: 4 } };
+      if (calls === 1) {
+        const reasoning = { type: "reasoning", id: "rs_1", summary: [], encrypted_content: "opaque-reasoning" };
+        const call = { type: "function_call", id: "fc_1", call_id: "call_1", name: "read_file", arguments: JSON.stringify({ path: "note.txt" }) };
+        // Azure OpenAI encrypts the same reasoning item anew in every event.
+        return responsesCompletion([
+          { type: "response.output_item.done", output_index: 0, item: { ...reasoning, encrypted_content: "opaque-reasoning-draft" } },
+          { type: "response.output_item.added", output_index: 1, item: { ...call, arguments: "" } },
+          { type: "response.output_item.done", output_index: 1, item: call },
+          { type: "response.completed", response: { id: "resp_1", status: "completed", output: [reasoning, call], usage } },
+        ]);
+      }
+      const message = { type: "message", id: "msg_1", role: "assistant", content: [{ type: "output_text", text: "read complete" }] };
+      return responsesCompletion([
+        { type: "response.output_text.delta", output_index: 0, delta: "read complete" },
+        { type: "response.output_item.done", output_index: 0, item: message },
+        { type: "response.completed", response: { id: "resp_2", status: "completed", output: [message], usage } },
+      ]);
+    });
+    try {
+      writeFileSync(join(f.workspace, "note.txt"), "fixture contents");
+      const result = await runFx(["ask", "--json", "--no-save", "--effort", "medium", "Read note.txt"], { cwd: f.workspace, env: { ...f.env, FX_PROVIDER: "responses" }, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.final_output).toBe("read complete");
+      expect(parsed.usage).toEqual({ input_tokens: 3000, output_tokens: 20, cache_read_tokens: 1536, cache_write_tokens: null, reasoning_tokens: 8 });
+      expect(f.requests.map(request => request.path)).toEqual(["/v1/responses", "/v1/responses"]);
+      expect(f.requests.every(request => request.authorization === `Bearer ${f.env.FX_TEST_PROVIDER_TOKEN}`)).toBe(true);
+      const first = f.requests[0].body;
+      expect(first.store).toBe(false);
+      expect(first.stream).toBe(true);
+      expect(first.reasoning).toEqual({ effort: "medium" });
+      expect(first.include).toEqual(["reasoning.encrypted_content"]);
+      expect(first.tools.some((tool: any) => tool.name === "read_file")).toBe(true);
+      expect(first.messages).toBeUndefined();
+      expect(first.text).toBeUndefined();
+      const input = f.requests[1].body.input;
+      expect(input.some((item: any) => item.type === "reasoning" && item.encrypted_content === "opaque-reasoning")).toBe(true);
+      expect(input.some((item: any) => item.type === "function_call_output" && String(item.output).includes("fixture contents"))).toBe(true);
+    } finally { f.close(); }
+  }, 25000);
+
+  test("Chat Completions sends a declared none effort instead of the endpoint default", async () => {
+    const f = fixture();
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "--effort", "none", "say hello"], { cwd: f.workspace, env: { ...f.env, FX_PROVIDER: "remote" }, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(f.requests).toHaveLength(1);
+      expect(f.requests[0].path).toBe("/v1/chat/completions");
+      expect(f.requests[0].body.reasoning_effort).toBe("none");
+    } finally { f.close(); }
+  }, 25000);
+
   test("status identifies the configured connection and endpoint without probing it", async () => {
     const f = fixture();
     try {
@@ -168,7 +226,7 @@ describe("configured providers", () => {
       if (selection.code !== 0) throw new Error(selection.stdout + selection.stderr);
       const saved = JSON.parse(readFileSync(f.settingsPath, "utf8"));
       expect(saved.provider).toBe("remote");
-      expect(saved.models).toEqual({ local: "local-model", remote: "workspace-model" });
+      expect(saved.models).toEqual({ local: "local-model", remote: "workspace-model", responses: "responses-model" });
       expect(saved.workspaces[f.workspace].models.remote).toBe("workspace-model");
       expect(saved.providers).toEqual(f.settings.providers);
     } finally { f.close(); }

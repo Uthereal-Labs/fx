@@ -430,7 +430,7 @@ Options:
 The prompt may be passed as arguments or piped on stdin when no prompt args are given.
 TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.
 Operational progress and diagnostics are written to stderr. JSON \`output\` keeps accumulated assistant Markdown; \`final_output\` contains only the completed final response, or an empty string when absent.
-JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. Nested usage and dollar spend are excluded.
+JSON usage sums reported main-agent input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, and reasoning_tokens, including with --no-save; unreported counts are null. Cached tokens are part of input_tokens and reasoning tokens are part of output_tokens. Nested usage and dollar spend are excluded.
 --system replaces only the built-in base prompt for this request; tool, skill, project, and runtime context still apply.
 With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.
 `;
@@ -4157,7 +4157,7 @@ describe("cli: ask success", () => {
       expect(jsonResult.code).toBe(1);
       expect(jsonResult.stderr).toBe("");
       expect(jsonResult.stdout).toBe(
-        '{"output":"","final_output":"","exit_code":1,"model":"","resolved_provider":null,"session_id":"","steps":0,"tool_calls":[],"usage":{"input_tokens":null,"output_tokens":null},"error":"PromptResourceLimitExceeded"}\n',
+        '{"output":"","final_output":"","exit_code":1,"model":"","resolved_provider":null,"session_id":"","steps":0,"tool_calls":[],"usage":{"input_tokens":null,"output_tokens":null,"cache_read_tokens":null,"cache_write_tokens":null,"reasoning_tokens":null},"error":"PromptResourceLimitExceeded"}\n',
       );
     },
     120_000,
@@ -4301,21 +4301,21 @@ describe("cli: ask success", () => {
     {
       name: "reports exact provider totals",
       reportedUsage: { inputTokens: { total: 17 }, outputTokens: { total: 23 } },
-      expectedUsage: { input_tokens: 17, output_tokens: 23 },
+      expectedUsage: { input_tokens: 17, output_tokens: 23, cache_read_tokens: null, cache_write_tokens: null, reasoning_tokens: null },
       toolLoop: false,
       json: true,
     },
     {
       name: "reports null when provider totals are missing",
       reportedUsage: undefined,
-      expectedUsage: { input_tokens: null, output_tokens: null },
+      expectedUsage: { input_tokens: null, output_tokens: null, cache_read_tokens: null, cache_write_tokens: null, reasoning_tokens: null },
       toolLoop: false,
       json: true,
     },
     {
       name: "sums main-agent completions across a read_file tool loop",
       reportedUsage: { inputTokens: { total: 17 }, outputTokens: { total: 23 } },
-      expectedUsage: { input_tokens: 20, output_tokens: 28 },
+      expectedUsage: { input_tokens: 20, output_tokens: 28, cache_read_tokens: null, cache_write_tokens: null, reasoning_tokens: null },
       toolLoop: true,
       json: true,
     },
@@ -4453,7 +4453,7 @@ describe("cli: ask success", () => {
         expect(first.code).toBe(0);
         expect(first.stderr).toBe("");
         const firstJson = JSON.parse(first.stdout.trim());
-        expect(firstJson.usage).toEqual({ input_tokens: 3, output_tokens: 5 });
+        expect(firstJson.usage).toEqual({ input_tokens: 3, output_tokens: 5, cache_read_tokens: null, cache_write_tokens: null, reasoning_tokens: null });
         expect(typeof firstJson.session_id).toBe("string");
         expect(firstJson.session_id.length).toBeGreaterThan(0);
         expect(gateway.requests[0]?.headers.get("x-session-id")).toBe(
@@ -4499,7 +4499,7 @@ describe("cli: ask success", () => {
         expect(resumed.stderr).toBe("");
         const resumedJson = JSON.parse(resumed.stdout.trim());
         expect(resumedJson.session_id).toBe(firstJson.session_id);
-        expect(resumedJson.usage).toEqual({ input_tokens: 3, output_tokens: 5 });
+        expect(resumedJson.usage).toEqual({ input_tokens: 3, output_tokens: 5, cache_read_tokens: null, cache_write_tokens: null, reasoning_tokens: null });
         expect(gateway.requests[1]?.headers.get("x-session-id")).toBe(
           firstJson.session_id,
         );
@@ -4538,7 +4538,7 @@ describe("cli: ask success", () => {
         expect(noSave.stderr).toBe("");
         const noSaveJson = JSON.parse(noSave.stdout.trim());
         expect(noSaveJson.session_id).toBe("");
-        expect(noSaveJson.usage).toEqual({ input_tokens: 3, output_tokens: 5 });
+        expect(noSaveJson.usage).toEqual({ input_tokens: 3, output_tokens: 5, cache_read_tokens: null, cache_write_tokens: null, reasoning_tokens: null });
         expect(gateway.requests[2]?.headers.get("x-session-id")).toBeNull();
         expect(gateway.requests[2]?.headers.get("x-session-affinity")).toBeNull();
         expect(existsSync(join(noSaveHome, ".fx"))).toBe(false);

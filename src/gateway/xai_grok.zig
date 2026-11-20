@@ -56,57 +56,22 @@ pub fn buildRequest(
     defer if (projected) |messages| alloc.free(messages);
     if (projected != null) debug_trace.logf("gateway", "provider_replay_omitted provider=grok reason=source_mismatch", .{});
 
-    var instructions: std.Io.Writer.Allocating = .init(alloc);
-    defer instructions.deinit();
-    for (request.instructions) |instruction| {
-        const text = instruction.content.?;
-        if (text.len == 0) continue;
-        if (instructions.written().len > 0) try instructions.writer.writeAll("\n\n");
-        try instructions.writer.writeAll(text);
-    }
-    if (instructions.written().len == 0) try instructions.writer.writeAll("You are a helpful assistant.");
-
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    const writer = &out.writer;
-    try writer.writeAll("{\"model\":");
-    try std.json.Stringify.value(request.model, .{}, writer);
-    try writer.writeAll(",\"store\":false,\"stream\":true,\"instructions\":");
-    try std.json.Stringify.value(instructions.written(), .{}, writer);
-    try writer.writeAll(",\"input\":[");
-    try writeResponsesInput(writer, std.heap.c_allocator, projected orelse request.messages, request.verified_images, budget);
-    try writer.writeByte(']');
-
-    const tool_count = try responses_protocol.writeTools(writer, alloc, request.tools);
-    if (tool_count > 0) {
-        try writer.writeAll(",\"tool_choice\":");
-        try std.json.Stringify.value(request.tool_choice.label(), .{}, writer);
-        try writer.writeAll(",\"parallel_tool_calls\":true");
-    }
-    try writer.writeAll(",\"include\":[\"reasoning.encrypted_content\"]");
-    try writer.writeAll(",\"text\":{\"verbosity\":\"low\"");
-    if (request.response_format) |format| {
-        if (format.schema != .object) return error.InvalidStructuredResponseSchema;
-        try writer.writeAll(",\"format\":{\"type\":\"json_schema\",\"name\":");
-        try std.json.Stringify.value(format.name, .{}, writer);
-        try writer.writeAll(",\"description\":");
-        try std.json.Stringify.value(format.description, .{}, writer);
-        try writer.writeAll(",\"schema\":");
-        try std.json.Stringify.value(format.schema, .{}, writer);
-        try writer.writeAll(",\"strict\":true}");
-    }
-    try writer.writeByte('}');
-
-    if (request.provider_options.reasoning) |effort| {
-        try writer.writeAll(",\"reasoning\":{\"effort\":");
-        try std.json.Stringify.value(effort.label(), .{}, writer);
-        try writer.writeAll(",\"summary\":\"auto\"}");
-    }
-    // xAI exposes Fast mode as its priority service tier; the subscription
-    // proxy accepts the parameter endpoint-wide, independent of the model.
-    if (request.provider_options.fast) try writer.writeAll(",\"service_tier\":\"priority\"");
-    if (request.max_output_tokens) |limit| try writer.print(",\"max_output_tokens\":{d}", .{limit});
-    try writer.writeByte('}');
+    responses_protocol.writeRequest(&out.writer, alloc, std.heap.c_allocator, request, projected orelse request.messages, budget, .{
+        .replay_limits = replay_limits,
+        .text_verbosity = "low",
+        .reasoning_summary = "auto",
+        // xAI exposes Fast mode as its priority service tier; the subscription
+        // proxy accepts the parameter endpoint-wide, independent of the model.
+        .priority_fast_mode = true,
+    }) catch |err| return switch (err) {
+        error.ProviderStateTooLarge => error.XaiGrokProviderStateTooLarge,
+        error.InvalidProviderState => error.InvalidXaiGrokProviderState,
+        error.ToolCallLimitExceeded => error.XaiGrokToolCallLimitExceeded,
+        error.ToolArgumentsTooLarge => error.XaiGrokToolArgumentsTooLarge,
+        else => err,
+    };
     return out.toOwnedSlice();
 }
 
@@ -118,26 +83,12 @@ fn buildRequestForProvider(
     return buildRequest(alloc, request);
 }
 
-fn writeResponsesInput(
-    writer: *std.Io.Writer,
-    alloc: Allocator,
-    messages: []const types.ChatMessage,
-    images: ?[]const image_attachments.VerifiedSnapshot,
-    budget: image_attachments.CaptureBudget,
-) !void {
-    return responses_protocol.writeInput(writer, alloc, messages, images, .{
-        .tool_calls = max_tool_calls,
-        .tool_identity_bytes = max_tool_identity_bytes,
-        .tool_arguments_bytes = max_tool_arguments_bytes,
-        .provider_state_bytes = max_provider_state_bytes,
-    }, budget) catch |err| switch (err) {
-        error.ProviderStateTooLarge => error.XaiGrokProviderStateTooLarge,
-        error.InvalidProviderState => error.InvalidXaiGrokProviderState,
-        error.ToolCallLimitExceeded => error.XaiGrokToolCallLimitExceeded,
-        error.ToolArgumentsTooLarge => error.XaiGrokToolArgumentsTooLarge,
-        else => err,
-    };
-}
+const replay_limits: responses_protocol.ReplayLimits = .{
+    .tool_calls = max_tool_calls,
+    .tool_identity_bytes = max_tool_identity_bytes,
+    .tool_arguments_bytes = max_tool_arguments_bytes,
+    .provider_state_bytes = max_provider_state_bytes,
+};
 
 fn streamCompletion(
     _: ?*anyopaque,
@@ -354,14 +305,15 @@ pub fn completeFromStream(
     reader: *std.Io.Reader,
 ) !stream_provider.Result {
     var events = request.events;
+    const callbacks = responses_protocol.eventSinkCallbacks(&events);
     const completion = try consumeSse(
         alloc,
         reader,
-        &events,
-        EventBridge.content,
-        EventBridge.toolStart,
-        EventBridge.reasoning,
-        EventBridge.toolInput,
+        callbacks.context,
+        callbacks.on_content,
+        callbacks.on_tool_start,
+        callbacks.on_reasoning,
+        callbacks.on_tool_input,
         request.cancel_flag,
         request.content_capture_limit,
     );
@@ -377,28 +329,6 @@ pub fn completeFromStream(
         .ownership = .owned,
     } };
 }
-
-const EventBridge = struct {
-    fn sink(raw: *anyopaque) *stream_provider.EventSink {
-        return @ptrCast(@alignCast(raw));
-    }
-
-    fn content(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .content_delta = chunk });
-    }
-
-    fn reasoning(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .reasoning_delta = chunk });
-    }
-
-    fn toolInput(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .tool_input_delta = chunk });
-    }
-
-    fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8, arguments_json: ?[]const u8) void {
-        sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label, .arguments_json = arguments_json } });
-    }
-};
 
 pub fn failureKind(status: std.http.Status) stream_provider.FailureKind {
     return switch (status) {
@@ -426,18 +356,13 @@ fn consumeSse(
     cancel_flag: *std.atomic.Value(bool),
     content_capture_limit: ?usize,
 ) !types.ModelCompletion {
-    var reducer = responses_protocol.Reducer.init(alloc);
-    defer reducer.deinit(alloc);
-    var sse: sse_stream.Reader = .{ .max_event_bytes = max_sse_line_bytes, .max_total_bytes = max_sse_aggregate_bytes };
-    defer sse.deinit(alloc);
-    const callbacks = responses_protocol.StreamCallbacks{
+    return responses_protocol.consumeSse(alloc, reader, .{
         .context = callback_ctx,
         .on_content = on_content_chunk,
         .on_tool_start = on_tool_start,
         .on_reasoning = on_reasoning_chunk,
         .on_tool_input = on_tool_input_chunk,
-    };
-    const stream_limits = responses_protocol.StreamLimits{
+    }, cancel_flag, content_capture_limit, max_sse_line_bytes, .{
         .aggregate_bytes = max_sse_aggregate_bytes,
         .count_json_bytes = false,
         .events = max_sse_events,
@@ -445,20 +370,7 @@ fn consumeSse(
         .tool_identity_bytes = max_tool_identity_bytes,
         .tool_arguments_bytes = max_tool_arguments_bytes,
         .provider_state_bytes = max_provider_state_bytes,
-    };
-    while (sse.next(alloc, reader, cancel_flag) catch |err| return mapReducerError(err)) |json_text| {
-        if (std.mem.eql(u8, json_text, "[DONE]")) break;
-        if (reducer.applyJson(
-            alloc,
-            json_text,
-            callbacks,
-            cancel_flag,
-            content_capture_limit,
-            stream_limits,
-        ) catch |err| return mapReducerError(err)) break;
-    }
-    return reducer.finish(alloc, cancel_flag, stream_limits) catch |err|
-        return mapReducerError(err);
+    }, .stable) catch |err| return mapReducerError(err);
 }
 
 fn mapReducerError(err: anyerror) anyerror {
