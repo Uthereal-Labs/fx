@@ -1,5 +1,7 @@
 const std = @import("std");
 const codec = @import("chat_completions_protocol.zig");
+const responses = @import("responses_protocol.zig");
+const image_attachments = @import("../core/images/image_attachments.zig");
 const client_mod = @import("client.zig");
 const definitions = @import("../core/config/configured_provider.zig");
 const streams = @import("../core/agent/stream_provider.zig");
@@ -22,7 +24,7 @@ const Allocator = std.mem.Allocator;
 pub fn bundle(definition: *const definitions.Definition) provider_set.Bundle {
     const context: *anyopaque = @ptrCast(@constCast(definition));
     return .{
-        .agent_stream = .{ .context = context, .stream_fn = stream, .build_request_fn = build, .project_replay_fn = project_replay },
+        .agent_stream = .{ .context = context, .stream_fn = stream, .build_request_fn = build, .project_replay_fn = replay_projection(definition) },
         .model_catalog = model_catalog_provider(definition),
         .cli_model_catalog = .{ .context = context, .fetch_fn = fetch_cli_catalog },
         .permission_reviewer = .{ .context = context, .review_fn = review },
@@ -60,10 +62,44 @@ pub fn build_for(definition: *const definitions.Definition, alloc: Allocator, re
             break;
         }
     };
-    return codec.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .provider = &identity });
+    return switch (definition.protocol) {
+        .@"openai-chat-completions" => codec.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .provider = &identity }),
+        .@"openai-responses" => build_responses(alloc, request, &identity),
+    };
 }
 
-pub fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
+const responses_replay_limits: responses.ReplayLimits = .{
+    .tool_calls = 128,
+    .tool_identity_bytes = 1024,
+    .tool_arguments_bytes = 4 * 1024 * 1024,
+    .provider_state_bytes = types.ProviderReplay.max_bytes,
+};
+
+/// A stateless Responses request: no stored conversation, reasoning carried
+/// as encrypted replay. Caller owns the result.
+fn build_responses(alloc: Allocator, request: streams.RequestData, identity: *const model_provider.ProviderId) ![]u8 {
+    try request.validatePrompt();
+    definitions.validate_model_id(request.model) catch return error.InvalidModel;
+    const budget: image_attachments.CaptureBudget = if (request.budget) |value| .{ .deadline = value.deadline, .cancel_flag = value.cancel_flag } else .{};
+    try budget.check();
+    const projected = try types.projectProviderReplay(alloc, request.messages, .{ .provider = identity.*, .model = request.model });
+    defer if (projected) |messages| alloc.free(messages);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try responses.writeRequest(&out.writer, alloc, std.heap.c_allocator, request, projected orelse request.messages, budget, .{ .replay_limits = responses_replay_limits });
+    return out.toOwnedSlice();
+}
+
+/// The replay projection for the definition's protocol, which owns the
+/// shape of the provider state it records.
+pub fn replay_projection(definition: *const definitions.Definition) *const fn (Allocator, ?types.ProviderReplay, []const types.ToolCall, bool, bool) anyerror!?types.ProviderReplay {
+    return switch (definition.protocol) {
+        .@"openai-chat-completions" => project_replay,
+        .@"openai-responses" => responses.selectReplayParts,
+    };
+}
+
+fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
     const selected = try codec.project_replay(alloc, replay, calls, text, reasoning);
     if (replay != null and selected == null) debug_trace.logf("gateway", "provider_replay_omitted reason={s}", .{if (reasoning) "associated_calls_removed" else "reasoning_removed"});
     return selected;
@@ -105,6 +141,90 @@ test "chat completions adapter binds replay to endpoint authority and wires proj
     try std.testing.expect(request.messages[0].provider_replay.?.parts_json.ptr == replay.parts_json.ptr);
 }
 
+test "configured responses provider builds a stateless Responses request" {
+    const alloc = std.testing.allocator;
+    var registry = try definitions.Registry.parse_json(alloc,
+        \\{"azure":{"protocol":"openai-responses","base_url":"https://example.openai.azure.com/openai/v1","auth":{"type":"bearer","env":"AZURE_OPENAI_API_KEY"}}}
+    );
+    defer registry.deinit(alloc);
+    const definition = registry.get("azure").?;
+    const adapter = bundle(definition).agent_stream.?;
+    const read_file = @import("../core/tooling/model_tool_schema.zig").FunctionSchema{ .name = "read_file", .description = "Read", .input_schema = .{} };
+    const replay: types.ProviderReplay = .{
+        .source = .{ .provider = bundle(definition).model_catalog.?.provider_id, .model = "luna" },
+        .parts_json = "[{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}]",
+    };
+    const body = try adapter.build_request_fn.?(adapter.context, alloc, .{
+        .model = "luna",
+        .instructions = &.{.{ .role = .system, .content = "Be brief." }},
+        .messages = &.{
+            .{ .role = .user, .content = "Read it." },
+            .{ .role = .assistant, .tool_calls = &.{.{ .id = "call_1", .name = "read_file", .arguments_json = "{\"path\":\"a.txt\"}" }}, .provider_replay = replay },
+            .{ .role = .tool, .tool_call_id = "call_1", .tool_name = "read_file", .content = "contents" },
+        },
+        .tools = .{ .additional_functions = &.{read_file} },
+        .tool_choice = .auto,
+        .provider_options = .{ .reasoning = types.ReasoningEffort.literal("medium"), .fast = true },
+        .max_output_tokens = 4096,
+    });
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("luna", root.get("model").?.string);
+    try std.testing.expect(!root.get("store").?.bool and root.get("stream").?.bool);
+    try std.testing.expectEqualStrings("Be brief.", root.get("instructions").?.string);
+    try std.testing.expectEqualStrings("auto", root.get("tool_choice").?.string);
+    try std.testing.expect(root.get("parallel_tool_calls").?.bool);
+    try std.testing.expectEqualStrings("read_file", root.get("tools").?.array.items[0].object.get("name").?.string);
+    try std.testing.expectEqualStrings("reasoning.encrypted_content", root.get("include").?.array.items[0].string);
+    const reasoning = root.get("reasoning").?.object;
+    try std.testing.expectEqualStrings("medium", reasoning.get("effort").?.string);
+    try std.testing.expectEqual(@as(usize, 1), reasoning.count());
+    try std.testing.expectEqual(@as(i64, 4096), root.get("max_output_tokens").?.integer);
+    try std.testing.expect(root.get("text") == null and root.get("service_tier") == null and root.get("messages") == null);
+    try std.testing.expect(std.mem.find(u8, body, "\"encrypted_content\":\"opaque\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"type\":\"function_call_output\"") != null);
+    try std.testing.expect(adapter.project_replay_fn.? == &responses.selectReplayParts);
+}
+
+test "configured responses provider reads usage with cached tokens from the event stream" {
+    const alloc = std.testing.allocator;
+    var registry = try definitions.Registry.parse_json(alloc,
+        \\{"azure":{"protocol":"openai-responses","base_url":"https://example.openai.azure.com/openai/v1","auth":{"type":"none"}}}
+    );
+    defer registry.deinit(alloc);
+    const sse =
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"hi\"}\n\n" ++
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}],\"usage\":{\"input_tokens\":1200,\"output_tokens\":40,\"input_tokens_details\":{\"cached_tokens\":1024},\"output_tokens_details\":{\"reasoning_tokens\":16}}}}\n\n";
+    var reader: std.Io.Reader = .fixed(sse);
+    var cancel = std.atomic.Value(bool).init(false);
+    var delivery: streams.DeliveryCertainty = .init();
+    var evidence: streams.AttemptEvidence = .{};
+    var event_context: u8 = 0;
+    var result = try consume(alloc, registry.get("azure").?, &reader, .{
+        .credential = .{ .direct = .{ .secret_bytes = "", .source = .configured } },
+        .model = "luna",
+        .retry_count = 0,
+        .messages = &.{.{ .role = .user, .content = "hi" }},
+        .tool_choice = .auto,
+        .provider_options = .{},
+        .trace_ctx = .{},
+        .content_capture_limit = null,
+        .delivery = &delivery,
+        .attempt_evidence = &evidence,
+        .events = .{ .context = &event_context, .emit_fn = ignore_event },
+        .cancel_flag = &cancel,
+    });
+    defer result.deinit(alloc);
+    const usage = result.completed.completion.usage;
+    try std.testing.expectEqualStrings("hi", result.completed.completion.content.?);
+    try std.testing.expectEqual(@as(?u64, 1200), usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 40), usage.output_tokens);
+    try std.testing.expectEqual(@as(?u64, 1024), usage.cache_read_tokens);
+    try std.testing.expectEqual(@as(?u64, 16), usage.reasoning_tokens);
+}
+
 fn stream(raw: ?*anyopaque, alloc: Allocator, request: streams.ModelRequest) !streams.Result {
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
     const definition = definition_at(raw);
@@ -139,7 +259,7 @@ fn phase_deadline(milliseconds: i64, caller: ?std.Io.Clock.Timestamp) std.Io.Clo
 }
 
 fn post(alloc: Allocator, definition: *const definitions.Definition, request: streams.ModelRequest, token: ?[]const u8, payload: []const u8) !streams.Result {
-    const url = try definition.chat_url(alloc);
+    const url = try definition.endpoint_url(alloc);
     defer alloc.free(url);
     const authorization = if (token) |value| try alloc.print("Bearer {s}", .{value}) else null;
     defer if (authorization) |value| secret.zeroAndFree(alloc, value);
@@ -214,7 +334,7 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
     watch.stop();
     if (response.head.status == .ok) {
         var transfer: [64 * 1024]u8 = undefined;
-        return consume_watched(alloc, http, response.reader(&transfer), request);
+        return consume_watched(alloc, definition, http, response.reader(&transfer), request);
     }
     if (http.connection) |connection| try watch.start(request.cancel_flag, phase_deadline(30_000, request.deadline), connection.stream_writer.stream);
     var retry_after: ?u64 = null;
@@ -274,12 +394,12 @@ test "a TLS setup that the server ends is retried inside connection setup, withi
 /// Parses a successful body while a stall watch ends a body that stays silent
 /// longer than the agent stream window; the stall is then a stream timeout,
 /// and recovery sends the request again.
-fn consume_watched(alloc: Allocator, http: *std.http.Client.Request, body: *std.Io.Reader, request: streams.ModelRequest) !streams.Result {
+fn consume_watched(alloc: Allocator, definition: *const definitions.Definition, http: *std.http.Client.Request, body: *std.Io.Reader, request: streams.ModelRequest) !streams.Result {
     var stall: client_mod.StreamStallWatch = .{};
     if (http.connection) |connection| try stall.start(request.cancel_flag, request.deadline, client_mod.agent_stream_stall_timeout_ms, connection.stream_writer.stream);
     var buffer: [64 * 1024]u8 = undefined;
     var progress = ProgressReader.init(body, &stall, &buffer);
-    var result = consume(alloc, &progress.interface, request) catch |err| {
+    var result = consume(alloc, definition, &progress.interface, request) catch |err| {
         if (stall.stop()) |stall_err| return stall_err;
         return err;
     };
@@ -335,14 +455,33 @@ pub fn failure_kind(status: std.http.Status) streams.FailureKind {
     };
 }
 
-/// Parses a successful streamed reply from `reader`.
-pub fn consume(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest) !streams.Result {
-    var limits: codec.Limits = .{};
-    if (request.content_capture_limit) |limit| limits.content_bytes = @min(limit, limits.content_bytes);
-    return codec.consume_stream(alloc, reader, request.data(), limits, request.events, request.cancel_flag);
+/// Parses a successful streamed reply from `reader` in the definition's protocol.
+pub fn consume(alloc: Allocator, definition: *const definitions.Definition, reader: *std.Io.Reader, request: streams.ModelRequest) !streams.Result {
+    switch (definition.protocol) {
+        .@"openai-chat-completions" => {
+            var limits: codec.Limits = .{};
+            if (request.content_capture_limit) |limit| limits.content_bytes = @min(limit, limits.content_bytes);
+            return codec.consume_stream(alloc, reader, request.data(), limits, request.events, request.cancel_flag);
+        },
+        .@"openai-responses" => {
+            var events = request.events;
+            const limits = codec.Limits{};
+            const completion = try responses.consumeSse(alloc, reader, responses.eventSinkCallbacks(&events), request.cancel_flag, request.content_capture_limit, limits.event_bytes, .{
+                .aggregate_bytes = limits.total_wire_bytes,
+                .count_json_bytes = false,
+                .events = limits.events,
+                .tool_calls = responses_replay_limits.tool_calls,
+                .tool_identity_bytes = responses_replay_limits.tool_identity_bytes,
+                .tool_arguments_bytes = responses_replay_limits.tool_arguments_bytes,
+                .provider_state_bytes = responses_replay_limits.provider_state_bytes,
+            }, .rotating);
+            return .{ .completed = .{ .completion = completion, .ownership = .owned } };
+        },
+    }
 }
 
-/// The returned entry borrows its strings; fetch_catalog replaces them with owned copies.
+/// The returned entry borrows its strings and efforts; fetch_catalog replaces
+/// them with owned copies.
 fn metadata_entry(metadata: definitions.ModelMetadata) catalog.ModelCatalogEntry {
     const vision = metadata.supports_vision orelse false;
     return .{
@@ -355,6 +494,8 @@ fn metadata_entry(metadata: definitions.ModelMetadata) catalog.ModelCatalogEntry
         .has_file_input = vision,
         .context_window = metadata.context_window orelse 0,
         .max_tokens = metadata.max_output_tokens orelse 0,
+        .has_reasoning = metadata.reasoning_efforts.len != 0,
+        .reasoning_efforts = .fromOwnedSlice(@constCast(metadata.reasoning_efforts)),
     };
 }
 
@@ -374,6 +515,9 @@ fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) 
         errdefer alloc.free(entry.id);
         entry.model_type = try alloc.dupe(u8, entry.model_type);
         errdefer alloc.free(entry.model_type);
+        entry.reasoning_efforts = .empty;
+        try entry.reasoning_efforts.appendSlice(alloc, metadata.reasoning_efforts);
+        errdefer entry.reasoning_efforts.deinit(alloc);
         try entries.append(alloc, entry);
     }
     return .{ .catalog = entries };
@@ -485,7 +629,8 @@ fn contextProvenanceHeader(alloc: Allocator, request: streams.ModelRequest, payl
     defer scratch.deinit();
     const arena = scratch.allocator();
     const parsed = try std.json.parseFromSlice(std.json.Value, arena, payload, .{});
-    const wire_messages = parsed.value.object.get("messages").?.array.items;
+    // Chat completions carries the history in "messages", Responses in "input".
+    const wire_messages = (parsed.value.object.get("messages") orelse parsed.value.object.get("input").?).array.items;
     var out = std.Io.Writer.Allocating.init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"version\":1,\"messages\":[");

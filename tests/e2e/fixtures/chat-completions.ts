@@ -19,7 +19,11 @@ export function toolCompletion(model: string, name: string, args: unknown, callI
   return new Response(chunks.map(value => `data: ${JSON.stringify(value)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
 }
 
-export function createConfiguredProviderFixture(respond?: (body: any) => Response | Promise<Response>) {
+export function responsesCompletion(events: Array<Record<string, unknown>>) {
+  return new Response(events.map(value => `data: ${JSON.stringify(value)}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
+}
+
+export function createConfiguredProviderFixture(respond?: (body: any, path: string) => Response | Promise<Response>) {
   const home = realpathSync(createIsolatedTestHome());
   const workspace = join(home, "workspace");
   mkdirSync(workspace);
@@ -31,8 +35,8 @@ export function createConfiguredProviderFixture(respond?: (body: any) => Respons
       const path = new URL(request.url).pathname;
       const body = request.method === "POST" ? await request.json() : null;
       requests.push({ path, authorization: request.headers.get("authorization"), body });
-      if (path !== "/v1/chat/completions") return new Response("unexpected endpoint", { status: 500 });
-      return respond ? respond(body) : completion((body as any).model);
+      if (path !== "/v1/chat/completions" && path !== "/v1/responses") return new Response("unexpected endpoint", { status: 500 });
+      return respond ? respond(body, path) : completion((body as any).model);
     },
   });
   const settingsPath = join(home, ".fx", "settings.json");
@@ -40,9 +44,10 @@ export function createConfiguredProviderFixture(respond?: (body: any) => Respons
     provider: "local", auto_upgrade: false, permission_mode: "ask",
     providers: {
       local: { protocol: "openai-chat-completions", base_url: `http://127.0.0.1:${server.port}/v1`, auth: { type: "none" }, model_metadata: { "local-model": { context_window: 262144, max_output_tokens: 8192, supports_tool_use: true } } },
-      remote: { protocol: "openai-chat-completions", base_url: `http://127.0.0.1:${server.port}/v1`, auth: { type: "bearer", env: "FX_TEST_PROVIDER_TOKEN" }, model_metadata: { "remote-model": { context_window: 262144, max_output_tokens: 8192, supports_tool_use: true } } },
+      remote: { protocol: "openai-chat-completions", base_url: `http://127.0.0.1:${server.port}/v1`, auth: { type: "bearer", env: "FX_TEST_PROVIDER_TOKEN" }, model_metadata: { "remote-model": { context_window: 262144, max_output_tokens: 8192, supports_tool_use: true, reasoning_efforts: ["none", "low", "medium", "high"] } } },
+      responses: { protocol: "openai-responses", base_url: `http://127.0.0.1:${server.port}/v1`, auth: { type: "bearer", env: "FX_TEST_PROVIDER_TOKEN" }, model_metadata: { "responses-model": { context_window: 262144, max_output_tokens: 8192, supports_tool_use: true, reasoning_efforts: ["none", "low", "medium", "high"] } } },
     },
-    models: { local: "local-model", remote: "remote-model" },
+    models: { local: "local-model", remote: "remote-model", responses: "responses-model" },
   };
   const save = () => writeFileSync(settingsPath, JSON.stringify(settings), { mode: 0o600 });
   save();

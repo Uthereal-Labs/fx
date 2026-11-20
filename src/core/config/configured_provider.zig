@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const types = @import("../shared/types.zig");
 const Allocator = std.mem.Allocator;
 
 const max_providers = 32;
@@ -30,7 +31,19 @@ pub const ParseError = Allocator.Error || error{
     InvalidModelMetadata,
 };
 
-pub const Protocol = enum { @"openai-chat-completions" };
+/// The wire protocol a configured provider speaks. Each protocol posts to its
+/// own path under `base_url`.
+pub const Protocol = enum {
+    @"openai-chat-completions",
+    @"openai-responses",
+
+    fn path(self: Protocol) []const u8 {
+        return switch (self) {
+            .@"openai-chat-completions" => "/chat/completions",
+            .@"openai-responses" => "/responses",
+        };
+    }
+};
 pub const ToolChoiceMode = enum { omit, send };
 
 /// Describes a credential slot, never a credential value. Resolution belongs at
@@ -46,6 +59,9 @@ pub const ModelMetadata = struct {
     max_output_tokens: ?u32 = null,
     supports_tool_use: ?bool = null,
     supports_vision: ?bool = null,
+    /// Efforts the model accepts, in declaration order. Empty means none are
+    /// declared, so fx sends no effort and the provider default applies.
+    reasoning_efforts: []const types.ReasoningEffort = &.{},
 };
 
 /// Registry owns all slices. Treat definitions as immutable while borrowed by
@@ -59,9 +75,10 @@ pub const Definition = struct {
     reviewer_model: ?[]const u8 = null,
     model_metadata: []const ModelMetadata = &.{},
 
-    /// Caller owns the returned URL. base_url is already a validated API prefix.
-    pub fn chat_url(self: Definition, alloc: Allocator) Allocator.Error![]u8 {
-        return std.mem.concat(alloc, u8, &.{ self.base_url, "/chat/completions" });
+    /// The protocol's endpoint under base_url, which is already a validated
+    /// API prefix. Caller owns the returned URL.
+    pub fn endpoint_url(self: Definition, alloc: Allocator) Allocator.Error![]u8 {
+        return std.mem.concat(alloc, u8, &.{ self.base_url, self.protocol.path() });
     }
 
     /// Borrowed metadata; absence and unspecified fields remain unknown.
@@ -98,7 +115,7 @@ pub const Definition = struct {
             .bearer => |env| alloc.free(env),
         }
         if (self.reviewer_model) |id| alloc.free(id);
-        for (self.model_metadata) |metadata| alloc.free(metadata.id);
+        for (self.model_metadata) |metadata| free_metadata(alloc, metadata);
         alloc.free(self.model_metadata);
     }
 };
@@ -167,7 +184,8 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
     try validate_id(id);
     try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata" });
     const protocol = try required(value, "protocol");
-    if (protocol != .string or !std.mem.eql(u8, protocol.string, "openai-chat-completions")) return error.InvalidProtocol;
+    if (protocol != .string) return error.InvalidProtocol;
+    const parsed_protocol = std.meta.stringToEnum(Protocol, protocol.string) orelse return error.InvalidProtocol;
     const url = try required(value, "base_url");
     if (url != .string) return error.InvalidBaseUrl;
     const normalized = try validate_url(url.string);
@@ -200,7 +218,7 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
     errdefer if (owned_reviewer) |model_id| alloc.free(model_id);
     return .{
         .id = owned_id,
-        .protocol = .@"openai-chat-completions",
+        .protocol = parsed_protocol,
         .base_url = owned_url,
         .auth = owned_auth,
         .tool_choice_mode = mode,
@@ -234,29 +252,53 @@ fn parse_metadata(alloc: Allocator, value: std.json.Value) ParseError![]const Mo
     const models = try alloc.alloc(ModelMetadata, value.object.count());
     var initialized: usize = 0;
     errdefer {
-        for (models[0..initialized]) |metadata| alloc.free(metadata.id);
+        for (models[0..initialized]) |metadata| free_metadata(alloc, metadata);
         alloc.free(models);
     }
     var iterator = value.object.iterator();
     while (iterator.next()) |entry| {
         try validate_model_id(entry.key_ptr.*);
         const metadata = entry.value_ptr.*;
-        try check_fields(metadata, &.{ "context_window", "max_output_tokens", "supports_tool_use", "supports_vision" });
+        try check_fields(metadata, &.{ "context_window", "max_output_tokens", "supports_tool_use", "supports_vision", "reasoning_efforts" });
         const context = try positive_limit(metadata.object.get("context_window"));
         const output = try positive_limit(metadata.object.get("max_output_tokens"));
         if (context != null and output != null and output.? >= context.?) return error.InvalidModelMetadata;
         const tools = try optional_bool(metadata.object.get("supports_tool_use"));
         const vision = try optional_bool(metadata.object.get("supports_vision"));
+        const efforts = try parse_efforts(alloc, metadata.object.get("reasoning_efforts"));
+        errdefer alloc.free(efforts);
         models[initialized] = .{
             .id = try alloc.dupe(u8, entry.key_ptr.*),
             .context_window = context,
             .max_output_tokens = output,
             .supports_tool_use = tools,
             .supports_vision = vision,
+            .reasoning_efforts = efforts,
         };
         initialized += 1;
     }
     return models;
+}
+
+fn free_metadata(alloc: Allocator, metadata: ModelMetadata) void {
+    alloc.free(metadata.id);
+    alloc.free(metadata.reasoning_efforts);
+}
+
+/// Distinct named efforts such as "none" or "medium". "auto" is the absence of
+/// an effort, not a value a model declares. Caller owns the returned slice.
+fn parse_efforts(alloc: Allocator, value: ?std.json.Value) ParseError![]const types.ReasoningEffort {
+    const present = value orelse return &.{};
+    if (present != .array or present.array.items.len > types.ReasoningEffort.max_options) return error.InvalidModelMetadata;
+    const efforts = try alloc.alloc(types.ReasoningEffort, present.array.items.len);
+    errdefer alloc.free(efforts);
+    for (present.array.items, efforts, 0..) |item, *effort, index| {
+        if (item != .string) return error.InvalidModelMetadata;
+        effort.* = types.ReasoningEffort.parse(item.string) orelse return error.InvalidModelMetadata;
+        if (effort.isDefault()) return error.InvalidModelMetadata;
+        for (efforts[0..index]) |earlier| if (earlier.eql(effort.*)) return error.InvalidModelMetadata;
+    }
+    return efforts;
 }
 
 fn positive_limit(value: ?std.json.Value) ParseError!?u32 {
@@ -371,7 +413,8 @@ fn hash_part(hash: *std.crypto.hash.sha2.Sha256, part: []const u8) void {
 
 const test_json =
     \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:11434/v1/","auth":{"type":"none"}},
-    \\"router":{"protocol":"openai-chat-completions","base_url":"https://openrouter.ai/api/v1","auth":{"type":"bearer","env":"OPENROUTER_API_KEY"},"tool_choice_mode":"send","reviewer_model":"openai/review","model_metadata":{"openai/gpt-4.1":{"context_window":8192,"max_output_tokens":1024,"supports_tool_use":true,"supports_vision":false},"unknown":{}}}}
+    \\"router":{"protocol":"openai-chat-completions","base_url":"https://openrouter.ai/api/v1","auth":{"type":"bearer","env":"OPENROUTER_API_KEY"},"tool_choice_mode":"send","reviewer_model":"openai/review","model_metadata":{"openai/gpt-4.1":{"context_window":8192,"max_output_tokens":1024,"supports_tool_use":true,"supports_vision":false},"unknown":{}}},
+    \\"azure":{"protocol":"openai-responses","base_url":"https://example.openai.azure.com/openai/v1/","auth":{"type":"bearer","env":"AZURE_OPENAI_API_KEY"},"model_metadata":{"reasoner":{"reasoning_efforts":["none","medium","high"]}}}}
 ;
 
 test "configured provider owns definitions and preserves unknown metadata" {
@@ -380,12 +423,12 @@ test "configured provider owns definitions and preserves unknown metadata" {
     var registry = try Registry.parse_json(alloc, input);
     alloc.free(input);
     defer registry.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 2), registry.definitions.len);
+    try std.testing.expectEqual(@as(usize, 3), registry.definitions.len);
     const local = registry.get("local").?;
     try std.testing.expectEqual(Auth.none, local.auth);
     try std.testing.expectEqual(ToolChoiceMode.omit, local.tool_choice_mode);
     try std.testing.expect(local.reviewer_model == null);
-    const chat = try local.chat_url(alloc);
+    const chat = try local.endpoint_url(alloc);
     defer alloc.free(chat);
     try std.testing.expectEqualStrings("http://localhost:11434/v1/chat/completions", chat);
     const router = registry.get("router").?;
@@ -402,6 +445,25 @@ test "configured provider owns definitions and preserves unknown metadata" {
     try std.testing.expect(unknown.supports_tool_use == null and unknown.supports_vision == null);
     try std.testing.expect(router.model("missing") == null);
     try std.testing.expect(registry.get("Router") == null);
+    try std.testing.expectEqual(@as(usize, 0), router.model("openai/gpt-4.1").?.reasoning_efforts.len);
+}
+
+test "configured provider responses protocol posts to the responses path with declared efforts" {
+    const alloc = std.testing.allocator;
+    var registry = try Registry.parse_json(alloc, test_json);
+    defer registry.deinit(alloc);
+    const azure = registry.get("azure").?;
+    try std.testing.expectEqual(Protocol.@"openai-responses", azure.protocol);
+    const url = try azure.endpoint_url(alloc);
+    defer alloc.free(url);
+    try std.testing.expectEqualStrings("https://example.openai.azure.com/openai/v1/responses", url);
+    const efforts = azure.model("reasoner").?.reasoning_efforts;
+    try std.testing.expectEqual(@as(usize, 3), efforts.len);
+    try std.testing.expectEqualStrings("none", efforts[0].label());
+    try std.testing.expectEqualStrings("high", efforts[2].label());
+    var chat = azure.*;
+    chat.protocol = .@"openai-chat-completions";
+    try std.testing.expect(!std.mem.eql(u8, &azure.binding_identity(), &chat.binding_identity()));
 }
 
 test "configured provider URL policy and prefix normalization" {
@@ -466,7 +528,7 @@ fn test_allocations(alloc: Allocator) !void {
     var registry = try Registry.parse_json(alloc, test_json);
     defer registry.deinit(alloc);
     const definition = registry.get("router").?;
-    const chat = try definition.chat_url(alloc);
+    const chat = try definition.endpoint_url(alloc);
     defer alloc.free(chat);
     _ = definition.binding_identity();
 }
@@ -515,6 +577,11 @@ test "configured provider invalid schemas fail explicitly" {
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"supports_tool_use\":1}}}}", .err = error.InvalidModelMetadata },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"supports_vision\":null}}}}", .err = error.InvalidModelMetadata },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"supports_search\":true}}}}", .err = error.UnknownField },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":\"high\"}}}}", .err = error.InvalidModelMetadata },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":[1]}}}}", .err = error.InvalidModelMetadata },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":[\"auto\"]}}}}", .err = error.InvalidModelMetadata },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":[\"bad effort\"]}}}}", .err = error.InvalidModelMetadata },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":[\"low\",\"low\"]}}}}", .err = error.InvalidModelMetadata },
     };
     for (cases) |case| try std.testing.expectError(case.err, Registry.parse_json(std.testing.allocator, case.json));
 }
@@ -625,7 +692,7 @@ test "configured provider registry model count and raw input bounds" {
 }
 
 fn test_invalid_allocations(alloc: Allocator) !void {
-    const json = "{\"first\":{" ++ test_required_fields ++ "},\"second\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"valid\":{},\"invalid\":{\"max_output_tokens\":0}}}}";
+    const json = "{\"first\":{" ++ test_required_fields ++ "},\"second\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"valid\":{\"reasoning_efforts\":[\"low\"]},\"invalid\":{\"max_output_tokens\":0}}}}";
     var registry = Registry.parse_json(alloc, json) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidModelMetadata => return,
