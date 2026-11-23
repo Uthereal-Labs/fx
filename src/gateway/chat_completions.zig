@@ -312,7 +312,7 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
         .extra_headers = request_headers[0..header_count],
     };
     try request.admission.admit();
-    var opened = try client_mod.openBoundedPost(alloc, request.cancel_flag, phase_deadline(30_000, request.deadline), &operation);
+    var opened = try open_post(alloc, request, &operation);
     defer opened.deinit(alloc);
     const http = &opened.request.?;
     var watch: client_mod.CancelWatch = .{};
@@ -332,7 +332,11 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
         return err;
     };
     watch.stop();
-    if (http.connection) |connection| try watch.start(request.cancel_flag, if (response.head.status == .ok) request.deadline else phase_deadline(30_000, request.deadline), connection.stream_writer.stream);
+    if (response.head.status == .ok) {
+        var transfer: [64 * 1024]u8 = undefined;
+        return consume_watched(alloc, definition, http, response.reader(&transfer), request);
+    }
+    if (http.connection) |connection| try watch.start(request.cancel_flag, phase_deadline(30_000, request.deadline), connection.stream_writer.stream);
     var retry_after: ?u64 = null;
     var headers = response.head.iterateHeaders();
     while (headers.next()) |header| if (std.ascii.eqlIgnoreCase(header.name, "retry-after")) {
@@ -341,22 +345,100 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
     };
     var transfer: [64 * 1024]u8 = undefined;
     const reader = response.reader(&transfer);
-    if (response.head.status != .ok) {
-        var detail = reader.allocRemaining(alloc, .limited(64 * 1024)) catch |err| switch (err) {
-            error.StreamTooLong => try alloc.dupe(u8, "Provider error response exceeded the local limit"),
-            else => return err,
-        };
-        errdefer alloc.free(detail);
-        if (token) |value| {
-            const redacted = try codec.redact_error_detail(alloc, detail, value);
-            alloc.free(detail);
-            detail = redacted;
-        }
-
-        return .{ .failed = .{ .kind = failure_kind(response.head.status), .detail = detail, .retry_after_seconds = retry_after, .ownership = .owned } };
+    var detail = reader.allocRemaining(alloc, .limited(64 * 1024)) catch |err| switch (err) {
+        error.StreamTooLong => try alloc.dupe(u8, "Provider error response exceeded the local limit"),
+        else => return err,
+    };
+    errdefer alloc.free(detail);
+    if (token) |value| {
+        const redacted = try codec.redact_error_detail(alloc, detail, value);
+        alloc.free(detail);
+        detail = redacted;
     }
-    return consume(alloc, definition, reader, request);
+
+    return .{ .failed = .{ .kind = failure_kind(response.head.status), .detail = detail, .retry_after_seconds = retry_after, .ownership = .owned } };
 }
+
+/// TLS setups that a server ends during the handshake are retried here: nothing
+/// was sent, so a new connection is always safe, and the turn's provider
+/// attempts stay for model failures. All attempts share one setup deadline.
+const tls_setup_attempts = 3;
+
+fn open_post(alloc: Allocator, request: streams.ModelRequest, operation: *client_mod.PostOperation) !client_mod.OpenedPost {
+    const deadline = phase_deadline(30_000, request.deadline);
+    var attempt: usize = 1;
+    while (true) : (attempt += 1) {
+        return client_mod.openBoundedPost(alloc, request.cancel_flag, deadline, operation) catch |err| {
+            if (retry_tls_setup(err, attempt, expired(deadline), request.cancel_flag.load(.seq_cst))) {
+                debug_trace.eventf("gateway", "tls_setup_retry", request.trace_ctx, "attempt={d}/{d}", .{ attempt, tls_setup_attempts });
+                continue;
+            }
+            return err;
+        };
+    }
+}
+
+fn retry_tls_setup(err: anyerror, attempt: usize, deadline_passed: bool, cancelled: bool) bool {
+    return err == error.TlsInitializationFailed and attempt < tls_setup_attempts and !deadline_passed and !cancelled;
+}
+
+test "a TLS setup that the server ends is retried inside connection setup, within its budget" {
+    try std.testing.expect(retry_tls_setup(error.TlsInitializationFailed, 1, false, false));
+    try std.testing.expect(retry_tls_setup(error.TlsInitializationFailed, 2, false, false));
+    try std.testing.expect(!retry_tls_setup(error.TlsInitializationFailed, 3, false, false));
+    try std.testing.expect(!retry_tls_setup(error.TlsInitializationFailed, 1, true, false));
+    try std.testing.expect(!retry_tls_setup(error.TlsInitializationFailed, 1, false, true));
+    try std.testing.expect(!retry_tls_setup(error.ConnectionRefused, 1, false, false));
+}
+
+/// Parses a successful body while a stall watch ends a body that stays silent
+/// longer than the agent stream window; the stall is then a stream timeout,
+/// and recovery sends the request again.
+fn consume_watched(alloc: Allocator, definition: *const definitions.Definition, http: *std.http.Client.Request, body: *std.Io.Reader, request: streams.ModelRequest) !streams.Result {
+    var stall: client_mod.StreamStallWatch = .{};
+    if (http.connection) |connection| try stall.start(request.cancel_flag, request.deadline, client_mod.agent_stream_stall_timeout_ms, connection.stream_writer.stream);
+    var buffer: [64 * 1024]u8 = undefined;
+    var progress = ProgressReader.init(body, &stall, &buffer);
+    var result = consume(alloc, definition, &progress.interface, request) catch |err| {
+        if (stall.stop()) |stall_err| return stall_err;
+        return err;
+    };
+    if (stall.stop()) |stall_err| {
+        result.deinit(alloc);
+        return stall_err;
+    }
+    return result;
+}
+
+/// Passes the response body through and marks stall-watch progress for every
+/// chunk that arrives.
+const ProgressReader = struct {
+    body: *std.Io.Reader,
+    stall: *client_mod.StreamStallWatch,
+    interface: std.Io.Reader,
+
+    fn init(body: *std.Io.Reader, stall: *client_mod.StreamStallWatch, buffer: []u8) ProgressReader {
+        return .{
+            .body = body,
+            .stall = stall,
+            .interface = .{ .vtable = &.{ .stream = stream_body, .discard = discard_body }, .buffer = buffer, .seek = 0, .end = 0 },
+        };
+    }
+
+    fn stream_body(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *ProgressReader = @fieldParentPtr("interface", r);
+        const n = try self.body.stream(w, limit);
+        if (n > 0) self.stall.progress();
+        return n;
+    }
+
+    fn discard_body(r: *std.Io.Reader, limit: std.Io.Limit) std.Io.Reader.Error!usize {
+        const self: *ProgressReader = @fieldParentPtr("interface", r);
+        const n = try self.body.discard(limit);
+        if (n > 0) self.stall.progress();
+        return n;
+    }
+};
 
 pub fn failure_kind(status: std.http.Status) streams.FailureKind {
     return switch (status) {
