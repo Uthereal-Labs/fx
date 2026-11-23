@@ -1479,7 +1479,7 @@ fn streamGatewayCompletionCore(
 /// not just known long-thinking classes: any model can go quiet for minutes on
 /// a hard prompt. Treat all models with the same ten-minute window instead of
 /// classifying by name.
-const agent_stream_stall_timeout_ms: i64 = 600_000;
+pub const agent_stream_stall_timeout_ms: i64 = 600_000;
 
 test "agent stream stall window gives every model ten minutes of silence" {
     try std.testing.expectEqual(@as(i64, 600_000), agent_stream_stall_timeout_ms);
@@ -2275,6 +2275,45 @@ pub fn openBoundedPost(
     return runBoundedHttpOperation(OpenedPost, alloc, cancel_flag, deadline, operation);
 }
 
+/// Ends a streamed response body that stays silent longer than its stall
+/// window: the watcher closes the socket, and `stop` returns
+/// `error.StreamStalled`, which recovery treats as a stream timeout and sends
+/// the request again. Call `progress` whenever body bytes arrive. The watch
+/// must not move while it runs.
+pub const StreamStallWatch = struct {
+    done: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+    request: ConnectedRequestWatch = .init(.{}),
+
+    pub fn start(
+        self: *StreamStallWatch,
+        cancel: *std.atomic.Value(bool),
+        deadline: ?std.Io.Clock.Timestamp,
+        stall_timeout_ms: i64,
+        stream: std.Io.net.Stream,
+    ) !void {
+        self.done.store(false, .seq_cst);
+        self.request = .init(.{ .stall_timeout_ms = stall_timeout_ms });
+        // The head has arrived; only body silence counts from here.
+        if (self.request.arm_response_head()) |err| return err;
+        if (self.request.commit_response_head()) |err| return err;
+        self.thread = try spawn_gateway_cancel_watcher(&self.done, cancel, null, deadline, &self.request, stream);
+    }
+
+    pub fn progress(self: *StreamStallWatch) void {
+        self.request.markStreamProgress();
+    }
+
+    /// Joins the watcher. Returns the error of a stall or cancellation that
+    /// ended the stream, or null when the body ended on its own.
+    pub fn stop(self: *StreamStallWatch) ?anyerror {
+        self.done.store(true, .seq_cst);
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        return self.request.finish();
+    }
+};
+
 pub const CancelWatch = struct {
     done: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
@@ -2374,6 +2413,42 @@ test "stream stall watchdog fires with production clocks" {
     try std.testing.expect(watch.stream_stall_expired(past_expiry));
     try std.testing.expect(watch.win_stall_timeout());
     try std.testing.expectEqual(error.StreamStalled, watch.finish().?);
+}
+
+test "stream stall watch ends a silent body with a stream stall" {
+    const loopback = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try loopback.listen(io_mod.getIo(), .{ .reuse_address = true });
+    defer server.deinit(io_mod.getIo());
+    var client_stream = try server.socket.address.connect(io_mod.getIo(), .{ .mode = .stream });
+    defer client_stream.close(io_mod.getIo());
+    var accepted = try server.accept(io_mod.getIo());
+    defer accepted.close(io_mod.getIo());
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var watch: StreamStallWatch = .{};
+    try watch.start(&cancel, null, 50, client_stream);
+    watch.progress();
+    var buffer: [16]u8 = undefined;
+    var reader = client_stream.reader(io_mod.getIo(), &buffer);
+    // The server sends nothing; the watch closes the socket and the read ends.
+    _ = reader.interface.takeByte() catch {};
+    try std.testing.expectEqual(error.StreamStalled, watch.stop().?);
+}
+
+test "stream stall watch keeps a body that ends on its own" {
+    const loopback = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try loopback.listen(io_mod.getIo(), .{ .reuse_address = true });
+    defer server.deinit(io_mod.getIo());
+    var client_stream = try server.socket.address.connect(io_mod.getIo(), .{ .mode = .stream });
+    defer client_stream.close(io_mod.getIo());
+    var accepted = try server.accept(io_mod.getIo());
+    defer accepted.close(io_mod.getIo());
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var watch: StreamStallWatch = .{};
+    try watch.start(&cancel, null, 60_000, client_stream);
+    watch.progress();
+    try std.testing.expect(watch.stop() == null);
 }
 
 test "production response head wait accepts slow headers and still expires" {
