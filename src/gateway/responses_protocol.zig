@@ -1156,7 +1156,8 @@ pub const Reducer = struct {
     }
 
     fn accept_failure(self: *Reducer, alloc: std.mem.Allocator, fields: std.json.ObjectMap) !void {
-        const code = stringField(fields, "code") orelse "provider_error";
+        const named_code = stringField(fields, "code");
+        const code = named_code orelse "provider_error";
         const message = stringField(fields, "message") orelse "Provider response failed";
         const bounded_code = types.ModelFailureDiagnostic.init(code);
         const bounded_message = types.ModelFailureDiagnostic.init(message);
@@ -1164,7 +1165,9 @@ pub const Reducer = struct {
         const text = try std.mem.print(&buffer, "{s}: {s}", .{ bounded_code.view(), bounded_message.view() });
         const detail = types.ModelFailureDiagnostic.init(text);
         self.provider_failure_detail = try alloc.dupe(u8, detail.view());
-        self.provider_failure_cause = if (std.mem.eql(u8, code, "server_error"))
+        // A failure without a code names no cause that a resend cannot fix, so
+        // it is an unspecified server failure and recovery retries it.
+        self.provider_failure_cause = if (named_code == null or std.mem.eql(u8, code, "server_error"))
             null
         else if (std.mem.eql(u8, code, "rate_limit_exceeded"))
             .rate_limited
@@ -1867,7 +1870,7 @@ test "Responses terminal incomplete event does not require nested status" {
     try std.testing.expectEqual(types.ProviderFinishReason.length, completion.finish_reason.?);
 }
 
-test "Responses terminal failure classification is conservative and diagnostics are bounded" {
+test "Responses terminal failures stop only on named non-server codes and diagnostics are bounded" {
     const cases = .{
         .{ "server_error", false },
         .{ "rate_limit_exceeded", false },
@@ -1896,14 +1899,20 @@ test "Responses terminal failure classification is conservative and diagnostics 
         try std.testing.expectEqual(@as(?u64, 7), completion.usage.input_tokens);
         try std.testing.expectEqual(@as(?u64, 3), completion.usage.output_tokens);
     }
-    var stream = ToolRecordTest.init(std.testing.allocator);
-    defer stream.deinit();
-    try stream.apply("{\"type\":\"response.failed\",\"response\":{\"error\":null}}");
-    const completion = try stream.finish();
-    defer stream.freeCompletion(completion);
-    try std.testing.expectEqual(types.ProviderFinishReason.provider_error, completion.finish_reason.?);
-    try std.testing.expectEqual(types.ProviderFailureCause.non_retryable, completion.provider_failure_cause.?);
-    try std.testing.expect(completion.provider_failure_detail.?.len > 0);
+    for ([_][]const u8{
+        "{\"type\":\"response.failed\",\"response\":{\"error\":null}}",
+        "{\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"failed\"}}}",
+        "{\"type\":\"error\",\"message\":\"failed\"}",
+    }) |event| {
+        var stream = ToolRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        try stream.apply(event);
+        const completion = try stream.finish();
+        defer stream.freeCompletion(completion);
+        try std.testing.expectEqual(types.ProviderFinishReason.provider_error, completion.finish_reason.?);
+        try std.testing.expectEqual(@as(?types.ProviderFailureCause, null), completion.provider_failure_cause);
+        try std.testing.expect(std.mem.startsWith(u8, completion.provider_failure_detail.?, "provider_error: "));
+    }
 }
 
 test "Responses terminal metadata rejects contradictions before publishing final text" {
