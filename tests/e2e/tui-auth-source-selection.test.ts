@@ -5300,7 +5300,7 @@ test("native terminal outcomes preserve recovery and incomplete warnings", async
       const result = await runFx(["ask", "--json", "--auto", "Report the supplied answer without using tools."], { cwd: profile, env, timeoutMs: TIMEOUT });
       expect(result.signal).toBeNull();
       expect(result.code, result.stdout + result.stderr).toBe(rejected ? 1 : 0);
-      expect(direct ? direct.bodies.length : gateway.requests.length).toBe(rejected || limited ? 1 : 2);
+      expect(direct ? direct.bodies.length : gateway.requests.length).toBe(rejected ? 1 : 2);
       const output = JSON.parse(result.stdout);
       expect(output.tool_calls).toEqual([]);
       if (rejected) {
@@ -5325,13 +5325,13 @@ test("native terminal outcomes preserve recovery and incomplete warnings", async
           expect(input.filter((item: { type?: string }) => item.type === "function_call")).toEqual([]);
         }
       } else {
-        expect(output.output).toBe(limited ? "LIMITED_ANSWER" : "RECOVERED_OK");
+        expect(output.output).toBe("RECOVERED_OK");
         expect(result.stderr).toContain(limited ? "response hit provider length limit" : "OUTCOME_RETRY");
         const detail = await runFx(["session", "--json", "--id", output.session_id], { cwd: profile, env });
         expect(detail.code).toBe(0);
         const history = JSON.parse(detail.stdout).history;
         expect(history).toHaveLength(1);
-        expect(history[0].assistant).toBe(limited ? "LIMITED_ANSWER" : "RECOVERED_OK");
+        expect(history[0].assistant).toBe("RECOVERED_OK");
         expect(history[0].execution.tool_steps).toEqual([]);
         if (mode === "partial") expect(direct!.bodies[1]).not.toContain("DISCARDED_PREVIEW");
       }
