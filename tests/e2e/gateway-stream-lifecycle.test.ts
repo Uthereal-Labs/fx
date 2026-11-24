@@ -10003,7 +10003,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.stderr).toContain("response hit provider length limit");
       expect(result.stderr).toContain("did not execute the returned tool calls");
       expect(existsSync(sentinelPath)).toBe(false);
-      expect(gateway.requestCount()).toBe(1);
+      // The first request and the default three length-limit retries (`length_limit_retries`).
+      expect(gateway.requestCount()).toBe(4);
       expect(trace).toContain("event=provider_completion_blocked");
       expect(trace).toContain("outcome_kind=provider_length");
 
@@ -10043,7 +10044,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.stdout).toContain("visible partial output");
       expect(result.stderr).toContain("response hit provider length limit");
       expect(existsSync(sentinelPath)).toBe(false);
-      expect(gateway.requestCount()).toBe(1);
+      // The first request and the default three length-limit retries (`length_limit_retries`).
+      expect(gateway.requestCount()).toBe(4);
       expect(trace).toContain("event=provider_completion_blocked");
       expect(trace).toContain("finish_reason=length");
 
