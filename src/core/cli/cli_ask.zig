@@ -2531,13 +2531,15 @@ fn resolveModelOverride(raw_ctx: ?*anyopaque, alloc: Allocator, raw_model: []con
     return subagent_model_contract.matchCatalogModel(alloc, ids.items, raw_model);
 }
 
-fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, disposition: ?types.ProviderCompletionDisposition, _: ?types.TurnTerminationCause) !void {
+fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, disposition: ?types.ProviderCompletionDisposition, cause: ?types.TurnTerminationCause) !void {
     std.debug.assert(turn_id != 0);
     _ = disposition;
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     if (outcome == .failed or outcome == .paused) {
         ctx.failed = true;
     }
+    // A caller can resume a turn that stopped at the step limit; report the cause.
+    if (cause == .step_limit) ctx.typed_error_code = "StepLimitReached";
     if (outcome == .completed) discard_restarted_json_preview(ctx);
 }
 
@@ -5643,6 +5645,22 @@ test "fx ask finalization fails every failed turn" {
         try std.testing.expectEqual(case.expected_failed, ctx.failed);
         try std.testing.expectEqual(@as(usize, 0), ctx.worker.worker_events.items.len);
     }
+}
+
+test "fx ask finalization reports the step limit" {
+    const alloc = std.testing.allocator;
+    var stdout_capture = TestCapture{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture = TestCapture{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(alloc, testConfig(), testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup), "/tmp/workspace");
+    defer ctx.deinit();
+    const deps = agentRuntimeDeps(&ctx);
+
+    try deps.finalize_turn(deps.ctx, 8, .failed, null, .step_limit);
+
+    try std.testing.expect(ctx.failed);
+    try std.testing.expectEqualStrings("StepLimitReached", ctx.typed_error_code.?);
 }
 
 test "fx ask deps reject malformed native web_search calls" {
