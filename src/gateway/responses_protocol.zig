@@ -8,6 +8,7 @@ const image_attachments = @import("../core/images/image_attachments.zig");
 const tool_call_ids = @import("tool_call_ids.zig");
 const json_comparison = @import("../core/shared/json_comparison.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
+const sse_stream = @import("sse.zig");
 
 pub fn selectReplayParts(alloc: std.mem.Allocator, replay: ?types.ProviderReplay, _: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
     const source = replay orelse return null;
@@ -698,6 +699,143 @@ pub const StreamCallbacks = struct {
     on_tool_input: ?stream_provider.StreamCallback = null,
 };
 
+/// Callbacks that forward stream deltas to `sink`, which must outlive the stream.
+pub fn eventSinkCallbacks(sink: *stream_provider.EventSink) StreamCallbacks {
+    return .{
+        .context = sink,
+        .on_content = EventBridge.content,
+        .on_tool_start = EventBridge.toolStart,
+        .on_reasoning = EventBridge.reasoning,
+        .on_tool_input = EventBridge.toolInput,
+    };
+}
+
+const EventBridge = struct {
+    fn sink(raw: *anyopaque) *stream_provider.EventSink {
+        return @ptrCast(@alignCast(raw));
+    }
+
+    fn content(raw: *anyopaque, chunk: []const u8) void {
+        sink(raw).emit(.{ .content_delta = chunk });
+    }
+
+    fn reasoning(raw: *anyopaque, chunk: []const u8) void {
+        sink(raw).emit(.{ .reasoning_delta = chunk });
+    }
+
+    fn toolInput(raw: *anyopaque, chunk: []const u8) void {
+        sink(raw).emit(.{ .tool_input_delta = chunk });
+    }
+
+    fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8, arguments_json: ?[]const u8) void {
+        sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label, .arguments_json = arguments_json } });
+    }
+};
+
+/// Reduces one successful Responses event stream into a completion the
+/// caller owns. Errors are the SSE reader's and the reducer's own; callers
+/// map them to provider-specific names.
+pub fn consumeSse(
+    alloc: std.mem.Allocator,
+    reader: *std.Io.Reader,
+    callbacks: StreamCallbacks,
+    cancel_flag: *std.atomic.Value(bool),
+    content_capture_limit: ?usize,
+    max_event_bytes: usize,
+    limits: StreamLimits,
+    reasoning_ciphertext: ReasoningCiphertext,
+) !types.ModelCompletion {
+    var reducer = Reducer.init(alloc);
+    defer reducer.deinit(alloc);
+    reducer.reasoning_ciphertext = reasoning_ciphertext;
+    var sse: sse_stream.Reader = .{ .max_event_bytes = max_event_bytes, .max_total_bytes = limits.aggregate_bytes };
+    defer sse.deinit(alloc);
+    while (try sse.next(alloc, reader, cancel_flag)) |json_text| {
+        if (std.mem.eql(u8, json_text, "[DONE]")) break;
+        if (try reducer.applyJson(alloc, json_text, callbacks, cancel_flag, content_capture_limit, limits)) break;
+    }
+    return reducer.finish(alloc, cancel_flag, limits);
+}
+
+pub const RequestOptions = struct {
+    replay_limits: ReplayLimits,
+    /// Sent as `text.verbosity` when set; otherwise the endpoint default applies.
+    text_verbosity: ?[]const u8 = null,
+    /// Sent as `reasoning.summary` with a reasoning effort when set.
+    reasoning_summary: ?[]const u8 = null,
+    /// Sends `service_tier: priority` for fast requests.
+    priority_fast_mode: bool = false,
+};
+
+/// Writes one stateless streaming Responses request body. `messages` is the
+/// history after replay projection. `scratch_alloc` holds replay and image
+/// scratch and must be independent of the writer's storage.
+pub fn writeRequest(
+    writer: *std.Io.Writer,
+    alloc: std.mem.Allocator,
+    scratch_alloc: std.mem.Allocator,
+    request: stream_provider.RequestData,
+    messages: []const types.ChatMessage,
+    budget: image_attachments.CaptureBudget,
+    options: RequestOptions,
+) !void {
+    try writer.writeAll("{\"model\":");
+    try std.json.Stringify.value(request.model, .{}, writer);
+    try writer.writeAll(",\"store\":false,\"stream\":true,\"instructions\":");
+    var instructions: std.Io.Writer.Allocating = .init(alloc);
+    defer instructions.deinit();
+    for (request.instructions) |instruction| {
+        const text = instruction.content.?;
+        if (text.len == 0) continue;
+        if (instructions.written().len > 0) try instructions.writer.writeAll("\n\n");
+        try instructions.writer.writeAll(text);
+    }
+    if (instructions.written().len == 0) try instructions.writer.writeAll("You are a helpful assistant.");
+    try std.json.Stringify.value(instructions.written(), .{}, writer);
+    try writer.writeAll(",\"input\":[");
+    try writeInput(writer, scratch_alloc, messages, request.verified_images, options.replay_limits, budget);
+    try writer.writeByte(']');
+
+    const tool_count = try writeTools(writer, alloc, request.tools);
+    if (tool_count > 0) {
+        try writer.writeAll(",\"tool_choice\":");
+        try std.json.Stringify.value(request.tool_choice.label(), .{}, writer);
+        try writer.writeAll(",\"parallel_tool_calls\":true");
+    }
+    try writer.writeAll(",\"include\":[\"reasoning.encrypted_content\"]");
+    if (options.text_verbosity != null or request.response_format != null) {
+        try writer.writeAll(",\"text\":{");
+        if (options.text_verbosity) |verbosity| {
+            try writer.writeAll("\"verbosity\":");
+            try std.json.Stringify.value(verbosity, .{}, writer);
+        }
+        if (request.response_format) |format| {
+            if (format.schema != .object) return error.InvalidStructuredResponseSchema;
+            if (options.text_verbosity != null) try writer.writeByte(',');
+            try writer.writeAll("\"format\":{\"type\":\"json_schema\",\"name\":");
+            try std.json.Stringify.value(format.name, .{}, writer);
+            try writer.writeAll(",\"description\":");
+            try std.json.Stringify.value(format.description, .{}, writer);
+            try writer.writeAll(",\"schema\":");
+            try std.json.Stringify.value(format.schema, .{}, writer);
+            try writer.writeAll(",\"strict\":true}");
+        }
+        try writer.writeByte('}');
+    }
+    if (request.provider_options.reasoning) |effort| {
+        try writer.writeAll(",\"reasoning\":{\"effort\":");
+        try std.json.Stringify.value(effort.label(), .{}, writer);
+        if (options.reasoning_summary) |summary| {
+            try writer.writeAll(",\"summary\":");
+            try std.json.Stringify.value(summary, .{}, writer);
+        }
+        try writer.writeByte('}');
+    }
+    if (options.priority_fast_mode and request.provider_options.fast) try writer.writeAll(",\"service_tier\":\"priority\"");
+    if (request.max_output_tokens) |limit| try writer.print(",\"max_output_tokens\":{d}", .{limit});
+    try writer.writeByte('}');
+}
+
 const ToolAccumulator = struct {
     output_index: i64,
     id: []u8,
@@ -838,6 +976,8 @@ fn assistantMessagePhase(fields: std.json.ObjectMap) !?AssistantMessagePhase {
     return std.meta.stringToEnum(AssistantMessagePhase, raw.string);
 }
 
+pub const ReasoningCiphertext = enum { stable, rotating };
+
 pub const Reducer = struct {
     const MessageItem = struct {
         output_index: i64,
@@ -859,6 +999,11 @@ pub const Reducer = struct {
         json: ?[]u8,
     };
 
+    /// `stable` treats a changed ciphertext for one reasoning item as a
+    /// conflict. `rotating` keeps the latest ciphertext for an item whose id
+    /// matches, for endpoints such as Azure OpenAI that encrypt the same
+    /// reasoning anew in every event.
+    reasoning_ciphertext: ReasoningCiphertext = .stable,
     content: std.ArrayList(u8) = .empty,
     message_items: std.ArrayList(MessageItem) = .empty,
     reasoning_items: std.ArrayList(ReasoningItem) = .empty,
@@ -1104,7 +1249,15 @@ pub const Reducer = struct {
         errdefer if (json) |bytes| alloc.free(bytes);
         if (found) if (self.reasoning_items.items[low].json) |prior| {
             if (json) |bytes| {
-                if (!try json_comparison.serializedEqual(alloc, prior, bytes)) return error.ResponsesReasoningConflict;
+                if (!try json_comparison.serializedEqual(alloc, prior, bytes)) {
+                    const prior_id = self.reasoning_items.items[low].id_hash;
+                    const same_item = id_hash != null and prior_id != null and std.mem.eql(u8, &id_hash.?, &prior_id.?);
+                    if (self.reasoning_ciphertext != .rotating or !same_item) return error.ResponsesReasoningConflict;
+                    self.reasoning_bytes = try checkedAccumulatedSize(self.reasoning_bytes - prior.len, bytes.len, limits.provider_state_bytes);
+                    alloc.free(prior);
+                    self.reasoning_items.items[low].json = bytes;
+                    return;
+                }
                 alloc.free(bytes);
             }
             if (id_hash != null) self.reasoning_items.items[low].id_hash = id_hash;
@@ -1724,6 +1877,23 @@ test "Responses reasoning replay binds supplied identity before ciphertext" {
         try stream.apply(event);
         try std.testing.expectError(error.ResponsesReasoningConflict, stream.apply("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"reasoning\",\"id\":\"rs_replacement\",\"encrypted_content\":\"opaque\"}]}}"));
     }
+}
+
+test "Responses rotating reasoning ciphertext keeps the latest ciphertext of the same item" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    stream.reducer.reasoning_ciphertext = .rotating;
+    try stream.apply("{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"first\"}}");
+    try stream.apply("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"second\"}]}}");
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqualStrings("[{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"second\"}]", completion.provider_state_json.?);
+
+    var other = ToolRecordTest.init(std.testing.allocator);
+    defer other.deinit();
+    other.reducer.reasoning_ciphertext = .rotating;
+    try other.apply("{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"first\"}}");
+    try std.testing.expectError(error.ResponsesReasoningConflict, other.apply("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"id\":\"rs_2\",\"type\":\"reasoning\",\"encrypted_content\":\"second\"}]}}"));
 }
 
 test "Responses reasoning replay rejects supplied identity at another position" {
