@@ -312,12 +312,12 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
         .extra_headers = request_headers[0..header_count],
     };
     try request.admission.admit();
-    var opened = try open_post(alloc, request, &operation);
+    var opened = try open_post(alloc, request, &operation, definition.timeouts.connect_ms orelse 30_000);
     defer opened.deinit(alloc);
     const http = &opened.request.?;
     var watch: client_mod.CancelWatch = .{};
     defer watch.stop();
-    const head_deadline = phase_deadline(120_000, request.deadline);
+    const head_deadline = phase_deadline(definition.timeouts.first_response_ms orelse 120_000, request.deadline);
     if (http.connection) |connection| try watch.start(request.cancel_flag, head_deadline, connection.stream_writer.stream);
     http.transfer_encoding = .{ .content_length = payload.len };
     var buffer: [8192]u8 = undefined;
@@ -364,8 +364,8 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
 /// attempts stay for model failures. All attempts share one setup deadline.
 const tls_setup_attempts = 3;
 
-fn open_post(alloc: Allocator, request: streams.ModelRequest, operation: *client_mod.PostOperation) !client_mod.OpenedPost {
-    const deadline = phase_deadline(30_000, request.deadline);
+fn open_post(alloc: Allocator, request: streams.ModelRequest, operation: *client_mod.PostOperation, connect_ms: u32) !client_mod.OpenedPost {
+    const deadline = phase_deadline(connect_ms, request.deadline);
     var attempt: usize = 1;
     while (true) : (attempt += 1) {
         return client_mod.openBoundedPost(alloc, request.cancel_flag, deadline, operation) catch |err| {
@@ -392,11 +392,11 @@ test "a TLS setup that the server ends is retried inside connection setup, withi
 }
 
 /// Parses a successful body while a stall watch ends a body that stays silent
-/// longer than the agent stream window; the stall is then a stream timeout,
-/// and recovery sends the request again.
+/// longer than the connection's stall_ms, or the agent stream window; the stall
+/// is then a stream timeout, and recovery sends the request again.
 fn consume_watched(alloc: Allocator, definition: *const definitions.Definition, http: *std.http.Client.Request, body: *std.Io.Reader, request: streams.ModelRequest) !streams.Result {
     var stall: client_mod.StreamStallWatch = .{};
-    if (http.connection) |connection| try stall.start(request.cancel_flag, request.deadline, client_mod.agent_stream_stall_timeout_ms, connection.stream_writer.stream);
+    if (http.connection) |connection| try stall.start(request.cancel_flag, request.deadline, if (definition.timeouts.stall_ms) |stall_ms| stall_ms else client_mod.agent_stream_stall_timeout_ms, connection.stream_writer.stream);
     var buffer: [64 * 1024]u8 = undefined;
     var progress = ProgressReader.init(body, &stall, &buffer);
     var result = consume(alloc, definition, &progress.interface, request) catch |err| {
