@@ -27,6 +27,7 @@ pub const ParseError = Allocator.Error || error{
     InvalidAuth,
     InvalidEnvironmentName,
     InvalidToolChoiceMode,
+    InvalidTimeout,
     InvalidModelId,
     InvalidModelMetadata,
 };
@@ -64,6 +65,17 @@ pub const ModelMetadata = struct {
     reasoning_efforts: []const types.ReasoningEffort = &.{},
 };
 
+/// How long one request may wait, in milliseconds. A null field keeps fx's
+/// default: 30 s to connect, 120 s for the response to start, and the agent
+/// stream window for silence once the response has started.
+pub const Timeouts = struct {
+    connect_ms: ?u32 = null,
+    first_response_ms: ?u32 = null,
+    stall_ms: ?u32 = null,
+};
+
+pub const max_timeout_ms: u32 = 86_400_000;
+
 /// Registry owns all slices. Treat definitions as immutable while borrowed by
 /// requests; destroying the registry invalidates every definition and lookup.
 pub const Definition = struct {
@@ -74,6 +86,7 @@ pub const Definition = struct {
     tool_choice_mode: ToolChoiceMode = .omit,
     reviewer_model: ?[]const u8 = null,
     model_metadata: []const ModelMetadata = &.{},
+    timeouts: Timeouts = .{},
 
     /// The protocol's endpoint under base_url, which is already a validated
     /// API prefix. Caller owns the returned URL.
@@ -182,7 +195,7 @@ pub const Registry = struct {
 
 fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) ParseError!Definition {
     try validate_id(id);
-    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata" });
+    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata", "timeouts" });
     const protocol = try required(value, "protocol");
     if (protocol != .string) return error.InvalidProtocol;
     const parsed_protocol = std.meta.stringToEnum(Protocol, protocol.string) orelse return error.InvalidProtocol;
@@ -224,7 +237,27 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
         .tool_choice_mode = mode,
         .reviewer_model = owned_reviewer,
         .model_metadata = if (value.object.get("model_metadata")) |metadata| try parse_metadata(alloc, metadata) else &.{},
+        .timeouts = if (value.object.get("timeouts")) |timeouts| try parse_timeouts(timeouts) else .{},
     };
+}
+
+fn parse_timeouts(value: std.json.Value) ParseError!Timeouts {
+    check_fields(value, &.{ "connect_ms", "first_response_ms", "stall_ms" }) catch |err| switch (err) {
+        error.InvalidObject => return error.InvalidTimeout,
+        else => return err,
+    };
+    return .{
+        .connect_ms = try parse_timeout(value.object.get("connect_ms")),
+        .first_response_ms = try parse_timeout(value.object.get("first_response_ms")),
+        .stall_ms = try parse_timeout(value.object.get("stall_ms")),
+    };
+}
+
+/// A whole number of milliseconds from 1 to max_timeout_ms; absent is null.
+fn parse_timeout(value: ?std.json.Value) ParseError!?u32 {
+    const milliseconds = value orelse return null;
+    if (milliseconds != .integer or milliseconds.integer < 1 or milliseconds.integer > max_timeout_ms) return error.InvalidTimeout;
+    return @intCast(milliseconds.integer);
 }
 
 fn parse_auth(value: std.json.Value) ParseError!Auth {
@@ -539,6 +572,18 @@ test "configured provider allocation failures release partial registry and URLs"
 
 const test_required_fields = "\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com/v1\",\"auth\":{\"type\":\"none\"}";
 
+test "configured provider timeouts bound each wait, and absent ones keep the defaults" {
+    const alloc = std.testing.allocator;
+    var registry = try Registry.parse_json(alloc,
+        \\{"bounded":{"protocol":"openai-responses","base_url":"https://a.example/v1","auth":{"type":"none"},
+        \\"timeouts":{"connect_ms":5000,"first_response_ms":60000,"stall_ms":86400000}},
+        \\"plain":{"protocol":"openai-responses","base_url":"https://b.example/v1","auth":{"type":"none"}}}
+    );
+    defer registry.deinit(alloc);
+    try std.testing.expectEqual(Timeouts{ .connect_ms = 5000, .first_response_ms = 60_000, .stall_ms = max_timeout_ms }, registry.get("bounded").?.timeouts);
+    try std.testing.expectEqual(Timeouts{}, registry.get("plain").?.timeouts);
+}
+
 test "configured provider invalid schemas fail explicitly" {
     const cases = [_]struct { json: []const u8, err: ParseError }{
         .{ .json = "{", .err = error.InvalidJson },
@@ -564,6 +609,13 @@ test "configured provider invalid schemas fail explicitly" {
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"reviewer_model\":\"\"}}", .err = error.InvalidModelId },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"reviewer_model\":\"bad\\nmodel\"}}", .err = error.InvalidModelId },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":null}}", .err = error.InvalidObject },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"timeouts\":null}}", .err = error.InvalidTimeout },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"timeouts\":{\"connect_ms\":0}}}", .err = error.InvalidTimeout },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"timeouts\":{\"first_response_ms\":-1}}}", .err = error.InvalidTimeout },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"timeouts\":{\"stall_ms\":86400001}}}", .err = error.InvalidTimeout },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"timeouts\":{\"stall_ms\":1.5}}}", .err = error.InvalidTimeout },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"timeouts\":{\"stall_ms\":\"30s\"}}}", .err = error.InvalidTimeout },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"timeouts\":{\"idle_ms\":1000}}}", .err = error.UnknownField },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"\":{}}}}", .err = error.InvalidModelId },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":[]}}}", .err = error.InvalidObject },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"context_window\":0}}}}", .err = error.InvalidModelMetadata },
