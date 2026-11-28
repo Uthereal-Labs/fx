@@ -46,7 +46,10 @@ pub const Protocol = enum {
         };
     }
 };
-pub const ToolChoiceMode = enum { omit, send };
+/// How a chat-completions request carries tool_choice. `omit` sends none, `send` sends the request's choice.
+/// `required_until_result` sends "required" until the turn has a result from a tool other than the tool-search
+/// tools, then "auto": for models that answer at once instead of calling tools (for example Apertus).
+pub const ToolChoiceMode = enum { omit, send, required_until_result };
 /// How a chat-completions request carries the system instructions. `separate`
 /// sends each one as its own message. `merged` joins them into one system
 /// message, for chat templates that accept only one.
@@ -212,7 +215,7 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
     var mode: ToolChoiceMode = .omit;
     if (value.object.get("tool_choice_mode")) |choice| {
         if (choice != .string) return error.InvalidToolChoiceMode;
-        mode = if (std.mem.eql(u8, choice.string, "omit")) .omit else if (std.mem.eql(u8, choice.string, "send")) .send else return error.InvalidToolChoiceMode;
+        mode = std.meta.stringToEnum(ToolChoiceMode, choice.string) orelse return error.InvalidToolChoiceMode;
     }
     var system_messages: SystemMessages = .separate;
     if (value.object.get("system_messages")) |choice| {
@@ -461,6 +464,15 @@ const test_json =
     \\"router":{"protocol":"openai-chat-completions","base_url":"https://openrouter.ai/api/v1","auth":{"type":"bearer","env":"OPENROUTER_API_KEY"},"tool_choice_mode":"send","system_messages":"merged","reviewer_model":"openai/review","model_metadata":{"openai/gpt-4.1":{"context_window":8192,"max_output_tokens":1024,"supports_tool_use":true,"supports_vision":false},"unknown":{}}},
     \\"azure":{"protocol":"openai-responses","base_url":"https://example.openai.azure.com/openai/v1/","auth":{"type":"bearer","env":"AZURE_OPENAI_API_KEY"},"model_metadata":{"reasoner":{"reasoning_efforts":["none","medium","high"]}}}}
 ;
+
+test "configured provider parses the required_until_result tool choice mode" {
+    const alloc = std.testing.allocator;
+    const input = try alloc.dupe(u8, "{\"local\":{" ++ test_required_fields ++ ",\"tool_choice_mode\":\"required_until_result\"}}");
+    defer alloc.free(input);
+    var registry = try Registry.parse_json(alloc, input);
+    defer registry.deinit(alloc);
+    try std.testing.expectEqual(ToolChoiceMode.required_until_result, registry.get("local").?.tool_choice_mode);
+}
 
 test "configured provider owns definitions and preserves unknown metadata" {
     const alloc = std.testing.allocator;
