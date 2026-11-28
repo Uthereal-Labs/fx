@@ -27,6 +27,7 @@ pub const ParseError = Allocator.Error || error{
     InvalidAuth,
     InvalidEnvironmentName,
     InvalidToolChoiceMode,
+    InvalidSystemMessages,
     InvalidTimeout,
     InvalidModelId,
     InvalidModelMetadata,
@@ -46,6 +47,10 @@ pub const Protocol = enum {
     }
 };
 pub const ToolChoiceMode = enum { omit, send };
+/// How a chat-completions request carries the system instructions. `separate`
+/// sends each one as its own message. `merged` joins them into one system
+/// message, for chat templates that accept only one.
+pub const SystemMessages = enum { separate, merged };
 
 /// Describes a credential slot, never a credential value. Resolution belongs at
 /// the effectful edge; `none` must omit Authorization rather than supply a token.
@@ -84,6 +89,7 @@ pub const Definition = struct {
     base_url: []const u8,
     auth: Auth,
     tool_choice_mode: ToolChoiceMode = .omit,
+    system_messages: SystemMessages = .separate,
     reviewer_model: ?[]const u8 = null,
     model_metadata: []const ModelMetadata = &.{},
     timeouts: Timeouts = .{},
@@ -195,7 +201,7 @@ pub const Registry = struct {
 
 fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) ParseError!Definition {
     try validate_id(id);
-    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata", "timeouts" });
+    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "system_messages", "reviewer_model", "model_metadata", "timeouts" });
     const protocol = try required(value, "protocol");
     if (protocol != .string) return error.InvalidProtocol;
     const parsed_protocol = std.meta.stringToEnum(Protocol, protocol.string) orelse return error.InvalidProtocol;
@@ -207,6 +213,11 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
     if (value.object.get("tool_choice_mode")) |choice| {
         if (choice != .string) return error.InvalidToolChoiceMode;
         mode = if (std.mem.eql(u8, choice.string, "omit")) .omit else if (std.mem.eql(u8, choice.string, "send")) .send else return error.InvalidToolChoiceMode;
+    }
+    var system_messages: SystemMessages = .separate;
+    if (value.object.get("system_messages")) |choice| {
+        if (choice != .string) return error.InvalidSystemMessages;
+        system_messages = std.meta.stringToEnum(SystemMessages, choice.string) orelse return error.InvalidSystemMessages;
     }
     var reviewer: ?[]const u8 = null;
     if (value.object.get("reviewer_model")) |model_value| {
@@ -235,6 +246,7 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
         .base_url = owned_url,
         .auth = owned_auth,
         .tool_choice_mode = mode,
+        .system_messages = system_messages,
         .reviewer_model = owned_reviewer,
         .model_metadata = if (value.object.get("model_metadata")) |metadata| try parse_metadata(alloc, metadata) else &.{},
         .timeouts = if (value.object.get("timeouts")) |timeouts| try parse_timeouts(timeouts) else .{},
@@ -446,7 +458,7 @@ fn hash_part(hash: *std.crypto.hash.sha2.Sha256, part: []const u8) void {
 
 const test_json =
     \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:11434/v1/","auth":{"type":"none"}},
-    \\"router":{"protocol":"openai-chat-completions","base_url":"https://openrouter.ai/api/v1","auth":{"type":"bearer","env":"OPENROUTER_API_KEY"},"tool_choice_mode":"send","reviewer_model":"openai/review","model_metadata":{"openai/gpt-4.1":{"context_window":8192,"max_output_tokens":1024,"supports_tool_use":true,"supports_vision":false},"unknown":{}}},
+    \\"router":{"protocol":"openai-chat-completions","base_url":"https://openrouter.ai/api/v1","auth":{"type":"bearer","env":"OPENROUTER_API_KEY"},"tool_choice_mode":"send","system_messages":"merged","reviewer_model":"openai/review","model_metadata":{"openai/gpt-4.1":{"context_window":8192,"max_output_tokens":1024,"supports_tool_use":true,"supports_vision":false},"unknown":{}}},
     \\"azure":{"protocol":"openai-responses","base_url":"https://example.openai.azure.com/openai/v1/","auth":{"type":"bearer","env":"AZURE_OPENAI_API_KEY"},"model_metadata":{"reasoner":{"reasoning_efforts":["none","medium","high"]}}}}
 ;
 
@@ -460,6 +472,7 @@ test "configured provider owns definitions and preserves unknown metadata" {
     const local = registry.get("local").?;
     try std.testing.expectEqual(Auth.none, local.auth);
     try std.testing.expectEqual(ToolChoiceMode.omit, local.tool_choice_mode);
+    try std.testing.expectEqual(SystemMessages.separate, local.system_messages);
     try std.testing.expect(local.reviewer_model == null);
     const chat = try local.endpoint_url(alloc);
     defer alloc.free(chat);
@@ -468,6 +481,7 @@ test "configured provider owns definitions and preserves unknown metadata" {
     try std.testing.expectEqualStrings("OPENROUTER_API_KEY", router.auth.bearer);
     try std.testing.expectEqualStrings("openai/review", router.reviewer_model.?);
     try std.testing.expectEqual(ToolChoiceMode.send, router.tool_choice_mode);
+    try std.testing.expectEqual(SystemMessages.merged, router.system_messages);
     const metadata = router.model("openai/gpt-4.1").?;
     try std.testing.expectEqual(@as(?u32, 8192), metadata.context_window);
     try std.testing.expectEqual(@as(?u32, 1024), metadata.max_output_tokens);
@@ -605,6 +619,8 @@ test "configured provider invalid schemas fail explicitly" {
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"secret\":\"not-allowed\"}}", .err = error.UnknownField },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"tool_choice_mode\":\"auto\"}}", .err = error.InvalidToolChoiceMode },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"tool_choice_mode\":null}}", .err = error.InvalidToolChoiceMode },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"system_messages\":\"single\"}}", .err = error.InvalidSystemMessages },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"system_messages\":null}}", .err = error.InvalidSystemMessages },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"reviewer_model\":null}}", .err = error.InvalidModelId },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"reviewer_model\":\"\"}}", .err = error.InvalidModelId },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"reviewer_model\":\"bad\\nmodel\"}}", .err = error.InvalidModelId },
