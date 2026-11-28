@@ -63,7 +63,7 @@ pub fn build_for(definition: *const definitions.Definition, alloc: Allocator, re
         }
     };
     return switch (definition.protocol) {
-        .@"openai-chat-completions" => codec.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .provider = &identity }),
+        .@"openai-chat-completions" => codec.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .system_messages = definition.system_messages, .provider = &identity }),
         .@"openai-responses" => build_responses(alloc, request, &identity),
     };
 }

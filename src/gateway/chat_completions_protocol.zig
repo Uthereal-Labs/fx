@@ -15,8 +15,10 @@ const text_utils = @import("../core/shared/text_utils.zig");
 const Allocator = std.mem.Allocator;
 
 pub const ToolChoiceMode = configured_provider.ToolChoiceMode;
+pub const SystemMessages = configured_provider.SystemMessages;
 pub const Options = struct {
     tool_choice_mode: ToolChoiceMode = .omit,
+    system_messages: SystemMessages = .separate,
     /// Borrowed only during serialization; includes the configured authority binding.
     provider: ?*const model_provider.ProviderId = null,
 };
@@ -530,11 +532,27 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
     defer pending_names.deinit(alloc);
     var pending_images: std.ArrayList(types.ToolImage) = .empty;
     defer pending_images.deinit(alloc);
+    const merged = options.system_messages == .merged;
+    if (merged) {
+        var parts: std.ArrayList([]const u8) = .empty;
+        defer parts.deinit(alloc);
+        for (request.instructions) |message| if (message.role == .system) if (message.content) |text| try parts.append(alloc, text);
+        if (parts.items.len != 0) {
+            const joined = try std.mem.join(alloc, "\n\n", parts.items);
+            defer alloc.free(joined);
+            try writer.writeAll("{\"role\":\"system\",\"content\":");
+            try std.json.Stringify.value(joined, .{}, writer);
+            try writer.writeByte('}');
+            count += 1;
+        }
+    }
     const lanes = [_][]const types.ChatMessage{ request.instructions, request.messages };
-    for (lanes) |lane| {
+    for (lanes, 0..) |lane, lane_index| {
         for (lane) |message| {
             // Source validation rejects empty assistants; only stripped replay can leave one here.
             if (message.role == .assistant and message.content == null and message.tool_calls.len == 0 and message.provider_replay == null) continue;
+            // The merged mode wrote the system instructions above as one message.
+            if (merged and lane_index == 0 and message.role == .system) continue;
             if (message.role != .tool) try flush_tool_image_follow_up(writer, alloc, &count, &pending_names, &pending_images);
             if (count != 0) try writer.writeByte(',');
             count += 1;
@@ -937,13 +955,12 @@ pub const Reducer = struct {
         if (value != .array) return error.InvalidChunk;
         if (value.array.items.len > self.limits.tool_calls) return error.TooManyTools;
         if (value.array.items.len != 0 and self.choice == .none) return error.UnexpectedToolCall;
-        for (value.array.items, 0..) |item, delta_index| {
+        for (value.array.items) |item| {
             const delta = try object(item);
             const index = try index_value(delta.get("index") orelse return error.InvalidChunk);
             if (index >= self.limits.tool_calls) return error.TooManyTools;
-            for (value.array.items[0..delta_index]) |prior| {
-                if (try index_value((try object(prior)).get("index") orelse return error.InvalidChunk) == index) return error.ConflictingIdentity;
-            }
+            // Deltas for the same index in one chunk apply in order (vLLM sends the name and the first
+            // arguments fragment as two deltas of one chunk).
             while (self.tools.items.len <= index) try self.tools.append(self.alloc, .{});
             const tool = &self.tools.items[index];
             if (non_null(delta, "type")) |kind| if (!std.mem.eql(u8, try string(kind), "function")) return error.InvalidChunk;
@@ -1861,6 +1878,19 @@ test "chat completions omits tool controls when no tools are advertised" {
     try std.testing.expect(parsed.value.object.get("parallel_tool_calls") == null);
 }
 
+test "chat completions merged system messages send one system message" {
+    const alloc = std.testing.allocator;
+    const body = try build_request(alloc, test_request(), .{ .system_messages = .merged });
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const messages = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), messages.len);
+    try std.testing.expectEqualStrings("system", messages[0].object.get("role").?.string);
+    try std.testing.expectEqualStrings("first\n\nsecond", messages[0].object.get("content").?.string);
+    try std.testing.expectEqualStrings("user", messages[1].object.get("role").?.string);
+}
+
 test "chat completions exact text wire preserves instruction order and opaque model" {
     const alloc = std.testing.allocator;
     const body = try build_request(alloc, test_request(), .{});
@@ -2277,6 +2307,20 @@ test "chat completions owns fragmented interleaved tools and results independent
     try std.testing.expectEqual(types.ToolExecutionProvenance.fx_local, completion.tool_calls[1].provenance);
 }
 
+test "chat completions applies deltas of one tool index in one chunk in order" {
+    const alloc = std.testing.allocator;
+    var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+    defer reducer.deinit();
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"\"}},{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\"}}]}}]}");
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"x\\\"}\"}}]}}]}");
+    var result = try test_finish(&reducer, test_tools_finish);
+    defer result.deinit(alloc);
+    const completion = result.completed.completion;
+    try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
+    try std.testing.expectEqualStrings("read_file", completion.tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"path\":\"x\"}", completion.tool_calls[0].arguments_json);
+}
+
 test "chat completions malformed and nonobject final arguments never become tools" {
     const alloc = std.testing.allocator;
     for ([_][]const u8{ "", "{", "[]", "null", "3", "{}junk", "{\"x\":1,\"x\":2}" }) |arguments| {
@@ -2348,7 +2392,6 @@ test "chat completions rejects malformed chunks contradictory identities and ext
         .{ .first = test_call, .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"shell\"}}]}}]}", .failure = error.InvalidToolName },
         .{ .first = test_call, .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call-1\"}]}}]}", .failure = error.ConflictingIdentity },
         .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":-1}]}}]}", .failure = error.InvalidChunk },
-        .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0},{\"index\":0}]}}]}", .failure = error.ConflictingIdentity },
         .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"type\":\"web_search\"}]}}]}", .failure = error.InvalidChunk },
         .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":{}}}]}", .failure = error.InvalidChunk },
     };
