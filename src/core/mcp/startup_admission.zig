@@ -54,7 +54,8 @@ pub fn decideServer(config: *const mcp_contract.McpServerConfig, phase: Phase) D
         .acp_host_channel => if (!host_channel) return .deferred,
         else => {},
     }
-    return decide(config.enabled, config.required, config.workspace_admission, phase);
+    // An always-loaded server advertises its tools from the first step, so Ask connects it at startup.
+    return decide(config.enabled, config.required or config.always_loaded, config.workspace_admission, phase);
 }
 
 test "startup admission keeps Ask required servers eager and optional servers deferred" {
@@ -81,6 +82,15 @@ test "ACP host-channel servers wait for the host-channel phase" {
     var disabled = host;
     disabled.enabled = false;
     try testing.expectEqual(Decision.disabled, decideServer(&disabled, .acp_startup));
+}
+
+test "Ask connects always-loaded servers at startup" {
+    const testing = @import("std").testing;
+    const loaded: mcp_contract.McpServerConfig = .{ .name = "app", .transport = .stdio, .always_loaded = true };
+    const optional: mcp_contract.McpServerConfig = .{ .name = "other", .transport = .stdio };
+    try testing.expectEqual(Decision.connect, decideServer(&loaded, .ask_startup));
+    try testing.expectEqual(Decision.deferred, decideServer(&loaded, .ask_deferred));
+    try testing.expectEqual(Decision.deferred, decideServer(&optional, .ask_startup));
 }
 
 test "disabled servers never enter a connection phase" {

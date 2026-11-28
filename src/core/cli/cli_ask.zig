@@ -4,6 +4,7 @@ const std_builtin = @import("builtin");
 const command_admission = @import("../permissions/command_admission.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
+const runtime_gateway_step = @import("../agent/runtime/gateway_step.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
 const shared_theme = @import("../shared/theme.zig");
 const ui_render = @import("../../ui/render.zig");
@@ -2048,6 +2049,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     };
 
     const deps = agentRuntimeDeps(&ctx);
+    var dynamic_tool_arena = std.heap.ArenaAllocator.init(alloc);
+    defer dynamic_tool_arena.deinit();
+    const initial_dynamic_tools = try alwaysLoadedMcpTools(&ctx, dynamic_tool_arena.allocator());
     const semantic_presentation = if (ctx.presenter) |value| value.semanticSink() else null;
     try ctx.checkCancellation();
     const title_task = maybeStartAskTitleTask(
@@ -2070,6 +2074,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .gateway_chat_url = cfg.gateway_chat_url,
         .advertised_tool_names = tool_projection.advertised_names,
         .advertised_functions = tool_projection.advertised_functions,
+        .initial_dynamic_tools = initial_dynamic_tools,
         .provider_capabilities = cfg.provider_set.select(ctx.provider).capabilities,
         .custom_tool_guidance = tool_projection.custom_guidance,
         .agent_step_limit = startup.agent_step_limit,
@@ -3649,6 +3654,25 @@ fn pushSystemNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     try ctx.writeStderr("[notice] ");
     try ctx.writeStderr(text);
     try ctx.writeStderr("\n");
+}
+
+/// The tools of MCP servers configured as always loaded, advertised from the first step without a capability
+/// search (as ACP does for editor servers).
+fn alwaysLoadedMcpTools(ctx: *AskContext, arena: Allocator) ![]const agent_stream_provider.DynamicFunctionTool {
+    var tools: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
+    if (ctx.mcp) |mcp| {
+        try mcp.waitForAlwaysLoadedStartup(ctx.cancelFlag());
+        const loaded = try mcp.snapshotAlwaysLoadedTools(arena, ctx.permission_rules, ctx.context_limits, .unrestricted);
+        if (loaded.notice) |notice| try pushContextNotice(@ptrCast(ctx), notice);
+        for (loaded.tools) |selected| try runtime_gateway_step.recordSelectedDynamicTool(arena, &tools, selected);
+    }
+    if (ctx.mcp_host) |h| {
+        const loaded = try h.catalog.snapshotAlwaysLoadedTools(arena, ctx.permission_rules, ctx.context_limits, .unrestricted, ctx.cancelFlag());
+        if (loaded.notice) |notice| try pushContextNotice(@ptrCast(ctx), notice);
+        for (loaded.tools) |selected| try runtime_gateway_step.recordSelectedDynamicTool(arena, &tools, selected);
+    }
+    debug_trace.logf("mcp", "advertised always-loaded MCP tools count={d}", .{tools.items.len});
+    return tools.items;
 }
 
 fn pushContextNotice(raw_ctx: *anyopaque, text: []const u8) !void {

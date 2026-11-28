@@ -2228,6 +2228,18 @@ test "profile required policy defaults optional and roundtrips canonically" {
     try std.testing.expect(findConfig(reparsed.items, "required").?.required);
 }
 
+test "profile config parses always_loaded" {
+    const alloc = std.testing.allocator;
+    var configs = try loadConfigFromJson(alloc, "{\"mcpServers\":{\"app\":{\"command\":\"node\",\"always_loaded\":true},\"lazy\":{\"command\":\"node\"}}}");
+    defer freeConfigs(alloc, &configs);
+    try std.testing.expect(findConfig(configs.items, "app").?.always_loaded);
+    try std.testing.expect(!findConfig(configs.items, "lazy").?.always_loaded);
+    try std.testing.expectError(
+        error.McpConfigInvalidAlwaysLoaded,
+        loadConfigFromJson(alloc, "{\"mcp\":{\"server\":{\"command\":[\"node\"],\"always_loaded\":\"yes\"}}}"),
+    );
+}
+
 test "profile config reports invalid required policy" {
     try std.testing.expectError(
         error.McpConfigInvalidRequired,
