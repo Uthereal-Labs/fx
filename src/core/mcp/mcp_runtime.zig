@@ -1376,6 +1376,14 @@ pub const McpRuntime = struct {
         for (server_handles) |server| try self.waitForServerStartup(server, cancel);
     }
 
+    /// Waits until every always-loaded server has finished its startup, so their tools can be advertised from the
+    /// first step.
+    pub fn waitForAlwaysLoadedStartup(self: *McpRuntime, cancel: *std.atomic.Value(bool)) !void {
+        const server_handles = try self.acquireServers();
+        defer self.releaseServers(server_handles);
+        for (server_handles) |server| if (server.config.always_loaded) try self.waitForServerStartup(server, cancel);
+    }
+
     fn waitForServerStartup(self: *McpRuntime, server: *const McpServer, cancel: *std.atomic.Value(bool)) !void {
         while (server.startup_state.load(.acquire) == .loading) {
             if (self.retiring.load(.acquire) or self.discovery_cancel_requested.load(.acquire) or cancel.load(.acquire)) return error.Cancelled;
@@ -1575,12 +1583,7 @@ pub const McpRuntime = struct {
                     continue;
                 }
                 if (server.startup_state.load(.acquire) == .complete) continue;
-                switch (startup_admission.decide(
-                    server.config.enabled,
-                    server.config.required,
-                    server.config.workspace_admission,
-                    batch.phase,
-                )) {
+                switch (startup_admission.decideServer(&server.config, batch.phase)) {
                     .disabled => {
                         var name_buf: [256]u8 = undefined;
                         debug_trace.logf(

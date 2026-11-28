@@ -1008,6 +1008,10 @@ fn parseServerEntry(
         if (field == .bool) field.bool else return failServerConfig(error.McpConfigInvalidEnabled)
     else
         true;
+    const always_loaded = if (object.get("always_loaded")) |field|
+        if (field == .bool) field.bool else return failServerConfig(error.McpConfigInvalidAlwaysLoaded)
+    else
+        false;
     const configured_required = if (object.get("required")) |field|
         if (field == .bool) field.bool else return failServerConfig(error.McpConfigInvalidRequired)
     else
@@ -1054,6 +1058,7 @@ fn parseServerEntry(
             .auth = auth,
             .allow_stored_credentials = policy.allow_stored_credentials,
             .enabled = enabled,
+            .always_loaded = always_loaded,
             .workspace_admission = policy.workspace_admission,
             .startup_timeout_ms = timeouts.startup_ms,
             .operation_timeout_ms = timeouts.operation_ms,
@@ -1085,6 +1090,7 @@ fn parseServerEntry(
         .args = command.args,
         .env = env,
         .enabled = enabled,
+        .always_loaded = always_loaded,
         .workspace_admission = policy.workspace_admission,
         .startup_timeout_ms = timeouts.startup_ms,
         .operation_timeout_ms = timeouts.operation_ms,

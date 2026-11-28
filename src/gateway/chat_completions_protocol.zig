@@ -520,6 +520,21 @@ fn flush_tool_image_follow_up(
     pending_images.clearRetainingCapacity();
 }
 
+/// True while the current turn has no result from a tool other than the tool-search tools, which only load the
+/// definitions of other tools.
+fn awaitsToolResult(messages: []const types.ChatMessage) bool {
+    var index = messages.len;
+    while (index > 0) {
+        index -= 1;
+        const message = messages[index];
+        if (message.role == .user) return true;
+        if (message.role != .tool) continue;
+        const name = message.tool_name orelse return false;
+        if (!std.mem.eql(u8, name, "capability_search") and !std.mem.eql(u8, name, "mcp_select_tool")) return false;
+    }
+    return true;
+}
+
 fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provider.RequestData, options: Options, functions: []const Function, projection: *const tool_call_ids.Projection) !void {
     try writer.writeAll("{\"model\":");
     try std.json.Stringify.value(request.model, .{}, writer);
@@ -614,9 +629,16 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
         try writer.writeByte(']');
     }
     if (functions.len != 0) {
-        if (options.tool_choice_mode == .send) {
-            try writer.writeAll(",\"tool_choice\":");
-            try std.json.Stringify.value(@tagName(request.tool_choice), .{}, writer);
+        switch (options.tool_choice_mode) {
+            .omit => {},
+            .send => {
+                try writer.writeAll(",\"tool_choice\":");
+                try std.json.Stringify.value(@tagName(request.tool_choice), .{}, writer);
+            },
+            .required_until_result => {
+                try writer.writeAll(",\"tool_choice\":");
+                try std.json.Stringify.value(if (awaitsToolResult(request.messages)) "required" else "auto", .{}, writer);
+            },
         }
         if (request.provider_options.parallel_tool_calls) |parallel| {
             try writer.writeAll(",\"parallel_tool_calls\":");
@@ -1971,6 +1993,34 @@ test "chat completions history correlation preserves canonical IDs and JSON stri
     try std.testing.expectEqualStrings(call.arguments_json, wire_call.get("function").?.object.get("arguments").?.string);
     try std.testing.expectEqualStrings("functions/read:0", call.id);
     try std.testing.expectEqualStrings(call.id, request.messages[1].tool_call_id.?);
+}
+
+test "chat completions required_until_result requires a tool call until a non-search tool result" {
+    const alloc = std.testing.allocator;
+    const search: types.ToolCall = .{ .id = "s1", .name = "capability_search", .arguments_json = "{\"query\":\"rulings\"}" };
+    const read: types.ToolCall = .{ .id = "r1", .name = "read_file", .arguments_json = "{\"path\":\"a\"}" };
+    const cases = [_]struct { messages: []const types.ChatMessage, expected: []const u8 }{
+        .{ .messages = &.{.{ .role = .user, .content = "hi" }}, .expected = "required" },
+        .{ .messages = &.{
+            .{ .role = .user, .content = "hi" },
+            .{ .role = .assistant, .tool_calls = &.{search} },
+            .{ .role = .tool, .tool_call_id = search.id, .tool_name = search.name, .content = "found" },
+        }, .expected = "required" },
+        .{ .messages = &.{
+            .{ .role = .user, .content = "hi" },
+            .{ .role = .assistant, .tool_calls = &.{read} },
+            .{ .role = .tool, .tool_call_id = read.id, .tool_name = read.name, .content = "text" },
+        }, .expected = "auto" },
+    };
+    for (cases) |case| {
+        var request = test_tool_request();
+        request.messages = case.messages;
+        const body = try build_request(alloc, request, .{ .tool_choice_mode = .required_until_result });
+        defer alloc.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(case.expected, parsed.value.object.get("tool_choice").?.string);
+    }
 }
 
 test "chat completions tool choice controls and deliberate basic option mapping" {
